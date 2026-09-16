@@ -35,6 +35,238 @@ fn callees(store: &Store, name: &str) -> GraphResult {
 }
 
 #[test]
+fn annotation_calls_are_conservatively_omitted_but_defaults_are_retained() {
+    let source = "def annotation():\n    pass\ndef default():\n    pass\ndef runtime():\n    pass\nmodule_value: annotation()\nclass C:\n    class_value: annotation()\ndef run(value: annotation() = default()) -> annotation():\n    x: annotation()\n    y: annotation() = runtime()\n    def inner(value: annotation() = default()) -> annotation():\n        z: annotation()\n    runtime()\n";
+    for postponed in [false, true] {
+        let source = if postponed {
+            format!("from __future__ import annotations\n{source}")
+        } else {
+            source.into()
+        };
+        let facts = parse(&source);
+        assert!(facts.diagnostics.is_empty());
+        let calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        assert_eq!(calls.iter().filter(|r| r.label == "annotation").count(), 0);
+        assert_eq!(calls.iter().filter(|r| r.label == "default").count(), 2);
+        assert_eq!(calls.iter().filter(|r| r.label == "runtime").count(), 2);
+        assert_eq!(
+            call(&facts, "run", "default").candidate_keys,
+            ["python:pkg.code:default"]
+        );
+        assert_eq!(
+            call(&facts, "run", "runtime").candidate_keys,
+            ["python:pkg.code:runtime"]
+        );
+    }
+    let local_only = parse("def target():\n    pass\ndef run():\n    x: target()\n");
+    assert!(!local_only.references.iter().any(|r| r.relation == "calls"));
+}
+
+#[test]
+fn class_private_names_and_implicit_class_cells_do_not_fall_through() {
+    let facts = parse(
+        "def __target():\n    pass\ndef _C__target():\n    pass\ndef __class__():\n    pass\ndef ordinary():\n    pass\nclass C:\n    def run(self):\n        __target()\n        __class__()\n        ordinary()\n        def nested():\n            __target()\n            __class__()\n    def imported(self):\n        from other import __target as alias\n        alias()\ndef outside():\n    __target()\n    __class__()\n",
+    );
+    assert!(facts.diagnostics.is_empty());
+    for owner in ["C.run", "C.run.nested"] {
+        for name in ["__target", "__class__"] {
+            assert!(call(&facts, owner, name).candidate_keys.is_empty());
+        }
+    }
+    assert!(
+        call(&facts, "C.imported", "alias")
+            .candidate_keys
+            .is_empty()
+    );
+    assert_eq!(
+        call(&facts, "C.run", "ordinary").candidate_keys,
+        ["python:pkg.code:ordinary"]
+    );
+    assert_eq!(
+        call(&facts, "outside", "__target").candidate_keys,
+        ["python:pkg.code:__target"]
+    );
+    assert_eq!(
+        call(&facts, "outside", "__class__").candidate_keys,
+        ["python:pkg.code:__class__"]
+    );
+}
+
+#[test]
+fn unicode_identifiers_normalize_bindings_without_changing_display_or_ids() {
+    let facts = parse(
+        "def K():\n    pass\ndef café():\n    pass\nclass ℂ:\n    def K(self):\n        pass\ndef run():\n    K()\n    K()\n    café()\n",
+    );
+    assert!(facts.diagnostics.is_empty());
+    for name in ["K", "K"] {
+        assert_eq!(
+            call(&facts, "run", name).candidate_keys,
+            ["python:pkg.code:K"]
+        );
+    }
+    assert_eq!(
+        call(&facts, "run", "café").candidate_keys,
+        ["python:pkg.code:café"]
+    );
+    let target = facts
+        .nodes
+        .iter()
+        .find(|n| n.qualified_name.as_deref() == Some("K"))
+        .unwrap();
+    assert_eq!(target.label, "K");
+    assert_eq!(target.id, "python:src/pkg/code.py:K@0");
+    let method = facts
+        .nodes
+        .iter()
+        .find(|n| n.qualified_name.as_deref() == Some("C.K"))
+        .unwrap();
+    assert_eq!(method.label, "K");
+    assert_eq!(method.binding_key.as_deref(), Some("python:pkg.code:C.K"));
+    assert!(method.id.contains(":ℂ.K@"));
+
+    for source in [
+        "def K():\n    pass\nK = other\ndef run():\n    K()\n",
+        "def K():\n    pass\ndef run(K):\n    K()\n",
+        "def K():\n    pass\ndef run():\n    global K\n    K = other\n    K()\n",
+        "def K():\n    pass\ndef K():\n    pass\ndef run():\n    K()\n",
+    ] {
+        let facts = parse(source);
+        assert!(facts.diagnostics.is_empty());
+        assert!(
+            call(&facts, "run", "K").candidate_keys.is_empty(),
+            "{source}"
+        );
+    }
+    let supported = parse(
+        "# K and café are ordinary text here\nlabel = 'K'\ndef target():\n    pass\ndef run():\n    target()\n",
+    );
+    assert!(supported.diagnostics.is_empty());
+    assert_eq!(
+        call(&supported, "run", "target").candidate_keys,
+        ["python:pkg.code:target"]
+    );
+}
+
+#[test]
+fn unicode_imports_normalize_identifiers_but_keep_filesystem_module_identity() {
+    let source = "from K import K as ｆ\nimport K as ｍ\nimport pkg.K\ndef caller():\n    f()\n    ｍ.K()\n    pkg.K.K()\n";
+    let facts = parse_python("consumer.py", source, "h").unwrap();
+    assert!(facts.diagnostics.is_empty());
+    for name in ["f", "ｍ.K"] {
+        assert_eq!(call(&facts, "caller", name).candidate_keys, ["python:K:K"]);
+    }
+    assert_eq!(
+        call(&facts, "caller", "pkg.K.K").candidate_keys,
+        ["python:pkg.K:K"]
+    );
+    assert!(facts.references.iter().any(|r| r.relation == "imports"
+        && r.label == "K.K"
+        && r.candidate_keys[0] == "python:K:K"));
+    let relative = parse_python(
+        "pkg/Kdir/consumer.py",
+        "from .K import K as f\ndef caller():\n    f()\n",
+        "h",
+    )
+    .unwrap();
+    assert_eq!(relative.module, "pkg.Kdir.consumer");
+    assert_eq!(
+        call(&relative, "caller", "f").candidate_keys,
+        ["python:pkg.Kdir.K:K"]
+    );
+
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::create_dir(root.path().join("pkg")).unwrap();
+    fs::write(root.path().join("consumer.py"), source).unwrap();
+    for path in ["K.py", "K.py", "pkg/K.py", "pkg/K.py"] {
+        fs::write(root.path().join(path), "def K():\n    pass\n").unwrap();
+    }
+    index::run(root.path(), &db).unwrap();
+    let graph = callees(&Store::open(&db).unwrap(), "caller");
+    assert_eq!(graph.edges.len(), 3);
+    assert!(graph.unresolved.is_empty());
+    for edge in &graph.edges {
+        let target = graph.nodes.iter().find(|n| n.id == edge.target).unwrap();
+        assert!(matches!(target.file.as_str(), "K.py" | "pkg/K.py"));
+        assert_eq!(target.label, "K");
+    }
+    // Python source imports normalize K to K; they cannot reach the literal K.py file.
+    fs::remove_file(root.path().join("K.py")).unwrap();
+    index::run(root.path(), &db).unwrap();
+    let graph = callees(&Store::open(&db).unwrap(), "caller");
+    assert_eq!(graph.edges.len(), 1);
+    assert_eq!(graph.unresolved.len(), 2);
+}
+
+#[test]
+fn duplicate_parameters_diagnose_and_clear_the_entire_file() {
+    for definition in [
+        "def run(x, x):\n    target()\n",
+        "async def run(x: int, x: str = ''):\n    target()\n",
+        "def run(x, /, x):\n    target()\n",
+        "def run(x, *, x=1):\n    target()\n",
+        "def run(x, *x):\n    target()\n",
+        "def run(*x, **x):\n    target()\n",
+        "value = lambda x, x: target()\n",
+        "def run(K, K):\n    target()\n",
+        "value = lambda K, K: target()\n",
+    ] {
+        let facts = parse(&format!("def target():\n    pass\n{definition}"));
+        assert!(
+            facts.nodes.is_empty() && facts.edges.is_empty() && facts.references.is_empty(),
+            "{definition}"
+        );
+        assert!(
+            facts.diagnostics[0]
+                .message
+                .contains("Duplicate Python parameter"),
+            "{definition}"
+        );
+        assert!(facts.diagnostics[0].line.is_some());
+    }
+    let valid = parse(
+        "def target():\n    pass\ndef run(x: int, /, y: int = 1, *args, z: int = 1, **kwargs):\n    target()\n",
+    );
+    assert!(valid.diagnostics.is_empty());
+    assert_eq!(
+        call(&valid, "run", "target").candidate_keys,
+        ["python:pkg.code:target"]
+    );
+}
+
+#[test]
+fn normalized_rebindings_and_duplicate_parameters_remove_old_targets_on_update() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let target = root.path().join("provider.py");
+    fs::write(
+        root.path().join("consumer.py"),
+        "from provider import K\ndef caller():\n    K()\n",
+    )
+    .unwrap();
+    for (source, diagnostics) in [
+        ("def K():\n    pass\nK = other\n", 0),
+        ("def K(x, x):\n    pass\n", 1),
+    ] {
+        fs::write(&target, "def K():\n    pass\n").unwrap();
+        index::run(root.path(), &db).unwrap();
+        assert_eq!(callees(&Store::open(&db).unwrap(), "caller").edges.len(), 1);
+        fs::write(&target, source).unwrap();
+        let updated = index::run(root.path(), &db).unwrap();
+        assert_eq!(updated.parsed_files, 1);
+        assert_eq!(updated.unchanged_files, 1);
+        assert_eq!(updated.diagnostics.len(), diagnostics);
+        let graph = callees(&Store::open(&db).unwrap(), "caller");
+        assert!(graph.edges.is_empty());
+        assert_eq!(graph.unresolved.len(), 1);
+    }
+}
+
+#[test]
 fn lexical_calls_have_one_owner_and_classes_are_not_closures() {
     let facts = parse(
         "def target():\n    pass\n\nclass Service:\n    def target(self):\n        pass\n    async def run(self):\n        target()\n        self.target()\n\ndef outer():\n    def inner():\n        target()\n    inner()\n",
@@ -397,7 +629,7 @@ fn old_extractor_stamps_refresh_unchanged_and_oversized_files() {
         .unwrap();
     let content_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
     // Cover both pre-revision caches and caches written by an earlier extractor.
-    for prefix in ["", "python-v0:"] {
+    for prefix in ["", "python-v0:", "python-v1:", "python-v2:"] {
         let outdated = vec![
             parse_python(
                 "module.py",

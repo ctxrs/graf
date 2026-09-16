@@ -43,7 +43,7 @@ Updates hash source files and parse only changed files. Changed definitions also
 
 The first release indexes Python definitions, containment, imports, and syntactic call sites. It supports conventional packages and `src/` layouts. It respects ignore rules, skips symlinks and common dependency/build directories, and does not execute project code.
 
-Call resolution is deliberately conservative: lexical functions and explicit local import aliases can resolve to definitions. Dynamic dispatch, ambiguous bindings, and unsupported import patterns remain unresolved. Results include source locations and unresolved references; an empty caller list does not prove a function is unused. Files with syntax errors are diagnosed and their old facts are removed on update. Files larger than 4 MiB, non-UTF-8 source, and excessively nested syntax are also diagnosed instead of indexed.
+Call resolution is deliberately conservative: lexical functions and explicit local import aliases can resolve to definitions. Dynamic dispatch, ambiguous bindings, and unsupported import patterns remain unresolved. Results include source locations and unresolved references; an empty caller list does not prove a function is unused. Tree-sitter syntax errors and duplicate parameters are diagnosed, and their old facts are removed on update. Graf does not validate every Python compiler or type-system rule. Annotation evaluation is omitted from call edges; class-private names and implicit `__class__` calls remain unresolved. Files larger than 4 MiB, non-UTF-8 source, and excessively nested syntax are also diagnosed instead of indexed.
 
 ## Migrate from Graphify
 
@@ -85,5 +85,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
+
+Validation runs locally. GitHub Actions and Buildkite are not required.
 
 Licensed under Apache-2.0. Graf is an independent project inspired by [Graphify](https://github.com/Graphify-Labs/graphify).

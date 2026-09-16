@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tree_sitter::{Node as Syntax, Parser};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::model::*;
 
@@ -76,6 +77,15 @@ struct Extractor<'a> {
 }
 
 /// Extract static Python facts without executing source or guessing dynamic targets.
+///
+/// Binding identifiers use Python's NFKC normalization. Display labels and native
+/// IDs retain source spelling; module paths retain literal filesystem spelling.
+/// Annotation expressions are conservatively omitted from call extraction across
+/// eager, lazy, and postponed annotation modes; evaluated defaults are retained.
+/// This is not a complete runtime call graph. Class-private names and implicit
+/// `__class__` stay unresolved.
+/// Validation covers Tree-sitter syntax and duplicate parameters, not all Python
+/// compiler constraints.
 pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
     if path.is_empty()
         || path.starts_with('/')
@@ -118,6 +128,22 @@ pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
             });
             return Ok(facts);
         }
+        if matches!(node.kind(), "parameters" | "lambda_parameters") {
+            let mut names = HashSet::new();
+            for parameter in parameter_names(node) {
+                let name = &source[parameter.byte_range()];
+                if !names.insert(identifier(name)) {
+                    facts.diagnostics.push(Diagnostic {
+                        file: path.into(),
+                        line: Some(line(parameter)),
+                        message: format!(
+                            "Duplicate Python parameter '{name}'; no facts indexed for this file"
+                        ),
+                    });
+                    return Ok(facts);
+                }
+            }
+        }
         let mut cursor = node.walk();
         pending.extend(node.children(&mut cursor).map(|n| (n, depth + 1)));
     }
@@ -159,6 +185,38 @@ fn line_end(node: Syntax<'_>) -> u32 {
     (end.row + usize::from(end.column != 0 || end.row == 0)) as u32
 }
 
+fn parameter_names(node: Syntax<'_>) -> Vec<Syntax<'_>> {
+    let mut names = vec![];
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "keyword_identifier" => names.push(node),
+            "default_parameter" | "typed_default_parameter" => {
+                pending.extend(node.child_by_field_name("name"));
+            }
+            "typed_parameter" => pending.extend(node.named_child(0)),
+            "parameters"
+            | "lambda_parameters"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "tuple_pattern" => {
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn private_name(name: &str) -> bool {
+    name.starts_with("__") && !name.ends_with("__")
+}
+
+fn identifier(name: &str) -> String {
+    name.nfkc().collect()
+}
+
 impl Extractor<'_> {
     fn text(&self, node: Syntax<'_>) -> &str {
         &self.source[node.byte_range()]
@@ -167,7 +225,7 @@ impl Extractor<'_> {
     fn bind(&mut self, scope: usize, name: String, binding: Binding) {
         self.scopes[scope]
             .bindings
-            .entry(name)
+            .entry(identifier(&name))
             .and_modify(|b| *b = Binding::Unknown)
             .or_insert(binding);
     }
@@ -195,25 +253,15 @@ impl Extractor<'_> {
     }
 
     fn parameters(&mut self, node: Syntax<'_>, scope: usize) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "default_parameter" | "typed_default_parameter" => {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        self.target(name, scope);
-                    }
-                }
-                "typed_parameter" => {
-                    if let Some(name) = child.named_child(0) {
-                        self.target(name, scope);
-                    }
-                }
-                _ => self.target(child, scope),
-            }
+        for name in parameter_names(node) {
+            self.target(name, scope);
         }
     }
 
     fn visit(&mut self, node: Syntax<'_>, scope: usize, conditional: bool) {
+        if node.kind() == "type" {
+            return;
+        }
         match node.kind() {
             "function_definition" | "class_definition" => {
                 self.definition(node, scope, conditional);
@@ -297,9 +345,12 @@ impl Extractor<'_> {
                     .child_by_field_name("function")
                     .and_then(|n| self.dotted(n))
                     .unwrap_or_default();
-                if parts.len() == 1 && matches!(parts[0].as_str(), "exec" | "globals" | "locals") {
+                let function = parts.first().map(|name| identifier(name));
+                if parts.len() == 1
+                    && matches!(function.as_deref(), Some("exec" | "globals" | "locals"))
+                {
                     self.scopes[scope].uncertain = true;
-                    if parts[0] == "globals" {
+                    if function.as_deref() == Some("globals") {
                         self.scopes[0].uncertain = true;
                     }
                 }
@@ -345,7 +396,7 @@ impl Extractor<'_> {
             qualified,
             node.start_byte()
         );
-        let key = format!("python:{}:{qualified}", self.facts.module);
+        let key = format!("python:{}:{}", self.facts.module, identifier(&qualified));
         let class = node.kind() == "class_definition";
         self.bind(
             scope,
@@ -374,7 +425,7 @@ impl Extractor<'_> {
             file: self.facts.path.clone(),
             line: Some(line(node)),
             end_line: Some(line_end(node)),
-            qualified_name: Some(qualified.clone()),
+            qualified_name: Some(identifier(&qualified)),
             binding_key: Some(key),
             metadata: Value::Null,
         });
@@ -447,6 +498,9 @@ impl Extractor<'_> {
         let from = node.kind() == "import_from_statement";
         let module = node
             .child_by_field_name("module_name")
+            .and_then(|n| self.relative_module(&identifier(self.text(n))));
+        let module_label = node
+            .child_by_field_name("module_name")
             .and_then(|n| self.relative_module(self.text(n)));
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -464,10 +518,11 @@ impl Extractor<'_> {
         let mut cursor = node.walk();
         for item in node.children_by_field_name("name", &mut cursor) {
             let name_node = item.child_by_field_name("name").unwrap_or(item);
-            let name = self.text(name_node).to_owned();
+            let raw_name = self.text(name_node).to_owned();
+            let name = identifier(&raw_name);
             let alias = item
                 .child_by_field_name("alias")
-                .map(|n| self.text(n).to_owned());
+                .map(|n| identifier(self.text(n)));
             let local = alias.clone().unwrap_or_else(|| {
                 if from {
                     name.clone()
@@ -475,7 +530,7 @@ impl Extractor<'_> {
                     name.split('.').next().unwrap().into()
                 }
             });
-            let (binding, keys) = if from {
+            let (mut binding, mut keys) = if from {
                 match &module {
                     Some(module) => {
                         let key = format!("python:{module}:{name}");
@@ -499,6 +554,15 @@ impl Extractor<'_> {
                     vec![format!("module:{name}")],
                 )
             };
+            if self.class_context(scope)
+                && (name.split('.').any(private_name)
+                    || module
+                        .as_ref()
+                        .is_some_and(|m| m.split('.').any(private_name)))
+            {
+                binding = Binding::Unknown;
+                keys.clear();
+            }
             self.bind(
                 scope,
                 local,
@@ -508,9 +572,9 @@ impl Extractor<'_> {
                     binding
                 },
             );
-            let label = module
+            let label = module_label
                 .as_ref()
-                .map_or_else(|| name.clone(), |m| format!("{m}.{name}"));
+                .map_or_else(|| raw_name.clone(), |m| format!("{m}.{raw_name}"));
             self.import_reference(
                 item,
                 scope,
@@ -562,7 +626,13 @@ impl Extractor<'_> {
     }
 
     fn call_key(&self, call: &PendingCall) -> Option<String> {
-        let name = call.parts.first()?;
+        let parts: Vec<_> = call.parts.iter().map(|part| identifier(part)).collect();
+        let name = parts.first()?;
+        if self.class_context(call.scope)
+            && (name == "__class__" || parts.iter().any(|part| private_name(part)))
+        {
+            return None;
+        }
         let mut index = Some(call.scope);
         let mut deferred = false;
         while let Some(current) = index {
@@ -575,7 +645,7 @@ impl Extractor<'_> {
                 if let Some(binding) = scope.bindings.get(name) {
                     return match binding {
                         Binding::Definition { key, start, .. } | Binding::Symbol { key, start }
-                            if call.parts.len() == 1 && (deferred || *start <= call.start) =>
+                            if parts.len() == 1 && (deferred || *start <= call.start) =>
                         {
                             Some(key.clone())
                         }
@@ -584,7 +654,7 @@ impl Extractor<'_> {
                             prefix,
                             start,
                         } if deferred || *start <= call.start => {
-                            let dotted = call.parts.join(".");
+                            let dotted = parts.join(".");
                             let suffix = dotted.strip_prefix(&format!("{prefix}."))?;
                             if suffix.contains('.') {
                                 None
@@ -600,6 +670,17 @@ impl Extractor<'_> {
             index = scope.parent;
         }
         None
+    }
+
+    fn class_context(&self, scope: usize) -> bool {
+        let mut index = Some(scope);
+        while let Some(current) = index {
+            if self.scopes[current].kind == ScopeKind::Class {
+                return true;
+            }
+            index = self.scopes[current].parent;
+        }
+        false
     }
 
     fn finish(&mut self) {

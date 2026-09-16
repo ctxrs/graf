@@ -11,7 +11,7 @@ use crate::{
 
 // Bump when parser, binding-resolution, grammar, or extraction settings change
 // stored facts. This invalidates every file stamp, including skipped sources.
-const EXTRACTOR_REVISION: u32 = 1;
+const EXTRACTOR_REVISION: u32 = 3;
 
 /// Collect file facts before applying any graph changes.
 ///

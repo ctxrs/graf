@@ -210,6 +210,93 @@ fn explicit_database_errors_and_limits_leave_stdout_and_disk_clean() {
     }
 }
 
+fn assert_terminal_safe(text: &str) {
+    assert!(text.chars().all(|c| !c.is_control() || c == '\n'));
+    for c in ['\u{200b}', '\u{2028}', '\u{202e}', '\u{2066}', '\u{feff}'] {
+        assert!(!text.contains(c));
+    }
+}
+
+#[test]
+fn human_output_escapes_controls_while_json_and_mcp_preserve_values() {
+    let dir = tempdir().unwrap();
+    let hostile = "normal\x1b[2J\x1b[H\n\r\t\u{85}\u{200b}\u{2028}\u{202e}\u{2066}\u{feff}";
+    let escaped = r"normal\u{1b}[2J\u{1b}[H\n\r\t\u{85}\u{200b}\u{2028}\u{202e}\u{2066}\u{feff}";
+    fs::write(
+        dir.path().join("graph.json"),
+        json!({
+            "directed": true, "multigraph": false,
+            "nodes": [
+                {"id":"a", "label":hostile, "source_file":hostile, "file_type":hostile},
+                {"id":hostile, "label":"café_東京"}
+            ],
+            "links": [{"source":"a", "target":hostile, "relation":hostile}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    success(cli(
+        dir.path(),
+        &["import", "graphify", "graph.json", "--json"],
+    ));
+    let output = cli(dir.path(), &["show", "a"]);
+    assert!(output.status.success());
+    let human = String::from_utf8(output.stdout).unwrap();
+    assert_terminal_safe(&human);
+    assert!(human.contains(escaped));
+    assert!(human.contains("café_東京"));
+    let machine = success(cli(dir.path(), &["show", "a", "--json"]));
+    let node = machine["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "a")
+        .unwrap();
+    assert_eq!(node["label"], hostile);
+    assert_eq!(node["file"], hostile);
+    assert_eq!(machine["edges"][0]["relation"], hostile);
+    let mut client = Mcp::start(dir.path(), "2025-11-25");
+    let response = client.call("show", json!({"symbol":"a"}));
+    assert_eq!(response["result"]["structuredContent"], machine);
+
+    for args in [
+        vec!["show", "missing\x1b[2J\n\u{202e}"],
+        vec!["query", "a", "--direction", "bad\x1b[2J\n\u{202e}"],
+    ] {
+        let error = failure(cli(dir.path(), &args));
+        assert_terminal_safe(&error);
+        assert!(error.contains(r"\u{1b}[2J"), "{error:?}");
+    }
+    let help = cli(dir.path(), &["--help"]);
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("Usage: graf")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn human_diagnostics_and_root_escape_filename_controls() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("project\x1b[2J\n");
+    fs::create_dir(&root).unwrap();
+    let filename = "bad\x1b[2J\r\t\u{202e}.py";
+    fs::write(root.join(filename), "def broken(:\n").unwrap();
+    let output = cli(&root, &["index", "--json"]);
+    let diagnostics = String::from_utf8(output.stderr.clone()).unwrap();
+    assert_terminal_safe(&diagnostics);
+    assert!(diagnostics.contains(r"bad\u{1b}[2J\r\t\u{202e}.py"));
+    let report = success(output);
+    assert_eq!(report["diagnostics"][0]["file"], filename);
+    let stats = cli(&root, &["stats"]);
+    assert!(stats.status.success());
+    let human = String::from_utf8(stats.stdout).unwrap();
+    assert_terminal_safe(&human);
+    assert!(human.contains(r"project\u{1b}[2J\n"));
+}
+
 // A small stdio client fixture: the SDK owns all server protocol handling.
 struct Mcp {
     child: Child,

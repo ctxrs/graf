@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(
+    bin_name = "graf",
+    styles = clap::builder::Styles::plain(),
     version,
     about = "Navigate a persistent local code graph",
     after_help = "Reads use the indexed snapshot; they do not check live worktree freshness. Run update explicitly to refresh native indexes."
@@ -294,14 +296,20 @@ fn database(cli: &Cli) -> Result<PathBuf> {
     }
 }
 
+// Escape terminal controls and nonprinting Unicode (including bidi/format
+// characters) only at the human-output boundary. Keep machine values intact.
+fn human(text: &str) -> impl std::fmt::Display + '_ {
+    text.escape_debug()
+}
+
 fn diagnostics(out: &mut impl Write, items: &[Diagnostic]) -> io::Result<()> {
     for d in items {
         writeln!(
             out,
             "{}:{}: {}",
-            d.file,
+            human(&d.file),
             d.line.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-            d.message
+            human(&d.message)
         )?;
     }
     Ok(())
@@ -313,10 +321,10 @@ fn print_graph(out: &mut impl Write, graph: &GraphResult) -> io::Result<()> {
         writeln!(
             out,
             "{}  {}  {}  {}:{}",
-            n.id,
-            n.kind,
-            n.label,
-            n.file,
+            human(&n.id),
+            human(&n.kind),
+            human(&n.label),
+            human(&n.file),
             n.line.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
         )?;
     }
@@ -324,17 +332,22 @@ fn print_graph(out: &mut impl Write, graph: &GraphResult) -> io::Result<()> {
         writeln!(
             out,
             "{} --{}{} {}",
-            e.source,
-            e.relation,
+            human(&e.source),
+            human(&e.relation),
             if e.directed { "-->" } else { "---" },
-            e.target
+            human(&e.target)
         )?;
     }
     for r in &graph.unresolved {
         writeln!(
             out,
             "unresolved: {} --{}--> {} ({}:{}; {})",
-            r.source, r.relation, r.label, r.file, r.line, r.reason
+            human(&r.source),
+            human(&r.relation),
+            human(&r.label),
+            human(&r.file),
+            r.line,
+            human(&r.reason)
         )?;
     }
     if graph.nodes.is_empty() {
@@ -372,10 +385,15 @@ fn print_output(output: Output, json: bool) -> Result<()> {
                 writeln!(
                     stdout,
                     "Generation {} ({})\n{} nodes, {} edges, {} files, {} unresolved references",
-                    s.generation, s.kind, s.nodes, s.edges, s.files, s.unresolved_references
+                    s.generation,
+                    human(&s.kind),
+                    s.nodes,
+                    s.edges,
+                    s.files,
+                    s.unresolved_references
                 )?;
                 if let Some(root) = &s.root {
-                    writeln!(stdout, "Root: {root}")?;
+                    writeln!(stdout, "Root: {}", human(root))?;
                 }
                 writeln!(
                     stdout,
@@ -445,10 +463,24 @@ async fn run(cli: Cli) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
-    match run(Cli::parse()).await {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if error.use_stderr() {
+                // Preserve argument controls until we can visibly escape them;
+                // StyledStr's plain Display would silently strip ANSI input.
+                eprintln!("{}", human(error.render().ansi().to_string().trim_end()));
+            } else {
+                // Help/version contain only static command metadata.
+                let _ = error.print();
+            }
+            return std::process::ExitCode::from(error.exit_code() as u8);
+        }
+    };
+    match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("graf: {error:#}");
+            eprintln!("graf: {}", human(&format!("{error:#}")));
             std::process::ExitCode::FAILURE
         }
     }
