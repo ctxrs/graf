@@ -8,7 +8,7 @@ function Install-Graf {
     if ($from -and $from -cne 'graphify') { throw 'GRAF_FROM must be graphify.' }
 
     function Get-GrafDownload([string] $Url, [string] $Path) {
-        if ($Url -cnotmatch '\Ahttps://github\.com/ctxrs/graf/releases/(?:latest/download/graf-release\.json|download/v[0-9]+\.[0-9]+\.[0-9]+/(?:graf-release\.json(?:\.sig)?|graf-windows-x64\.exe(?:\.third-party-notices\.txt)?))\z') {
+        if ($Url -cnotmatch '\Ahttps://github\.com/ctxrs/graf/releases/(?:latest/download/graf-release\.json|download/v[0-9]+\.[0-9]+\.[0-9]+/(?:graf-release\.json(?:\.sig)?|graf-windows-x64\.exe(?:\.gz|\.third-party-notices\.txt)?))\z') {
             throw 'Invalid Graf release URL.'
         }
         # Follow GitHub asset redirects explicitly so a redirect cannot downgrade HTTPS.
@@ -144,21 +144,59 @@ function Install-Graf {
         if ($manifest.product -isnot [string] -or $manifest.product -cne 'graf' -or
             $manifest.repository -isnot [string] -or $manifest.repository -cne 'https://github.com/ctxrs/graf' -or
             ($manifest.schema_version -isnot [int] -and $manifest.schema_version -isnot [long]) -or
-            $manifest.schema_version -ne 1 -or $manifest.artifacts -isnot [array] -or $manifest.targets -isnot [array]) { throw 'Invalid Graf release manifest identity or schema.' }
+            $manifest.schema_version -notin @(1, 2) -or $manifest.artifacts -isnot [array] -or $manifest.targets -isnot [array]) { throw 'Invalid Graf release manifest identity or schema.' }
         $binaryName = 'graf-windows-x64.exe'
         $noticesName = "$binaryName.third-party-notices.txt"
-        $binaryHash = Get-GrafArtifactHash $manifest $binaryName
+        $artifactName = $binaryName
+        if ($manifest.schema_version -eq 2) { $artifactName += '.gz' }
+        $binaryHash = Get-GrafArtifactHash $manifest $artifactName
         $noticesHash = Get-GrafArtifactHash $manifest $noticesName
         $targets = @($manifest.targets | Where-Object { $_.id -is [string] -and $_.id -ceq 'windows-x64' })
         if ($targets.Count -ne 1 -or $targets[0].artifact -isnot [string] -or
-            $targets[0].artifact -cne $binaryName -or $targets[0].sha256 -isnot [string] -or
+            $targets[0].artifact -cne $artifactName -or $targets[0].sha256 -isnot [string] -or
             $targets[0].sha256 -ine $binaryHash) { throw 'Invalid Graf Windows target.' }
+        if ($manifest.schema_version -eq 2) {
+            $target = $targets[0]
+            foreach ($property in @('binary', 'binary_sha256', 'binary_size')) {
+                if ($null -eq $target.PSObject.Properties[$property]) { throw 'Invalid Graf Windows binary proof.' }
+            }
+            if ($target.binary -isnot [string] -or $target.binary -cne $binaryName -or
+                $target.binary_sha256 -isnot [string] -or $target.binary_sha256 -cnotmatch '\A[0-9a-fA-F]{64}\z' -or
+                ($target.binary_size -isnot [int] -and $target.binary_size -isnot [long]) -or
+                $target.binary_size -le 0 -or $target.binary_size -gt 1073741824) {
+                throw 'Invalid Graf Windows binary proof.'
+            }
+        }
         $binaryPath = Join-Path $stage $binaryName
+        $artifactPath = Join-Path $stage $artifactName
         $noticesPath = Join-Path $stage $noticesName
-        Get-GrafDownload "$release/$binaryName" $binaryPath
+        Get-GrafDownload "$release/$artifactName" $artifactPath
         Get-GrafDownload "$release/$noticesName" $noticesPath
-        Assert-GrafHash $binaryPath $binaryHash
+        Assert-GrafHash $artifactPath $binaryHash
         Assert-GrafHash $noticesPath $noticesHash
+        if ($manifest.schema_version -eq 2) {
+            $inputStream = [IO.File]::OpenRead($artifactPath)
+            try {
+                $gzip = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+                try {
+                    $output = [IO.File]::Open($binaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    try {
+                        $buffer = New-Object byte[] 65536
+                        $size = 0L
+                        while (($count = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $size += $count
+                            if ($size -gt $target.binary_size) { throw 'Graf executable size mismatch.' }
+                            $output.Write($buffer, 0, $count)
+                        }
+                        if ($size -ne $target.binary_size) { throw 'Graf executable size mismatch.' }
+                    }
+                    finally { $output.Dispose() }
+                }
+                finally { $gzip.Dispose() }
+            }
+            finally { $inputStream.Dispose() }
+            Assert-GrafHash $binaryPath $target.binary_sha256
+        }
         $authenticode = Get-AuthenticodeSignature -LiteralPath $binaryPath
         if ($authenticode.Status -ne 'Valid' -or $null -eq $authenticode.SignerCertificate -or
             $null -eq $authenticode.TimeStamperCertificate -or
