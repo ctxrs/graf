@@ -1,4 +1,7 @@
 mod mcp;
+mod switch;
+mod switch_config;
+mod switch_files;
 
 use std::{
     io::{self, Write},
@@ -32,6 +35,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Import a Graphify snapshot and switch this project's MCP connection.
+    Switch(switch::SwitchArgs),
     /// Index Python sources into PATH/.graf/index.db unless --db is supplied.
     Index {
         #[arg(default_value = ".")]
@@ -64,7 +69,18 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ImportFormat {
-    Graphify { file: PathBuf },
+    Graphify {
+        file: PathBuf,
+        /// node-link honors graph flags; export uses Graphify's logical edge direction and raw export layouts.
+        #[arg(long, value_enum, default_value = "node-link")]
+        format: SnapshotFormat,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SnapshotFormat {
+    NodeLink,
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, JsonSchema)]
@@ -420,8 +436,38 @@ fn print_output(output: Output, json: bool) -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if let Command::Switch(args) = cli.command {
+        ensure!(
+            cli.db.is_none(),
+            "switch uses the project's .graf/index.db; omit --db"
+        );
+        let report = switch::run(args)?;
+        if cli.json {
+            println!("{}", serde_json::to_string(&report)?);
+        } else {
+            println!(
+                "{}: {} nodes, {} edges.\nMCP config: {}\nDatabase: {}",
+                report.status,
+                report.nodes,
+                report.edges,
+                human(&report.config.display().to_string()),
+                human(&report.database.display().to_string())
+            );
+            if report.status != "undone" {
+                println!(
+                    "Verified Graf MCP. Restart your client to load Graf's tools.\nImported graphs are snapshots; Graphify generation remains available.\nUndo: graf switch --undo (use the same --project and --config, if supplied)"
+                );
+            } else {
+                println!(
+                    "Restored the MCP configuration; the imported database was retained. Restart your client."
+                );
+            }
+        }
+        return Ok(());
+    }
     let db = database(&cli)?;
     let command = match cli.command {
+        Command::Switch(_) => unreachable!(),
         Command::Index { path } => {
             return print_output(Output::Index(index::run(&path, &db)?), cli.json);
         }
@@ -438,9 +484,12 @@ async fn run(cli: Cli) -> Result<()> {
             return print_output(Output::Index(index::run(Path::new(&root), &db)?), cli.json);
         }
         Command::Import {
-            format: ImportFormat::Graphify { file },
+            format: ImportFormat::Graphify { file, format },
         } => {
-            let graph = import::read_graphify(&file)?;
+            let graph = match format {
+                SnapshotFormat::NodeLink => import::read_graphify(&file)?,
+                SnapshotFormat::Export => import::read_graphify_export(&file)?,
+            };
             if let Some(parent) = db.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
             }

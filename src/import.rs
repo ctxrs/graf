@@ -1,6 +1,6 @@
-//! Strict Graphify node-link snapshot import.
+//! Explicit node-link and Graphify-export snapshot import.
 //!
-//! The root requires `nodes`, exactly one of `links`/`edges`, and boolean
+//! In strict node-link mode the root requires `nodes`, exactly one of `links`/`edges`, and boolean
 //! `directed`/`multigraph`. Nodes require a string or integer `id`; edges require
 //! `source`/`target` (or agreeing `from`/`to` aliases). Strings remain unchanged;
 //! integers in i64/u64 range become `graphify:integer:<decimal>`. Floating-point
@@ -24,7 +24,19 @@
 //! fields are retained in metadata, as are all root fields except the node/edge
 //! arrays. `graph`, if present, must be an object. Hyperedges at the root or in
 //! `graph` must be empty arrays. Duplicate JSON keys are errors at every depth.
-//! Only the supplied snapshot is read, with a hard 256 MiB limit.
+//! Only the supplied regular file is read, with a hard 256 MiB limit.
+//!
+//! [`read_graphify_export`] explicitly selects Graphify producer semantics:
+//! missing root flags are permitted (default false for storage identity).
+//! Every edge is directed, using `_src`/`_tgt` when present, otherwise ordered
+//! source/target. Markers must name the same unordered endpoint pair, even if
+//! the root says directed=true. Root and edge direction flags describe storage;
+//! present flags must still be booleans, but do not override export direction.
+//! Without multigraph=true, keys are forbidden and every unkeyed fact survives,
+//! including repeated pairs/relations. With multigraph=true, every edge needs a
+//! string/integer key unique per serialized endpoint pair: ordered when the
+//! root directed=true, unordered otherwise. All modes assign ordinal edge IDs
+//! and retain original metadata without inserting or rewriting flags.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -42,9 +54,33 @@ use crate::model::{Edge, ImportedGraph, Node};
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 pub fn read_graphify(path: &Path) -> Result<ImportedGraph> {
-    let file = File::open(path).context("cannot open Graphify snapshot")?;
+    read_snapshot(path, false)
+}
+
+/// Read a Graphify-produced export, including raw no-cluster extraction/update.
+/// See the module contract for direction and parallel-edge interpretation.
+pub fn read_graphify_export(path: &Path) -> Result<ImportedGraph> {
+    read_snapshot(path, true)
+}
+
+fn read_snapshot(path: &Path, export: bool) -> Result<ImportedGraph> {
+    // Check before open: opening a FIFO with no writer would otherwise block.
+    // Symlinks to regular files remain supported. This is not an atomic defense
+    // against a path being replaced with a FIFO between metadata and open.
     ensure!(
-        file.metadata()?.len() <= MAX_BYTES,
+        std::fs::metadata(path)
+            .context("cannot inspect Graphify snapshot")?
+            .is_file(),
+        "Graphify snapshot must be a regular file"
+    );
+    let file = File::open(path).context("cannot open Graphify snapshot")?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "Graphify snapshot must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_BYTES,
         "Graphify snapshot exceeds 256 MiB limit"
     );
     let mut bytes = Vec::new();
@@ -57,8 +93,16 @@ pub fn read_graphify(path: &Path) -> Result<ImportedGraph> {
     );
     let StrictJson(value) = serde_json::from_slice(&bytes).context("invalid Graphify JSON")?;
     let mut root = into_object(value).context("Graphify root must be an object")?;
-    let directed = required_bool(&root, "directed")?;
-    let multigraph = required_bool(&root, "multigraph")?;
+    let directed = if export && !root.contains_key("directed") {
+        false
+    } else {
+        required_bool(&root, "directed")?
+    };
+    let multigraph = if export && !root.contains_key("multigraph") {
+        false
+    } else {
+        required_bool(&root, "multigraph")?
+    };
     empty_hyperedges(&root)?;
     if let Some(graph) = root.get("graph") {
         empty_hyperedges(graph.as_object().context("graph must be an object")?)?;
@@ -135,16 +179,18 @@ pub fn read_graphify(path: &Path) -> Result<ImportedGraph> {
             } else {
                 (source.clone(), target.clone())
             };
-            ensure!(identities.insert((pair, key)), "duplicate edge identity");
+            if !export || multigraph {
+                ensure!(identities.insert((pair, key)), "duplicate edge identity");
+            }
             let (source, target, edge_directed) = match (attrs.get("_src"), attrs.get("_tgt")) {
-                (None, None) => (source, target, directed),
+                (None, None) => (source, target, export || directed),
                 (Some(_), Some(_)) => {
                     let src = endpoint(&attrs, &["_src"], &ids)?;
                     let tgt = endpoint(&attrs, &["_tgt"], &ids)?;
                     let same = src == source && tgt == target;
                     let reversed = src == target && tgt == source;
                     ensure!(
-                        same || (!directed && reversed),
+                        same || ((export || !directed) && reversed),
                         "conflicting _src/_tgt orientation"
                     );
                     (src, tgt, true)
@@ -152,8 +198,9 @@ pub fn read_graphify(path: &Path) -> Result<ImportedGraph> {
                 _ => bail!("_src and _tgt must appear together"),
             };
             if attrs.contains_key("directed") {
+                let edge_flag = required_bool(&attrs, "directed")?;
                 ensure!(
-                    required_bool(&attrs, "directed")? == edge_directed,
+                    export || edge_flag == edge_directed,
                     "edge directed conflicts with graph direction or _src/_tgt"
                 );
             }
