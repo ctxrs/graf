@@ -56,7 +56,53 @@ macOS executables are Developer ID signed and notarized by Apple. `SHA256SUMS`
 is also provided for checking the complete downloaded asset set; the signed
 manifest authenticates those hashes.
 
-## Install
+## Install with a script
+
+Linux and macOS need `curl`, `openssl`, and standard shell utilities. Windows
+needs PowerShell 5.1 or newer. The scripts select the appropriate executable,
+verify the signed manifest and download hashes, and install `graf` with its
+license notices. The new executable must report the expected version before
+replacing an existing installation. macOS code signatures and Windows
+Authenticode signatures are checked as well.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh
+```
+
+The default directory is `~/.local/bin`. If it is not already on your `PATH`,
+add it in your shell configuration; for the current sh/bash/zsh session:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+graf --version
+```
+
+To choose a version or directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh \
+  | sh -s -- --version 0.1.0 --install-dir "$HOME/bin"
+```
+
+On Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
+```
+
+The default directory is `%LOCALAPPDATA%\Graf\bin`. Add it to your `PATH` in
+Windows environment settings if needed. To select a version or another directory,
+set `$env:GRAF_VERSION = '0.1.0'` or `$env:GRAF_INSTALL_DIR = 'C:\Tools\Graf'`
+before running the command. Those same environment variables work with the
+Unix installer. Neither script requires administrator access for its default
+directory or modifies your shell profiles.
+
+Rerun the installer to upgrade to the latest release, or set a version to install
+that release explicitly. A failed download or verification leaves the existing
+executable intact. Graph indexes are separate from the installed executable;
+`graf update` refreshes indexed source, not the Graf application.
+
+## Install manually
 
 After verification, install the downloaded Unix executable as `graf` in a
 directory on your `PATH`. For example, on Linux x64:
@@ -68,6 +114,6 @@ graf --version
 ```
 
 On Windows, rename `graf-windows-x64.exe` to `graf.exe` and place it in a directory
-on your `PATH`. These are manual installations. To upgrade, verify and replace
+on your `PATH`. To upgrade manually, verify and replace
 the executable from a newer release. Existing graph indexes remain local;
 `graf update` explicitly refreshes indexed source.
