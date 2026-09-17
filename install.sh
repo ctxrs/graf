@@ -10,6 +10,7 @@ main() (
         case "$1" in
             --version|--install-dir)
                 [ "$#" -ge 2 ] || fail "$1 requires a value"
+                [ -n "$2" ] || fail "$1 requires a nonempty value"
                 case "$1" in --version) version=$2 ;; --install-dir) install_dir=$2 ;; esac
                 shift 2 ;;
             -h|--help)
@@ -24,8 +25,10 @@ main() (
         case "$1" in ''|*[!0-9.]*) return 1 ;; esac
         printf '%s\n' "$1" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
     }
-    version=${version#v}
-    [ -z "$version" ] || valid_version "$version" || fail 'version must have the form 0.1.0'
+    if [ -n "$version" ]; then
+        version=${version#v}
+        valid_version "$version" || fail 'version must have the form 0.1.0'
+    fi
     requested_version=$version
     for tool in curl openssl awk grep uname mktemp; do
         command -v "$tool" >/dev/null 2>&1 || fail "required command not found: $tool"
