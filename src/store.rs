@@ -74,6 +74,16 @@ CREATE INDEX edges_target_direction_relation ON edges(target, directed, relation
 CREATE INDEX edges_owner ON edges(owner_file);
 "#;
 
+/// A concurrent writer committed after this handle captured its baseline.
+#[derive(Debug)]
+pub struct StaleStore;
+impl std::fmt::Display for StaleStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("graph changed since this Store was opened; retry from a fresh Store")
+    }
+}
+impl std::error::Error for StaleStore {}
+
 impl Store {
     /// Existing files must already be Graf databases. Even an empty foreign
     /// SQLite database is not an invitation to initialize it.
@@ -120,6 +130,18 @@ impl Store {
         })
     }
 
+    /// Open without write permission or migrations. Normal SQLite WAL locking
+    /// remains enabled so later committed generations stay visible.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = connect_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        validate(&conn)?;
+        let baseline_generation = generation(&conn)?;
+        Ok(Self {
+            conn,
+            baseline_generation,
+        })
+    }
+
     pub fn file_stamps(&self) -> Result<Vec<FileStamp>> {
         let mut stmt = self
             .conn
@@ -141,6 +163,178 @@ impl Store {
         Ok(stats)
     }
 
+    /// Read graph-level metadata without loading any nodes or edges.
+    pub fn graph_metadata(&self) -> Result<serde_json::Value> {
+        let json: String = self.conn.query_row(
+            "SELECT graph_metadata FROM metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Short saved-graph topic labels for an explicitly configured transcription adapter.
+    pub fn transcription_topics(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "WITH incidents AS (SELECT source AS id FROM edges UNION ALL SELECT target FROM edges),
+             degrees AS (SELECT id,count(*) AS degree FROM incidents GROUP BY id)
+             SELECT n.label FROM degrees d JOIN nodes n ON n.id=d.id
+             WHERE json_extract(n.payload,'$.kind') NOT IN ('file','module','document','group','rationale')
+             ORDER BY d.degree DESC,n.id LIMIT 64",
+        )?;
+        let mut topics = Vec::new();
+        let mut seen = BTreeSet::new();
+        for label in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let label: String = label?
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '+' | '.' | '#'))
+                .take(64)
+                .collect();
+            let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !label.is_empty() && seen.insert(label.to_lowercase()) {
+                topics.push(label);
+                if topics.len() == 8 {
+                    break;
+                }
+            }
+        }
+        Ok(topics)
+    }
+
+    /// Read every node and edge in one SQLite read transaction. This explicit
+    /// full read has no query limit and never returns a truncated graph.
+    pub fn snapshot(&self) -> Result<GraphSnapshot> {
+        self.snapshot_inner(None)
+    }
+
+    /// Check counts and stored payload bytes inside the same read transaction
+    /// before allocating records. Useful for bounded server consumers.
+    pub fn snapshot_bounded(
+        &self,
+        nodes: usize,
+        edges: usize,
+        references: usize,
+        payload_bytes: usize,
+    ) -> Result<GraphSnapshot> {
+        self.snapshot_inner(Some((nodes, edges, references, payload_bytes)))
+    }
+
+    fn snapshot_inner(
+        &self,
+        limits: Option<(usize, usize, usize, usize)>,
+    ) -> Result<GraphSnapshot> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (generation, kind, root, metadata): (i64, String, Option<String>, String) = tx
+            .query_row(
+                "SELECT generation,kind,root,graph_metadata FROM metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        if let Some((max_nodes, max_edges, max_refs, max_bytes)) = limits {
+            let mut total_bytes = metadata.len() as u64;
+            for (sql, limit) in [
+                (
+                    "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM nodes",
+                    max_nodes,
+                ),
+                (
+                    "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM edges",
+                    max_edges,
+                ),
+                (
+                    "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM refs WHERE resolved_target IS NULL",
+                    max_refs,
+                ),
+            ] {
+                let (count, bytes): (i64, i64) =
+                    tx.query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let (count, bytes) = (u64::try_from(count)?, u64::try_from(bytes)?);
+                ensure!(count <= limit as u64, "snapshot record count exceeds limit");
+                total_bytes = total_bytes
+                    .checked_add(bytes)
+                    .context("snapshot byte count overflow")?;
+                ensure!(
+                    total_bytes <= max_bytes as u64,
+                    "snapshot payload exceeds byte limit"
+                );
+            }
+        }
+        let nodes = read_payloads(&tx, "SELECT payload FROM nodes ORDER BY id")?;
+        let edges = read_payloads(&tx, "SELECT payload FROM edges ORDER BY id")?;
+        let mut metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+        if kind == "native" {
+            let references: Vec<Reference> = read_payloads(
+                &tx,
+                "SELECT payload FROM refs WHERE resolved_target IS NULL ORDER BY id",
+            )?;
+            if metadata.is_null() {
+                metadata = serde_json::json!({});
+            }
+            metadata
+                .as_object_mut()
+                .context("native graph metadata must be an object")?
+                .insert(
+                    "graf_unresolved_references".into(),
+                    serde_json::to_value(references)?,
+                );
+        }
+        let snapshot = GraphSnapshot {
+            schema_version: SCHEMA_VERSION,
+            generation: u64::try_from(generation)?,
+            kind,
+            root,
+            nodes,
+            edges,
+            metadata,
+        };
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn semantic_losses(&self, changed: &[FileFacts]) -> Result<Vec<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut losses = Vec::new();
+        for facts in changed {
+            // A managed source's capture key stays stable when its display name changes.
+            let source_glob = facts.path.strip_prefix(".graf/sources/").and_then(|path| {
+                let (key, _) = path.split_once('/')?;
+                (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| format!(".graf/sources/{key}/*"))
+            });
+            let mut old_nodes = 0;
+            let mut old_edges = 0;
+            for (query, count) in [
+                (
+                    "SELECT payload FROM nodes WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)",
+                    &mut old_nodes,
+                ),
+                (
+                    "SELECT payload FROM edges WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)",
+                    &mut old_edges,
+                ),
+            ] {
+                let mut stmt = tx.prepare(query)?;
+                for payload in
+                    stmt.query_map(params![facts.path, source_glob], |r| r.get::<_, String>(0))?
+                {
+                    let value: serde_json::Value = serde_json::from_str(&payload?)?;
+                    if crate::index::semantic_provenance(&value["metadata"]) {
+                        *count += 1;
+                    }
+                }
+            }
+            let (nodes, edges) = crate::index::semantic_counts(facts);
+            if nodes < old_nodes || edges < old_edges {
+                losses.push(format!(
+                    "{} (nodes {old_nodes}->{nodes}, edges {old_edges}->{edges})",
+                    facts.path
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(losses)
+    }
+
     pub fn apply_native(
         &mut self,
         root: &str,
@@ -148,15 +342,36 @@ impl Store {
         deleted: Vec<String>,
         coverage: Coverage,
     ) -> Result<IndexReport> {
+        self.apply_native_inner(root, changed, deleted, coverage, None)
+    }
+
+    pub fn apply_native_with_options(
+        &mut self,
+        root: &str,
+        changed: Vec<FileFacts>,
+        deleted: Vec<String>,
+        coverage: Coverage,
+        options: serde_json::Value,
+    ) -> Result<IndexReport> {
+        self.apply_native_inner(root, changed, deleted, coverage, Some(options))
+    }
+
+    fn apply_native_inner(
+        &mut self,
+        root: &str,
+        changed: Vec<FileFacts>,
+        deleted: Vec<String>,
+        coverage: Coverage,
+        options: Option<serde_json::Value>,
+    ) -> Result<IndexReport> {
         ensure!(!root.is_empty(), "native root cannot be empty");
         validate_facts(&changed, &deleted)?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        ensure!(
-            generation(&tx)? == self.baseline_generation,
-            "index changed since this scan started; retry indexing from a fresh Store"
-        );
+        if generation(&tx)? != self.baseline_generation {
+            return Err(StaleStore.into());
+        }
         let (kind, previous_root): (String, Option<String>) = tx.query_row(
             "SELECT kind, root FROM metadata WHERE singleton=1",
             [],
@@ -170,10 +385,70 @@ impl Store {
             );
         }
         let mut keys = BTreeSet::new();
+        ensure_aliases(&tx, &mut keys)?;
+        let aliases_migrated = !keys.is_empty();
+        let search_migrated = ensure_search(&tx)?;
+        let mut metadata: serde_json::Value = serde_json::from_str(&tx.query_row(
+            "SELECT graph_metadata FROM metadata WHERE singleton=1",
+            [],
+            |r| r.get::<_, String>(0),
+        )?)?;
+        let mut options_changed = false;
+        if let Some(options) = options {
+            if metadata.is_null() {
+                metadata = serde_json::json!({});
+            }
+            let attrs = metadata
+                .as_object_mut()
+                .context("native graph metadata must be an object")?;
+            options_changed = attrs.get("graf_index_options") != Some(&options);
+            attrs.insert("graf_index_options".to_owned(), options);
+        }
+        // Replacing a target cascades away incoming edges even when their
+        // unchanged owner still asserts them. References are rebound below;
+        // direct edges have no reference record from which to rebuild them.
+        let replaced: BTreeSet<_> = deleted
+            .iter()
+            .map(String::as_str)
+            .chain(changed.iter().map(|facts| facts.path.as_str()))
+            .collect();
+        let mut ruby_changed = changed.iter().any(|facts| {
+            facts
+                .nodes
+                .iter()
+                .any(|node| node.metadata["language"] == "ruby")
+        });
+        if !ruby_changed {
+            for path in &replaced {
+                ruby_changed = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_file=?1 AND json_extract(payload,'$.metadata.language')='ruby')",
+                    [path], |row| row.get(0),
+                )?;
+                if ruby_changed {
+                    break;
+                }
+            }
+        }
+        let mut incoming = Vec::new();
+        for facts in &changed {
+            let mut stmt = tx.prepare(
+                "SELECT e.payload,e.owner_file FROM nodes n JOIN edges e ON e.target=n.id
+                 WHERE n.owner_file=?1 AND e.ref_id IS NULL AND e.owner_file IS NOT NULL",
+            )?;
+            for row in stmt.query_map([&facts.path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (payload, owner) = row?;
+                if !replaced.contains(owner.as_str()) {
+                    incoming.push((serde_json::from_str::<Edge>(&payload)?, owner));
+                }
+            }
+        }
         let mut removed = 0;
         for path in deleted.iter().chain(changed.iter().map(|f| &f.path)) {
             let mut stmt = tx.prepare(
-                "SELECT binding_key FROM nodes WHERE owner_file=?1 AND binding_key IS NOT NULL",
+                "SELECT binding_key FROM nodes WHERE owner_file=?1 AND binding_key IS NOT NULL
+                 UNION SELECT a.binding_key FROM node_aliases a JOIN nodes n ON n.id=a.node_id WHERE n.owner_file=?1",
             )?;
             for key in stmt.query_map([path], |r| r.get::<_, String>(0))? {
                 keys.insert(key?);
@@ -200,6 +475,23 @@ impl Store {
                     keys.insert(key.clone());
                 }
                 insert_node(&tx, node, Some(&facts.path))?;
+                for alias in binding_aliases(node)? {
+                    keys.insert(alias.to_owned());
+                    tx.execute(
+                        "INSERT OR IGNORE INTO node_aliases(node_id,binding_key) VALUES(?1,?2)",
+                        params![node.id, alias],
+                    )?;
+                }
+            }
+        }
+        for (edge, owner) in incoming {
+            let endpoints_survive: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1) AND EXISTS(SELECT 1 FROM nodes WHERE id=?2)",
+                params![edge.source, edge.target],
+                |r| r.get(0),
+            )?;
+            if endpoints_survive {
+                insert_edge(&tx, &edge, Some(&owner), None)?;
             }
         }
         let mut affected = BTreeSet::new();
@@ -225,12 +517,53 @@ impl Store {
                 affected.insert(id?);
             }
         }
+        if ruby_changed {
+            let nodes: Vec<Node> = read_payloads(
+                &tx,
+                "SELECT payload FROM nodes WHERE json_extract(payload,'$.metadata.language')='ruby' ORDER BY id",
+            )?;
+            let context = crate::languages::scripted::RubyContext::from_nodes(&nodes);
+            let references: Vec<Reference> = read_payloads(
+                &tx,
+                "SELECT r.payload FROM refs r JOIN nodes n ON n.id=r.source WHERE json_extract(n.payload,'$.metadata.language')='ruby' ORDER BY r.id",
+            )?;
+            for reference in references {
+                let keys = context
+                    .inherited_keys(&reference)
+                    .unwrap_or_else(|| reference.candidate_keys.clone());
+                tx.execute("DELETE FROM ref_keys WHERE ref_id=?1", [&reference.id])?;
+                for (priority, key) in keys.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO ref_keys(ref_id,priority,binding_key) VALUES(?1,?2,?3)",
+                        params![reference.id, priority as i64, key],
+                    )?;
+                }
+                affected.insert(reference.id);
+            }
+        }
         for id in affected {
             resolve_reference(&tx, &id)?;
         }
-        let changed_generation = kind == "empty" || !changed.is_empty() || removed > 0;
-        tx.execute("UPDATE metadata SET kind='native', root=?1, coverage=?2, generation=generation+?3 WHERE singleton=1",
-            params![root, serde_json::to_string(&coverage)?, i64::from(changed_generation)])?;
+        let previous_coverage: Coverage = serde_json::from_str(&tx.query_row(
+            "SELECT coverage FROM metadata WHERE singleton=1",
+            [],
+            |r| r.get::<_, String>(0),
+        )?)?;
+        // The unchanged count describes this scan, not a change in stored facts.
+        // Keep no-op scans read-only; coverage changes still publish a generation.
+        let coverage_changed = previous_coverage.supported_files != coverage.supported_files
+            || previous_coverage.unsupported_files != coverage.unsupported_files;
+        let changed_generation = kind == "empty"
+            || !changed.is_empty()
+            || removed > 0
+            || options_changed
+            || aliases_migrated
+            || search_migrated
+            || coverage_changed;
+        if changed_generation {
+            tx.execute("UPDATE metadata SET kind='native', root=?1, coverage=?2, generation=generation+1, graph_metadata=?3 WHERE singleton=1",
+                params![root, serde_json::to_string(&coverage)?, serde_json::to_string(&metadata)?])?;
+        }
         let stats = read_stats(&tx)?;
         let report = IndexReport {
             schema_version: SCHEMA_VERSION,
@@ -241,6 +574,8 @@ impl Store {
             nodes: stats.nodes,
             edges: stats.edges,
             diagnostics: stats.diagnostics,
+            semantic_usage: None,
+            timings: None,
         };
         tx.commit()?;
         self.baseline_generation = report.generation;
@@ -248,16 +583,44 @@ impl Store {
     }
 
     pub fn import_graph(&mut self, graph: ImportedGraph) -> Result<Stats> {
+        self.write_import(graph, false)
+    }
+
+    /// Atomically replace an imported graph. Native indexes (even empty ones)
+    /// and handles opened before another writer committed cannot be replaced.
+    pub fn refresh_import(&mut self, graph: ImportedGraph) -> Result<Stats> {
+        self.write_import(graph, true)
+    }
+
+    fn write_import(&mut self, graph: ImportedGraph, refresh: bool) -> Result<Stats> {
+        crate::snapshot::validate_graph(&graph.nodes, &graph.edges)?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let kind: String =
-            tx.query_row("SELECT kind FROM metadata WHERE singleton=1", [], |r| {
-                r.get(0)
-            })?;
-        ensure!(kind == "empty", "import requires an empty Graf database");
-        // All inserts and mode changes roll back together on duplicate IDs or
-        // dangling endpoints. Nothing replaces an existing row.
+        if generation(&tx)? != self.baseline_generation {
+            return Err(StaleStore.into());
+        }
+        let (kind, root): (String, Option<String>) = tx.query_row(
+            "SELECT kind,root FROM metadata WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if refresh {
+            ensure!(
+                kind == "imported" && root.is_none(),
+                "refresh requires an imported snapshot without an index root"
+            );
+            tx.execute("DELETE FROM edges", [])?;
+            tx.execute("DELETE FROM nodes", [])?;
+        } else {
+            ensure!(
+                kind == "empty" && root.is_none(),
+                "import requires an empty Graf database"
+            );
+        }
+        ensure_search(&tx)?;
+        // Deletes, inserts, search triggers and generation advance commit as
+        // one transaction. Any validation or SQL failure retains the old graph.
         for node in &graph.nodes {
             insert_node(&tx, node, None)?;
         }
@@ -272,6 +635,29 @@ impl Store {
         Ok(stats)
     }
 
+    pub fn query_extended(
+        &self,
+        text: &str,
+        options: &crate::query::SearchOptions,
+    ) -> Result<crate::query::SearchResult> {
+        crate::query::query_extended(&self.conn, text, options, false)
+    }
+    pub fn neighbors_extended(
+        &self,
+        symbol: &str,
+        options: &crate::query::SearchOptions,
+    ) -> Result<crate::query::SearchResult> {
+        crate::query::query_extended(&self.conn, symbol, options, true)
+    }
+    pub fn path_extended(
+        &self,
+        source: &str,
+        target: &str,
+        options: &crate::query::SearchOptions,
+    ) -> Result<crate::query::PathSearchResult> {
+        crate::query::path_extended(&self.conn, source, target, options)
+    }
+
     pub fn query(&self, text: &str, options: &QueryOptions) -> Result<GraphResult> {
         crate::query::query(&self.conn, text, options)
     }
@@ -283,12 +669,20 @@ impl Store {
     }
 }
 
+fn read_payloads<T: serde::de::DeserializeOwned>(conn: &Connection, sql: &str) -> Result<Vec<T>> {
+    let mut stmt = conn.prepare(sql)?;
+    stmt.query_map([], |r| r.get::<_, String>(0))?
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect()
+}
+
 fn connect(path: &Path) -> Result<Connection> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("cannot open Graf database {}", path.display()))?;
+    connect_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+}
+
+fn connect_with_flags(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("cannot open Graf database {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     Ok(conn)
@@ -327,6 +721,7 @@ fn validate_facts(changed: &[FileFacts], deleted: &[String]) -> Result<()> {
         );
         let ids: BTreeSet<_> = facts.nodes.iter().map(|n| n.id.as_str()).collect();
         for node in &facts.nodes {
+            binding_aliases(node)?;
             ensure!(
                 node.file == facts.path,
                 "node file does not match its owning file"
@@ -355,13 +750,135 @@ fn validate_facts(changed: &[FileFacts], deleted: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn binding_aliases(node: &Node) -> Result<Vec<&str>> {
+    let Some(value) = node.metadata.get("binding_aliases") else {
+        return Ok(Vec::new());
+    };
+    value
+        .as_array()
+        .context("binding_aliases must be an array")?
+        .iter()
+        .map(|alias| {
+            let alias = alias.as_str().context("binding aliases must be strings")?;
+            ensure!(!alias.is_empty(), "binding alias cannot be empty");
+            Ok(alias)
+        })
+        .collect()
+}
+
+// Additive schema-1 extension: opening/querying old stores never migrates them.
+// Explicit indexing installs and backfills this derived index transactionally.
+fn ensure_aliases(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<()> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_aliases')",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE node_aliases (
+        node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        binding_key TEXT NOT NULL, PRIMARY KEY(node_id,binding_key)
+    ); CREATE INDEX node_aliases_binding ON node_aliases(binding_key,node_id);",
+    )?;
+    let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE owner_file IS NOT NULL")?;
+    for payload in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        let node: Node = serde_json::from_str(&payload?)?;
+        for alias in binding_aliases(&node)? {
+            keys.insert(alias.to_owned());
+            tx.execute(
+                "INSERT OR IGNORE INTO node_aliases(node_id,binding_key) VALUES(?1,?2)",
+                params![node.id, alias],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// Search enrichment is another additive schema-1 extension. Migration runs
+// only during an explicit write, under the same transaction/generation check.
+fn ensure_search(tx: &Transaction<'_>) -> Result<bool> {
+    let has_version: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='search_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_version {
+        tx.execute_batch(
+            "ALTER TABLE metadata ADD COLUMN search_version INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    let version: i64 = tx.query_row(
+        "SELECT search_version FROM metadata WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        version <= 1,
+        "unsupported Graf search index version {version}"
+    );
+    if version == 1 {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut stmt = tx.prepare("SELECT id,payload,search FROM nodes ORDER BY id")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let node: Node = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        let search = search_text(&node);
+        if search != row.get::<_, String>(2)? {
+            tx.execute(
+                "UPDATE nodes SET search=?1 WHERE id=?2",
+                params![search, node.id],
+            )?;
+            changed = true;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if changed {
+        tx.execute("DELETE FROM node_search", [])?;
+        tx.execute(
+            "INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes",
+            [],
+        )?;
+    }
+    tx.execute("UPDATE metadata SET search_version=1 WHERE singleton=1", [])?;
+    Ok(changed)
+}
+
+pub(crate) fn cjk(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' | '\u{20000}'..='\u{2fa1f}')
+}
+
 fn search_text(node: &Node) -> String {
-    let text = format!(
-        "{} {} {}",
+    let mut text = format!(
+        "{} {} {} {}",
+        node.id,
         node.label,
         node.qualified_name.as_deref().unwrap_or(""),
-        node.file
+        node.file,
     );
+    let mut attrs = &node.metadata;
+    while let Some(original) = attrs.get("original_metadata") {
+        attrs = original;
+    }
+    // Deliberately index named prose fields, never arbitrary metadata values.
+    for field in [
+        "rationale",
+        "description",
+        "summary",
+        "text",
+        "excerpt",
+        "evidence",
+    ] {
+        if let Some(value) = attrs.get(field).and_then(serde_json::Value::as_str) {
+            text.push(' ');
+            text.push_str(value);
+        }
+    }
     let mut search = String::with_capacity(text.len() * 2);
     let mut previous_lower = false;
     for c in text.chars() {
@@ -370,6 +887,23 @@ fn search_text(node: &Node) -> String {
         }
         previous_lower = c.is_lowercase() || c.is_numeric();
         search.push(if c == '_' { ' ' } else { c });
+    }
+    // Useful CJK recall without a dictionary or a query-side scan: preserve
+    // full strings and index individual ideographs plus adjacent bigrams.
+    let mut previous = None;
+    for c in text.chars() {
+        if cjk(c) {
+            search.push(' ');
+            search.push(c);
+            if let Some(before) = previous {
+                search.push(' ');
+                search.push(before);
+                search.push(c);
+            }
+            previous = Some(c);
+        } else {
+            previous = None;
+        }
     }
     // Retain the original spelling as well as identifier components.
     format!("{text} {search}")
@@ -405,9 +939,16 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
     } else {
         reference.reason.clone()
     };
-    for key in &reference.candidate_keys {
-        let mut stmt =
-            tx.prepare("SELECT id FROM nodes WHERE binding_key=?1 ORDER BY id LIMIT 2")?;
+    let keys = tx
+        .prepare("SELECT binding_key FROM ref_keys WHERE ref_id=?1 ORDER BY priority")?
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for key in &keys {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM nodes WHERE binding_key=?1
+                        UNION SELECT node_id FROM node_aliases WHERE binding_key=?1
+                        ORDER BY 1 LIMIT 2",
+        )?;
         let ids = stmt
             .query_map([key], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -429,6 +970,24 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
         params![target, reason, id],
     )?;
     if let Some(target) = target {
+        let mut metadata = serde_json::json!({"reference_id": reference.id});
+        let source_payload: String = tx.query_row(
+            "SELECT payload FROM nodes WHERE id=?1",
+            [&reference.source],
+            |row| row.get(0),
+        )?;
+        let source: serde_json::Value = serde_json::from_str(&source_payload)?;
+        if let Some(context) = source["metadata"]["python_references"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["reference_id"] == reference.id)
+            })
+            .and_then(|item| item["context"].as_str())
+        {
+            metadata["context"] = serde_json::Value::String(context.to_owned());
+        }
         let edge = Edge {
             id: format!("reference:{}", reference.id),
             source: reference.source,
@@ -438,7 +997,7 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
             file: Some(reference.file.clone()),
             line: Some(reference.line),
             confidence: "statically_resolved".to_owned(),
-            metadata: serde_json::json!({"reference_id": reference.id}),
+            metadata,
         };
         insert_edge(tx, &edge, Some(&reference.file), Some(id))?;
     }

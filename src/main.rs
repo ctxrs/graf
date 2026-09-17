@@ -1,3 +1,7 @@
+mod agent_setup;
+mod commands;
+mod connect;
+mod extraction;
 mod mcp;
 mod switch;
 mod switch_config;
@@ -29,30 +33,105 @@ struct Cli {
     /// Print machine-readable JSON instead of human-readable output.
     #[arg(long, global = true)]
     json: bool,
+    /// Explicitly append read-command metadata to a JSONL file.
+    #[arg(long, global = true)]
+    query_log: Option<PathBuf>,
+    /// Also include returned graph records in the explicit query log.
+    #[arg(long, global = true, requires = "query_log")]
+    log_responses: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Extended(commands::Command),
+    #[command(flatten)]
+    Connect(connect::Command),
+    /// Install reversible agent guidance, skills or MCP configuration.
+    Install(agent_setup::SetupArgs),
+    /// Remove only the selected Graf-owned agent integration.
+    Uninstall(agent_setup::SetupArgs),
+    /// Explicitly manage optional Git refresh hooks.
+    Hook(agent_setup::HookArgs),
     /// Import a Graphify snapshot and switch this project's MCP connection.
     Switch(switch::SwitchArgs),
-    /// Index Python sources into PATH/.graf/index.db unless --db is supplied.
+    /// Index supported source code and documents into a persistent local graph.
+    #[command(alias = "extract")]
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[command(flatten)]
+        extraction: extraction::ExtractionArgs,
     },
     /// Refresh the native source root recorded in the database.
-    Update,
+    Update {
+        /// Include measured detection, extraction and commit times in the report.
+        #[arg(long)]
+        timing: bool,
+        /// Re-extract local files once; saved remote sources remain offline.
+        #[arg(long)]
+        force: bool,
+        /// Bypass semantic/transcript cache reads for local sources once.
+        #[arg(long)]
+        refresh_cache: bool,
+        /// Accept fewer semantic facts, saving the previous graph in .graf/backups.
+        #[arg(long)]
+        allow_semantic_shrink: bool,
+    },
+    /// Compare local source fingerprints without model or converter calls.
+    CheckUpdate,
+    /// Explicit foreground polling; queries themselves never refresh the graph.
+    Watch {
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..=3_600_000))]
+        interval_ms: u64,
+        /// Stop after this many polls; omitted means until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        iterations: Option<u32>,
+    },
+    /// Explicitly import a URL, Google pointer or local document and retain its extracted facts.
+    Add {
+        source: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        contributor: Option<String>,
+        #[arg(long)]
+        captured_at_unix_secs: Option<u64>,
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        #[command(flatten)]
+        extraction: extraction::ExtractionArgs,
+    },
+    /// Manage semantic provider configurations; keys remain in the environment.
+    Provider(extraction::ProviderArgs),
+    /// Inspect or explicitly repair an extraction cache without provider calls.
+    Cache(extraction::CacheArgs),
+    /// Clone a GitHub repository with Git; optionally index it after checkout.
+    Clone {
+        url: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        index: bool,
+        /// Fetch and fast-forward an existing cached checkout; local changes are never reset.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Find symbols and explore a bounded neighborhood.
     Query(QueryArgs),
     /// Show an exact ID or unique symbol and its immediate neighbors.
+    #[command(alias = "explain")]
     Show(SymbolArgs),
     /// Show immediate incoming calls to a symbol.
     Callers(SymbolArgs),
     /// Show immediate outgoing calls from a symbol.
     Callees(SymbolArgs),
-    /// Follow incoming calls to find potentially affected symbols.
+    /// Follow reverse dependencies from a symbol, class members, or source file.
+    #[command(alias = "affected")]
     Impact(ImpactArgs),
     /// Find a bounded path, following outgoing edges by default.
     Path(PathArgs),
@@ -63,8 +142,8 @@ enum Command {
         #[command(subcommand)]
         format: ImportFormat,
     },
-    /// Serve seven read-only MCP tools over stdin/stdout.
-    Serve,
+    /// Serve read-only MCP tools over stdin/stdout or explicit HTTP.
+    Serve(mcp::ServeArgs),
 }
 
 #[derive(Subcommand)]
@@ -74,6 +153,14 @@ enum ImportFormat {
         /// node-link honors graph flags; export uses Graphify's logical edge direction and raw export layouts.
         #[arg(long, value_enum, default_value = "node-link")]
         format: SnapshotFormat,
+        /// Atomically replace an existing imported graph, retaining it on failure.
+        #[arg(long)]
+        refresh: bool,
+    },
+    Graf {
+        file: PathBuf,
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -145,6 +232,61 @@ struct QueryArgs {
     /// Exact relation filter, such as calls, imports, or contains; omitted means all.
     #[arg(long)]
     relation: Option<String>,
+    #[command(flatten)]
+    #[serde(flatten)]
+    navigation: NavigationArgs,
+}
+
+#[derive(Debug, Default, Args, Deserialize, JsonSchema)]
+#[serde(default)]
+struct NavigationArgs {
+    /// Use depth-first traversal instead of breadth-first.
+    #[arg(long)]
+    dfs: bool,
+    /// Restrict relationship contexts (repeatable).
+    #[arg(long)]
+    context: Vec<String>,
+    /// Restrict node source files (repeatable).
+    #[arg(long)]
+    file: Vec<String>,
+    /// Restrict node kinds (repeatable).
+    #[arg(long)]
+    kind: Vec<String>,
+    /// Approximate JSON token budget: UTF-8 bytes divided by four.
+    #[arg(long)]
+    budget: Option<usize>,
+    /// Include edges between any returned nodes, within the query bounds.
+    #[arg(long)]
+    induced_edges: bool,
+    #[arg(long)]
+    infer_context: bool,
+}
+impl NavigationArgs {
+    fn enabled(&self) -> bool {
+        self.dfs
+            || !self.context.is_empty()
+            || !self.file.is_empty()
+            || !self.kind.is_empty()
+            || self.budget.is_some()
+            || self.induced_edges
+            || self.infer_context
+    }
+    fn options(self, graph: QueryOptions) -> graf::query::SearchOptions {
+        graf::query::SearchOptions {
+            graph,
+            traversal: if self.dfs {
+                graf::query::Traversal::Dfs
+            } else {
+                graf::query::Traversal::Bfs
+            },
+            contexts: self.context,
+            files: self.file,
+            kinds: self.kind,
+            token_budget: self.budget,
+            induced_edges: self.induced_edges,
+            infer_context: self.infer_context,
+        }
+    }
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -158,6 +300,9 @@ struct SymbolArgs {
     #[serde(default = "hundred")]
     #[schemars(range(min = 1, max = 500))]
     limit: u32,
+    #[command(flatten)]
+    #[serde(flatten)]
+    navigation: NavigationArgs,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -166,7 +311,7 @@ struct ImpactArgs {
     /// Exact node ID or unique label/qualified name. Ambiguous names are errors.
     #[schemars(length(min = 1))]
     symbol: String,
-    /// Maximum incoming call depth, 0..6. Default 3.
+    /// Maximum reverse dependency depth, 0..6. Default 3.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=6))]
     #[serde(default = "three")]
     #[schemars(range(min = 0, max = 6))]
@@ -176,6 +321,13 @@ struct ImpactArgs {
     #[serde(default = "hundred")]
     #[schemars(range(min = 1, max = 500))]
     limit: u32,
+    /// Follow these dependency relations; repeat to combine. Defaults to known dependency relations.
+    #[arg(long)]
+    #[serde(default)]
+    relation: Vec<String>,
+    #[command(flatten)]
+    #[serde(flatten)]
+    navigation: NavigationArgs,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -204,6 +356,9 @@ struct PathArgs {
     /// Exact relation filter; omitted means all relations.
     #[arg(long)]
     relation: Option<String>,
+    #[command(flatten)]
+    #[serde(flatten)]
+    navigation: NavigationArgs,
 }
 
 enum ReadCommand {
@@ -219,6 +374,8 @@ enum ReadCommand {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Output {
+    Search(graf::query::SearchResult),
+    SearchPath(graf::query::PathSearchResult),
     Graph(GraphResult),
     Path(PathResult),
     Stats(Stats),
@@ -253,41 +410,87 @@ fn nonempty(value: &str, name: &str) -> Result<()> {
 }
 
 fn read(db: &Path, command: ReadCommand) -> Result<Output> {
-    let store = Store::open(db)?;
-    let (symbol, options) = match command {
+    let store = Store::open_read_only(db)?;
+    let (symbol, options, navigation) = match command {
         ReadCommand::Stats => return Ok(Output::Stats(store.stats()?)),
         ReadCommand::Query(a) => {
             nonempty(&a.text, "text")?;
-            return Ok(Output::Graph(store.query(
-                &a.text,
-                &options(a.depth, a.limit, a.direction.into(), a.relation)?,
-            )?));
+            let graph = options(a.depth, a.limit, a.direction.into(), a.relation)?;
+            let extended = a.navigation.enabled();
+            let result = store.query_extended(&a.text, &a.navigation.options(graph))?;
+            return Ok(if extended {
+                Output::Search(result)
+            } else {
+                Output::Graph(result.graph)
+            });
         }
         ReadCommand::Path(a) => {
             nonempty(&a.source, "source")?;
             nonempty(&a.target, "target")?;
-            return Ok(Output::Path(store.path(
+            let extended = a.navigation.enabled();
+            let path = store.path_extended(
                 &a.source,
                 &a.target,
-                &options(a.depth, a.limit, a.direction.into(), a.relation)?,
-            )?));
+                &a.navigation
+                    .options(options(a.depth, a.limit, a.direction.into(), a.relation)?),
+            )?;
+            if extended {
+                return Ok(Output::SearchPath(path));
+            }
+            return Ok(Output::Path(PathResult {
+                found: path.found,
+                graph: path.result.graph,
+            }));
         }
-        ReadCommand::Show(a) => (a.symbol, options(1, a.limit, Direction::Both, None)?),
+        ReadCommand::Show(a) => {
+            nonempty(&a.symbol, "symbol")?;
+            let extended = a.navigation.enabled();
+            let options = a
+                .navigation
+                .options(options(1, a.limit, Direction::Both, None)?);
+            let node = store.resolve_endpoint(&a.symbol, &options)?;
+            let result = store.neighbors_extended(&node.id, &options)?;
+            return Ok(if extended {
+                Output::Search(result)
+            } else {
+                Output::Graph(result.graph)
+            });
+        }
         ReadCommand::Callers(a) => (
             a.symbol,
             options(1, a.limit, Direction::Incoming, Some("calls".into()))?,
+            a.navigation,
         ),
         ReadCommand::Callees(a) => (
             a.symbol,
             options(1, a.limit, Direction::Outgoing, Some("calls".into()))?,
+            a.navigation,
         ),
-        ReadCommand::Impact(a) => (
-            a.symbol,
-            options(a.depth, a.limit, Direction::Incoming, Some("calls".into()))?,
-        ),
+        ReadCommand::Impact(a) => {
+            nonempty(&a.symbol, "symbol")?;
+            let result = store.impact_extended(
+                &a.symbol,
+                &graf::query::ImpactOptions {
+                    search: a.navigation.options(options(
+                        a.depth,
+                        a.limit,
+                        Direction::Incoming,
+                        None,
+                    )?),
+                    relations: a.relation,
+                },
+            )?;
+            return Ok(Output::Search(result));
+        }
     };
     nonempty(&symbol, "symbol")?;
-    Ok(Output::Graph(store.neighbors(&symbol, &options)?))
+    let extended = navigation.enabled();
+    let result = store.neighbors_extended(&symbol, &navigation.options(options))?;
+    Ok(if extended {
+        Output::Search(result)
+    } else {
+        Output::Graph(result.graph)
+    })
 }
 
 fn database(cli: &Cli) -> Result<PathBuf> {
@@ -295,7 +498,8 @@ fn database(cli: &Cli) -> Result<PathBuf> {
         return Ok(db.clone());
     }
     match &cli.command {
-        Command::Index { path } => Ok(path.join(".graf/index.db")),
+        Command::Index { path, .. } => Ok(path.join(".graf/index.db")),
+        Command::Add { project, .. } => Ok(project.join(".graf/index.db")),
         Command::Import { .. } => Ok(std::env::current_dir()?.join(".graf/index.db")),
         _ => {
             let cwd = std::env::current_dir()?;
@@ -382,7 +586,36 @@ fn print_output(output: Output, json: bool) -> Result<()> {
         writeln!(stdout)?;
     } else {
         match &output {
+            Output::Search(result) => {
+                print_graph(&mut stdout, &result.graph)?;
+                writeln!(stdout, "Estimated JSON tokens: {}", result.estimated_tokens)?;
+                for reason in &result.truncation_reasons {
+                    writeln!(stdout, "{}", human(reason))?;
+                }
+            }
             Output::Graph(graph) => print_graph(&mut stdout, graph)?,
+            Output::SearchPath(path) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    if path.found {
+                        "Path found."
+                    } else if path.result.graph.truncated {
+                        "Search incomplete: no path found within query bounds."
+                    } else {
+                        "No path found."
+                    }
+                )?;
+                print_graph(&mut stdout, &path.result.graph)?;
+                writeln!(
+                    stdout,
+                    "Estimated JSON tokens: {}",
+                    path.result.estimated_tokens
+                )?;
+                for reason in &path.result.truncation_reasons {
+                    writeln!(stdout, "{}", human(reason))?;
+                }
+            }
             Output::Path(path) => {
                 writeln!(
                     stdout,
@@ -428,14 +661,217 @@ fn print_output(output: Output, json: bool) -> Result<()> {
     }
     // JSON retains the full report; diagnostics never contaminate stdout as prose.
     match &output {
-        Output::Index(r) => diagnostics(&mut io::stderr().lock(), &r.diagnostics)?,
+        Output::Index(r) => {
+            diagnostics(&mut io::stderr().lock(), &r.diagnostics)?;
+            if !json && let Some(t) = &r.timings {
+                eprintln!(
+                    "Timing (ms): detect={:.3} extract={:.3} commit={:.3} total={:.3}",
+                    t.detect_ms, t.extract_ms, t.commit_ms, t.total_ms
+                );
+            }
+        }
         Output::Stats(s) => diagnostics(&mut io::stderr().lock(), &s.diagnostics)?,
         _ => {}
     }
     Ok(())
 }
 
-async fn run(cli: Cli) -> Result<()> {
+fn print_value(value: &impl Serialize, json: bool) -> Result<()> {
+    let mut out = io::stdout().lock();
+    if json {
+        serde_json::to_writer(&mut out, value)?;
+    } else {
+        serde_json::to_writer_pretty(&mut out, value)?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+fn native_root(db: &Path) -> Result<PathBuf> {
+    let stats = Store::open_read_only(db)?.stats()?;
+    ensure!(
+        stats.kind == "native",
+        "this command requires a native index"
+    );
+    Ok(PathBuf::from(
+        stats.root.context("native index has no source root")?,
+    ))
+}
+
+fn retryable_update(error: &anyhow::Error) -> bool {
+    error.is::<graf::store::StaleStore>() || error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    })
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if !matches!(
+        cli.command,
+        Command::Install(_) | Command::Uninstall(_) | Command::Hook(_) | Command::Serve(_)
+    ) {
+        let current = std::env::current_dir().ok();
+        let project = match &cli.command {
+            Command::Index { path, .. } => Some(path.as_path()),
+            Command::Add { project, .. } => Some(project.as_path()),
+            Command::Provider(args) => args.project.as_deref(),
+            _ => cli
+                .db
+                .as_deref()
+                .and_then(Path::parent)
+                .filter(|directory| directory.file_name().is_some_and(|name| name == ".graf"))
+                .and_then(Path::parent)
+                .or(current.as_deref()),
+        };
+        for notice in agent_setup::guidance_notices(project) {
+            eprintln!("{}", human(&notice));
+        }
+    }
+    match &cli.command {
+        Command::Clone {
+            url,
+            output,
+            branch,
+            index,
+            refresh,
+        } => {
+            let parsed =
+                reqwest::Url::parse(url).context("expected an HTTPS GitHub repository URL")?;
+            ensure!(
+                parsed.scheme() == "https"
+                    && parsed.host_str() == Some("github.com")
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none()
+                    && parsed.port().is_none(),
+                "expected an HTTPS GitHub repository URL without credentials or query parameters"
+            );
+            let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
+            ensure!(
+                parts.len() == 2
+                    && parts.iter().all(|p| !matches!(*p, "" | "." | "..")
+                        && p.bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))),
+                "expected github.com/OWNER/REPOSITORY"
+            );
+            let name = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            ensure!(
+                !name.is_empty() && name != "." && name != "..",
+                "invalid repository name"
+            );
+            let output = match output {
+                Some(output) => output.clone(),
+                None => PathBuf::from(
+                    std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .context("home directory unavailable; pass --output")?,
+                )
+                .join(".graf/repos")
+                .join(parts[0])
+                .join(name),
+            };
+            ensure!(*index || cli.db.is_none(), "--db requires clone --index");
+            let reused = output.try_exists()?;
+            if reused {
+                ensure!(
+                    output.is_dir() && output.join(".git").try_exists()?,
+                    "clone destination is not a Git checkout"
+                );
+                let git = |args: &[&str]| -> Result<String> {
+                    let result = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&output)
+                        .args(args)
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .output()
+                        .context("cannot launch Git")?;
+                    ensure!(
+                        result.status.success(),
+                        "Git cache operation failed; inspect the checkout and repository access"
+                    );
+                    Ok(String::from_utf8(result.stdout)
+                        .context("Git returned non-UTF-8 metadata")?
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned())
+                };
+                let origin = git(&["config", "--get", "remote.origin.url"])?;
+                ensure!(
+                    origin
+                        .trim_end_matches('/')
+                        .trim_end_matches(".git")
+                        .eq_ignore_ascii_case(
+                            parsed
+                                .as_str()
+                                .trim_end_matches('/')
+                                .trim_end_matches(".git")
+                        ),
+                    "existing checkout has a different origin; choose another --output"
+                );
+                let current = git(&["symbolic-ref", "--short", "HEAD"])?;
+                if let Some(branch) = branch {
+                    ensure!(
+                        branch == &current,
+                        "existing checkout uses a different branch; choose another --output"
+                    );
+                }
+                if *refresh {
+                    git(&["pull", "--ff-only", "--", "origin", &current])?;
+                }
+            } else {
+                if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut command = std::process::Command::new("git");
+                command
+                    .args(["clone", "--depth", "1"])
+                    .env("GIT_TERMINAL_PROMPT", "0");
+                if let Some(branch) = branch {
+                    command.arg("--branch").arg(branch);
+                }
+                let result = command
+                    .arg("--")
+                    .arg(parsed.as_str())
+                    .arg(&output)
+                    .output()
+                    .context("cannot launch Git")?;
+                ensure!(
+                    result.status.success(),
+                    "Git clone failed; check repository access, branch and destination"
+                );
+            }
+            let report = if *index {
+                let db = cli
+                    .db
+                    .clone()
+                    .unwrap_or_else(|| output.join(".graf/index.db"));
+                Some(graf::index::run(&output, &db)?)
+            } else {
+                None
+            };
+            return print_value(
+                &serde_json::json!({"status":if reused { if *refresh { "refreshed" } else { "reused" } } else { "cloned" },"path":output,"index":report}),
+                cli.json,
+            );
+        }
+        Command::Extended(args) => return commands::run(args, cli.db.as_deref(), cli.json),
+        Command::Connect(args) => return connect::run(args, cli.db.as_deref(), cli.json),
+        Command::Provider(args) => return print_value(&extraction::provider(args)?, cli.json),
+        Command::Cache(args) => return print_value(&extraction::cache(args)?, cli.json),
+        Command::Install(args) => {
+            ensure!(cli.db.is_none(), "install selects a project; omit --db");
+            return print_value(&agent_setup::install(args)?, cli.json);
+        }
+        Command::Uninstall(args) => {
+            ensure!(cli.db.is_none(), "uninstall selects a project; omit --db");
+            return print_value(&agent_setup::uninstall(args)?, cli.json);
+        }
+        Command::Hook(args) => {
+            ensure!(cli.db.is_none(), "hook selects a project; omit --db");
+            return print_value(&agent_setup::hook(args)?, cli.json);
+        }
+        _ => (),
+    }
+
     if let Command::Switch(args) = cli.command {
         ensure!(
             cli.db.is_none(),
@@ -467,12 +903,97 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let db = database(&cli)?;
     let command = match cli.command {
-        Command::Switch(_) => unreachable!(),
-        Command::Index { path } => {
-            return print_output(Output::Index(index::run(&path, &db)?), cli.json);
+        Command::Switch(_)
+        | Command::Install(_)
+        | Command::Uninstall(_)
+        | Command::Hook(_)
+        | Command::Extended(_)
+        | Command::Connect(_)
+        | Command::Provider(_)
+        | Command::Cache(_)
+        | Command::Clone { .. } => unreachable!(),
+        Command::Index { path, extraction } => {
+            let options = extraction.configure(index::stored_options(&db)?, &path, &db)?;
+            return print_output(
+                Output::Index(index::run_with_options(&path, &db, &options)?),
+                cli.json,
+            );
         }
-        Command::Update => {
-            let stats = Store::open(&db)?.stats()?;
+        Command::Add {
+            source,
+            name,
+            contributor,
+            captured_at_unix_secs,
+            project,
+            extraction,
+        } => {
+            let root = project.canonicalize().context("cannot resolve project")?;
+            ensure!(root.is_dir(), "project must be a directory");
+            let options = extraction.configure(index::stored_options(&db)?, &root, &db)?;
+            if db.try_exists()? {
+                let stats = Store::open_read_only(&db)?.stats()?;
+                ensure!(
+                    stats.kind == "native" && stats.root.as_deref() == root.to_str(),
+                    "add requires this project's native graph"
+                );
+            }
+            let capture = graf::ingest::CaptureMetadata {
+                contributor,
+                captured_at_unix_secs,
+            };
+            let (record, report) = graf::sources::add_and_index(
+                &root,
+                &db,
+                &source,
+                name.as_deref(),
+                &options,
+                &capture,
+            )?;
+            return print_value(
+                &serde_json::json!({"source":record.source,"path":record.facts.path,"index":report}),
+                cli.json,
+            );
+        }
+        Command::CheckUpdate => {
+            return print_value(&index::check_update(&native_root(&db)?, &db)?, cli.json);
+        }
+        Command::Watch {
+            interval_ms,
+            iterations,
+        } => {
+            let root = native_root(&db)?;
+            let mut polls = 0;
+            loop {
+                let result = (|| -> Result<()> {
+                    if !index::check_update(&root, &db)?.fresh {
+                        print_output(Output::Index(index::run(&root, &db)?), cli.json)?;
+                    }
+                    Ok(())
+                })();
+                let pending = match result {
+                    Err(error) if retryable_update(&error) => {
+                        eprintln!(
+                            "index is busy or changed concurrently; retrying at the next watch poll"
+                        );
+                        Some(error)
+                    }
+                    Err(error) => return Err(error),
+                    Ok(()) => None,
+                };
+                polls += 1;
+                if iterations.is_some_and(|limit| polls >= limit) {
+                    return pending.map_or(Ok(()), Err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        }
+        Command::Update {
+            timing,
+            force,
+            refresh_cache,
+            allow_semantic_shrink,
+        } => {
+            let stats = Store::open_read_only(&db)?.stats()?;
             ensure!(
                 stats.kind == "native",
                 "update requires a native index, not {}",
@@ -481,24 +1002,48 @@ async fn run(cli: Cli) -> Result<()> {
             let root = stats
                 .root
                 .context("native index has no recorded source root")?;
-            return print_output(Output::Index(index::run(Path::new(&root), &db)?), cli.json);
+            let mut options = index::stored_options(&db)?;
+            options.force = force || refresh_cache;
+            options.timing = timing;
+            options.ingest.force_cache_refresh = refresh_cache;
+            options.allow_semantic_shrink = allow_semantic_shrink;
+            return print_output(
+                Output::Index(index::run_with_options(Path::new(&root), &db, &options)?),
+                cli.json,
+            );
         }
-        Command::Import {
-            format: ImportFormat::Graphify { file, format },
-        } => {
-            let graph = match format {
-                SnapshotFormat::NodeLink => import::read_graphify(&file)?,
-                SnapshotFormat::Export => import::read_graphify_export(&file)?,
+        Command::Import { format } => {
+            let (graph, refresh) = match format {
+                ImportFormat::Graphify {
+                    file,
+                    format,
+                    refresh,
+                } => (
+                    match format {
+                        SnapshotFormat::NodeLink => import::read_graphify(&file)?,
+                        SnapshotFormat::Export => import::read_graphify_export(&file)?,
+                    },
+                    refresh,
+                ),
+                ImportFormat::Graf { file, refresh } => (graf::snapshot::read(&file)?, refresh),
             };
             if let Some(parent) = db.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
             }
-            return print_output(
-                Output::Stats(Store::create(&db)?.import_graph(graph)?),
-                cli.json,
-            );
+            let mut store = Store::create(&db)?;
+            let stats = if refresh {
+                store.refresh_import(graph)?
+            } else {
+                store.import_graph(graph)?
+            };
+            return print_output(Output::Stats(stats), cli.json);
         }
-        Command::Serve => return mcp::serve(db).await,
+        Command::Serve(args) => {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(mcp::serve(db, args));
+        }
         Command::Query(a) => ReadCommand::Query(a),
         Command::Show(a) => ReadCommand::Show(a),
         Command::Callers(a) => ReadCommand::Callers(a),
@@ -507,11 +1052,79 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Path(a) => ReadCommand::Path(a),
         Command::Stats => ReadCommand::Stats,
     };
-    print_output(read(&db, command)?, cli.json)
+    let (kind, question) = match &command {
+        ReadCommand::Query(a) => ("query", a.text.clone()),
+        ReadCommand::Show(a) => ("show", a.symbol.clone()),
+        ReadCommand::Callers(a) => ("callers", a.symbol.clone()),
+        ReadCommand::Callees(a) => ("callees", a.symbol.clone()),
+        ReadCommand::Impact(a) => ("impact", a.symbol.clone()),
+        ReadCommand::Path(a) => ("path", format!("{} -> {}", a.source, a.target)),
+        ReadCommand::Stats => ("stats", String::new()),
+    };
+    let start = std::time::Instant::now();
+    let output = read(&db, command)?;
+    if let Some(path) = cli.query_log.as_deref() {
+        let response = serde_json::to_value(&output)?;
+        let graph = response.get("result").unwrap_or(&response);
+        let graph = graph.get("graph").unwrap_or(graph);
+        let mut record = serde_json::json!({
+            "timestamp_unix_secs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            "kind":kind,"question":question,"corpus":db,
+            "duration_ms":start.elapsed().as_millis(),"generation":graph.get("generation"),
+            "nodes":graph.get("nodes").and_then(|v|v.as_array()).map(Vec::len),
+            "response_bytes":serde_json::to_vec(&response)?.len(),
+        });
+        if cli.log_responses {
+            record["response"] = response;
+        }
+        if append_query_log(path, &record).is_err() {
+            eprintln!("graf: query log could not be written; query result is still available");
+        }
+    }
+    print_output(output, cli.json)
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::process::ExitCode {
+fn append_query_log(path: &Path, record: &serde_json::Value) -> Result<()> {
+    use std::io::{BufRead, Read, Seek};
+    let mut bytes = serde_json::to_vec(record)?;
+    ensure!(bytes.len() <= 1024 * 1024, "query log record exceeds 1 MiB");
+    bytes.push(b'\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        ensure!(metadata.is_file(), "query log must be a regular file");
+    }
+    let mut file = options.open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "query log must be a regular file"
+    );
+    if file.metadata()?.len() > 0 {
+        let mut first = Vec::new();
+        std::io::BufReader::new((&mut file).take(1024 * 1024 + 1)).read_until(b'\n', &mut first)?;
+        ensure!(
+            serde_json::from_slice::<serde_json::Value>(&first)?.is_object(),
+            "existing log must contain JSON objects"
+        );
+        file.seek(std::io::SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        if tail[0] != b'\n' {
+            bytes.insert(0, b'\n');
+        }
+    }
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -526,7 +1139,7 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(error.exit_code() as u8);
         }
     };
-    match run(cli).await {
+    match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("graf: {}", human(&format!("{error:#}")));

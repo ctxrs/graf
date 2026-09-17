@@ -88,7 +88,8 @@ fn imported_cli_routes_direction_relations_and_preserves_snapshot() {
     let callees = success(cli(dir.path(), &["callees", "b", "--json"]));
     assert_eq!(ids(&callees), ["b", "c"]);
     let impact = success(cli(dir.path(), &["impact", "c", "--json"]));
-    assert_eq!(ids(&impact), ["a", "b", "c"]);
+    assert_eq!(ids(&impact["graph"]), ["a", "b", "c", "x"]);
+    assert_eq!(impact["seeds"], json!(["c", "x"]));
     let show = success(cli(dir.path(), &["show", "c", "--json"]));
     assert_eq!(ids(&show), ["b", "c", "x"]);
     let query = success(cli(
@@ -384,12 +385,20 @@ fn mcp_stdio_has_typed_read_only_tools_and_honest_errors() {
         let tools = listing["result"]["tools"].as_array().unwrap();
         let mut names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "callees", "callers", "impact", "path", "query", "show", "stats"
-            ]
-        );
+        for required in [
+            "callees",
+            "callers",
+            "impact",
+            "path",
+            "query",
+            "show",
+            "stats",
+            "graph_stats",
+            "god_nodes",
+            "get_community",
+        ] {
+            assert!(names.contains(&required), "missing MCP tool {required}");
+        }
         for tool in tools {
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
         }
