@@ -69,7 +69,9 @@ function Install-Graf {
 
     function Move-GrafFile([string] $Source, [string] $Destination) {
         Assert-GrafFileTarget $Destination
-        if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Source, $Destination, $null) }
+        if ([IO.File]::Exists($Destination)) {
+            [IO.File]::Replace($Source, $Destination, [Management.Automation.Language.NullString]::Value)
+        }
         else { [IO.File]::Move($Source, $Destination) }
     }
 
