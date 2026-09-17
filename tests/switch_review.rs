@@ -258,3 +258,107 @@ fn edits_after_switch_or_undo_are_not_overwritten() {
         }
     }
 }
+
+#[test]
+fn ordinary_receipt_repeat_preserves_config_database_and_receipt() {
+    let dir = project();
+    let root = dir.path();
+    write(
+        &root.join(".mcp.json"),
+        config("graphify-out/graph.json").to_string(),
+    );
+    success(cli(root, &["switch", "graphify"]));
+    let paths = [".mcp.json", ".graf/index.db", ".graf/switch-graphify.json"];
+    let before = paths.map(|path| fs::read(root.join(path)).unwrap());
+
+    for args in [
+        &["switch", "graphify"][..],
+        &["switch", "graphify", "--config", ".mcp.json"][..],
+    ] {
+        assert_eq!(success(cli(root, args))["status"], "already_switched");
+        assert_eq!(paths.map(|path| fs::read(root.join(path)).unwrap()), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn receipt_parent_redirect_requires_explicit_resolved_global_config() {
+    let dir = project();
+    let root = dir.path();
+    let external = tempdir().unwrap();
+    let original = config("graphify-out/graph.json").to_string();
+    write(&root.join(".cursor/mcp.json"), &original);
+    success(cli(root, &["switch", "graphify"]));
+    let migrated = fs::read(root.join(".cursor/mcp.json")).unwrap();
+    let receipt = fs::read(root.join(".graf/switch-graphify.json")).unwrap();
+    let database = fs::read(root.join(".graf/index.db")).unwrap();
+
+    let moved = external.path().join("cursor");
+    fs::rename(root.join(".cursor"), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, root.join(".cursor")).unwrap();
+    let global = moved.join("mcp.json").canonicalize().unwrap();
+
+    for action in ["graphify", "--undo"] {
+        failure(cli(root, &["switch", action]));
+        assert_eq!(fs::read(&global).unwrap(), migrated);
+        assert_eq!(
+            fs::read(root.join(".graf/switch-graphify.json")).unwrap(),
+            receipt
+        );
+        assert_eq!(fs::read(root.join(".graf/index.db")).unwrap(), database);
+    }
+
+    // Selecting the resolved global path explicitly authorizes the same receipt.
+    for (action, status, expected) in [
+        ("graphify", "already_switched", migrated.as_slice()),
+        ("--undo", "undone", original.as_bytes()),
+        ("graphify", "switched", migrated.as_slice()),
+    ] {
+        let report = success(cli(
+            root,
+            &["switch", action, "--config", global.to_str().unwrap()],
+        ));
+        assert_eq!(report["status"], status);
+        assert_eq!(Path::new(report["config"].as_str().unwrap()), global);
+        assert_eq!(fs::read(&global).unwrap(), expected);
+        assert_eq!(
+            fs::read(root.join(".graf/switch-graphify.json")).unwrap(),
+            receipt
+        );
+        assert_eq!(fs::read(root.join(".graf/index.db")).unwrap(), database);
+        // The opt-in applies to this invocation, not future repeat/redo calls.
+        failure(cli(root, &["switch", "graphify"]));
+        assert_eq!(fs::read(&global).unwrap(), expected);
+    }
+}
+
+#[test]
+fn receipt_parent_traversal_is_rejected_even_when_config_bytes_match() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("project");
+    write(&root.join("graphify-out/graph.json"), graph("original"));
+    let original = config("graphify-out/graph.json").to_string();
+    write(&root.join(".mcp.json"), &original);
+    success(cli(&root, &["switch", "graphify"]));
+    let migrated = fs::read(root.join(".mcp.json")).unwrap();
+    let database = fs::read(root.join(".graf/index.db")).unwrap();
+    let receipt_path = root.join(".graf/switch-graphify.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["config"] = json!(root.canonicalize().unwrap().join("../global.json"));
+    let forged = serde_json::to_vec(&receipt).unwrap();
+    fs::write(&receipt_path, &forged).unwrap();
+    let global = dir.path().join("global.json");
+
+    // A valid database and exact before/after config bytes must not authorize
+    // an external destination hidden behind a project-prefixed path.
+    for matching in [original.as_bytes(), migrated.as_slice()] {
+        write(&global, matching);
+        for action in ["graphify", "--undo"] {
+            failure(cli(&root, &["switch", action]));
+            assert_eq!(fs::read(&global).unwrap(), matching);
+            assert_eq!(fs::read(root.join(".mcp.json")).unwrap(), migrated);
+            assert_eq!(fs::read(&receipt_path).unwrap(), forged);
+            assert_eq!(fs::read(root.join(".graf/index.db")).unwrap(), database);
+        }
+    }
+}

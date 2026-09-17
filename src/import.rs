@@ -40,7 +40,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
@@ -64,16 +64,26 @@ pub fn read_graphify_export(path: &Path) -> Result<ImportedGraph> {
 }
 
 fn read_snapshot(path: &Path, export: bool) -> Result<ImportedGraph> {
-    // Check before open: opening a FIFO with no writer would otherwise block.
-    // Symlinks to regular files remain supported. This is not an atomic defense
-    // against a path being replaced with a FIFO between metadata and open.
+    // Reject nonregular paths before open; symlinks to regular files remain supported.
     ensure!(
         std::fs::metadata(path)
             .context("cannot inspect Graphify snapshot")?
             .is_file(),
         "Graphify snapshot must be a regular file"
     );
-    let file = File::open(path).context("cannot open Graphify snapshot")?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A regular path can become a FIFO after the check. Nonblocking open
+        // lets the descriptor check below reject it without waiting for a writer.
+        // O_NONBLOCK has no effect on regular files.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .context("cannot open Graphify snapshot")?;
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file(),

@@ -145,14 +145,17 @@ fn write_atomic(path: &Path, bytes: &[u8], expected: Option<&[u8]>) -> Result<()
         path.display()
     );
     let parent = path.parent().context("file has no parent directory")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    // Protect the empty directory before creating a file that will hold secrets.
+    // This also prevents inherited ACL readers opening the file before protection.
+    let staging = tempfile::tempdir_in(parent)?;
+    switch_files::protect(staging.path())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(staging.path())?;
     switch_files::protect(tmp.path())?;
+    if expected.is_some() {
+        switch_files::preserve_permissions(tmp.as_file(), path)?;
+    }
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    if expected.is_some() {
-        tmp.as_file()
-            .set_permissions(fs::metadata(path)?.permissions())?;
-    }
     // Recheck immediately before replacement. The project lock serializes Graf
     // migrations; editors do not participate, so callers should close the client.
     ensure!(
@@ -387,12 +390,15 @@ pub fn run(args: SwitchArgs) -> Result<Report> {
         None
     };
     if let Some(bytes) = existing {
-        let record: Receipt =
+        let mut record: Receipt =
             serde_json::from_slice(&bytes).context("invalid Graf migration record")?;
         ensure!(
             record.schema_version == 1 && record.project == project,
             "migration record does not belong to this project"
         );
+        // Parent components can be redirected after the initial switch. Resolve
+        // the saved destination again before applying project/global boundaries.
+        record.config = config_path(&record.config)?;
         let selected_config = args
             .config
             .as_ref()
@@ -537,7 +543,7 @@ pub fn run(args: SwitchArgs) -> Result<Report> {
     verify(&staged_db, &exe, nodes, edges)?;
     record.database_hash = database_hash(&staged_db)?;
     // Closing the last SQLite connection checkpoints WAL before publishing the DB.
-    let mut target = tempfile::NamedTempFile::new_in(&directory)?;
+    let mut target = tempfile::NamedTempFile::new_in(staging.path())?;
     switch_files::protect(target.path())?;
     std::io::copy(&mut File::open(&staged_db)?, &mut target)?;
     target.as_file().sync_all()?;
