@@ -326,10 +326,9 @@ fn explicit_and_relative_imports_produce_binding_candidates() {
         ["python:pkg.tools:tool"]
     );
     assert!(call(&facts, "run", "job").candidate_keys.is_empty());
-    assert!(
-        call(&facts, "run", "h.object.method")
-            .candidate_keys
-            .is_empty()
+    assert_eq!(
+        call(&facts, "run", "h.object.method").candidate_keys,
+        ["python-member:pkg.helpers:object.method"]
     );
     let package = parse_python(
         "src/pkg/sub/__init__.py",
@@ -514,10 +513,18 @@ fn ignores_apply_without_git_and_database_files_are_excluded() {
     std::os::unix::fs::symlink(root.path().join("src/file.py"), root.path().join("link.py"))
         .unwrap();
     let report = index::run(root.path(), &db).unwrap();
-    assert_eq!(report.parsed_files, 1);
+    assert_eq!(report.parsed_files, 2);
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.file_stamps().unwrap()[0].path, "src/file.py");
-    assert_eq!(store.stats().unwrap().coverage.unsupported_files, 2);
+    assert_eq!(
+        store
+            .file_stamps()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["README.md", "src/file.py"]
+    );
+    assert_eq!(store.stats().unwrap().coverage.unsupported_files, 1);
     fs::write(
         root.path().join(".gitignore"),
         "ignored/\n*.skip.py\nsrc/\n",

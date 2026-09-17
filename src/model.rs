@@ -50,7 +50,7 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileFacts {
     pub path: String,
     pub hash: String,
@@ -84,6 +84,20 @@ pub struct IndexReport {
     pub nodes: usize,
     pub edges: usize,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_usage: Option<crate::ingest::SemanticUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<IndexTimings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexTimings {
+    pub detect_ms: f64,
+    pub extract_ms: f64,
+    pub commit_ms: f64,
+    pub total_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,5 +172,19 @@ pub struct PathResult {
 pub struct ImportedGraph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    pub metadata: Value,
+}
+
+/// A consistent, explicit full-graph read for exports and offline analysis.
+/// Ordinary navigation continues to use bounded indexed queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphSnapshot {
+    pub schema_version: u32,
+    pub generation: u64,
+    pub kind: String,
+    pub root: Option<String>,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    #[serde(default)]
     pub metadata: Value,
 }

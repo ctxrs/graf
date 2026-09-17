@@ -200,6 +200,16 @@ fn adjacency(
     options: &QueryOptions,
     budget: usize,
 ) -> Result<Vec<Edge>> {
+    adjacency_filtered(conn, id, options, budget, &[])
+}
+
+fn adjacency_filtered(
+    conn: &Connection,
+    id: &str,
+    options: &QueryOptions,
+    budget: usize,
+    relations: &[String],
+) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
     let streams = if options.direction == Direction::Incoming {
         [false, true]
@@ -216,30 +226,39 @@ fn adjacency(
             (options.direction, outgoing),
             (Direction::Incoming, true) | (Direction::Outgoing, false)
         );
-        let mut sql = format!("SELECT payload FROM edges WHERE {column}=?1");
+        let mut sql = format!("SELECT payload FROM edges WHERE {column}=?");
+        let mut values: Vec<rusqlite::types::Value> = vec![id.to_owned().into()];
         if undirected_only {
             sql.push_str(" AND directed=0");
         }
         // Do not filter self-loops in SQL: even rejected rows could make a
         // LIMIT scan an entire hub. Duplicates consume the budget and are
         // removed only after bounded retrieval.
-        if options.relation.is_some() {
-            sql.push_str(" AND relation=?2 ORDER BY id LIMIT ?3");
-        } else {
-            sql.push_str(" ORDER BY id LIMIT ?2");
+        if let Some(relation) = &options.relation {
+            sql.push_str(" AND relation=?");
+            values.push(relation.clone().into());
         }
+        relation_sql(&mut sql, &mut values, relations);
+        sql.push_str(" ORDER BY id LIMIT ?");
+        values.push((remaining as i64).into());
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = if let Some(relation) = &options.relation {
-            stmt.query(params![id, relation, remaining as i64])?
-        } else {
-            stmt.query(params![id, remaining as i64])?
-        };
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
         while let Some(row) = rows.next()? {
             let json: String = row.get(0)?;
             edges.push(serde_json::from_str(&json)?);
         }
     }
     Ok(edges)
+}
+
+fn relation_sql(sql: &mut String, values: &mut Vec<rusqlite::types::Value>, relations: &[String]) {
+    if !relations.is_empty() {
+        sql.push_str(&format!(
+            " AND relation IN ({})",
+            vec!["?"; relations.len()].join(",")
+        ));
+        values.extend(relations.iter().cloned().map(Into::into));
+    }
 }
 
 fn opposite<'a>(edge: &'a Edge, id: &str) -> &'a str {
@@ -430,9 +449,1355 @@ fn path_snapshot(
     })
 }
 
+/// Exploration order. Shortest-path searches always require breadth first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Traversal {
+    #[default]
+    Bfs,
+    Dfs,
+}
+
+/// Optional query controls; the original QueryOptions and Store methods retain
+/// their behavior. Files and kinds constrain every returned node. Contexts
+/// constrain relations; entries within a filter are ORed, filters are ANDed.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SearchOptions {
+    pub graph: QueryOptions,
+    pub traversal: Traversal,
+    pub contexts: Vec<String>,
+    pub files: Vec<String>,
+    pub kinds: Vec<String>,
+    /// Approximate budget for GraphResult JSON: ceil(UTF-8 bytes / 4). This is
+    /// not a model tokenizer count, and excludes the SearchResult wrapper.
+    pub token_budget: Option<usize>,
+    pub induced_edges: bool,
+    pub infer_context: bool,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SearchResult {
+    pub graph: GraphResult,
+    pub seeds: Vec<String>,
+    pub estimated_tokens: usize,
+    pub contexts: Vec<String>,
+    pub truncation_reasons: Vec<String>,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PathSearchResult {
+    pub found: bool,
+    pub result: SearchResult,
+}
+
+/// Recorded dependency relations followed backwards by default. Containment
+/// only supplies initial seeds; it is never part of impact propagation.
+pub const DEFAULT_IMPACT_RELATIONS: &[&str] = &[
+    "calls",
+    "indirect_call",
+    "references",
+    "imports",
+    "imports_from",
+    "dynamic_import",
+    "re_exports",
+    "inherits",
+    "extends",
+    "implements",
+    "uses",
+    "mixes_in",
+    "embeds",
+    "requires",
+    "type",
+    "uses_type",
+    "type_of",
+    "field_type",
+    "parameter_type",
+    "return_type",
+    "generic_arg",
+    "documents",
+];
+
+const MEMBERSHIP_RELATIONS: &[&str] = &["contains", "method", "defines"];
+
+/// Impact always traverses incoming dependencies, including either direction
+/// of genuinely undirected edges. Other SearchOptions filters/budgets apply.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ImpactOptions {
+    pub search: SearchOptions,
+    /// Empty uses DEFAULT_IMPACT_RELATIONS. search.graph.relation, if set,
+    /// selects a single relation instead, and must agree with this list.
+    pub relations: Vec<String>,
+}
+
+impl crate::store::Store {
+    /// Resolve a unique endpoint: exact ID/label/scope, exact file, then literal
+    /// Unicode/accent-insensitive exact, prefix and substring tiers. Punctuation
+    /// stays literal; ties and incomplete convenience scans return errors.
+    pub fn resolve_endpoint(&self, text: &str, options: &SearchOptions) -> Result<Node> {
+        budgeted(&self.conn, || {
+            validate_search(options)?;
+            let tx = self.conn.unchecked_transaction()?;
+            let node = resolve_endpoint_in(&tx, validate_text(text)?, options)?;
+            tx.commit()?;
+            Ok(node)
+        })
+    }
+
+    /// Include grounded root/member/file seeds, then reverse dependencies.
+    /// SearchResult.seeds distinguishes starting evidence from affected nodes.
+    pub fn impact_extended(&self, text: &str, options: &ImpactOptions) -> Result<SearchResult> {
+        budgeted(&self.conn, || {
+            validate_search(&options.search)?;
+            let text = validate_text(text)?;
+            ensure!(options.relations.len() <= 32, "at most 32 impact relations");
+            ensure!(
+                options
+                    .relations
+                    .iter()
+                    .all(|s| !s.trim().is_empty() && s.len() <= 1024),
+                "impact relations must be nonempty and at most 1024 bytes each"
+            );
+            let mut relations: BTreeSet<String> = if options.relations.is_empty() {
+                DEFAULT_IMPACT_RELATIONS
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect()
+            } else {
+                options.relations.iter().cloned().collect()
+            };
+            if let Some(relation) = &options.search.graph.relation {
+                ensure!(
+                    options.relations.is_empty() || relations.contains(relation),
+                    "single relation conflicts with impact relations"
+                );
+                relations = BTreeSet::from([relation.clone()]);
+            }
+            ensure!(
+                !relations
+                    .iter()
+                    .any(|s| MEMBERSHIP_RELATIONS.contains(&s.as_str())),
+                "containment relations only expand impact seeds, not dependencies"
+            );
+            let relations: Vec<_> = relations.into_iter().collect();
+            let mut search = options.search.clone();
+            search.graph.direction = Direction::Incoming;
+            let tx = self.conn.unchecked_transaction()?;
+            let mut output = new_search(&tx, contexts(text, &search))?;
+            let (seeds, examined) = impact_seeds(&tx, text, &search, &mut output)?;
+            explore_filtered(
+                &tx,
+                seeds,
+                &search,
+                &mut output,
+                &relations,
+                examined,
+                search.graph.limit,
+            )?;
+            tx.commit()?;
+            finish_search(output)
+        })
+    }
+}
+
+const CANDIDATES_PER_TERM: usize = 64;
+
+fn validate_search(options: &SearchOptions) -> Result<()> {
+    validate(&options.graph)?;
+    for filters in [&options.contexts, &options.files, &options.kinds] {
+        ensure!(filters.len() <= 32, "at most 32 values per filter");
+        ensure!(
+            filters
+                .iter()
+                .all(|s| !s.trim().is_empty() && s.len() <= 1024),
+            "filters must be nonempty and at most 1024 bytes each"
+        );
+    }
+    ensure!(
+        options
+            .token_budget
+            .is_none_or(|n| (1..=1_000_000).contains(&n)),
+        "token budget must be between 1 and 1000000"
+    );
+    ensure!(
+        options
+            .graph
+            .relation
+            .as_ref()
+            .is_none_or(|s| !s.is_empty() && s.len() <= 1024),
+        "relation must be nonempty and at most 1024 bytes"
+    );
+    Ok(())
+}
+
+fn validate_text(text: &str) -> Result<&str> {
+    let text = text.trim();
+    ensure!(
+        !text.is_empty() && text.len() <= 1024,
+        "query/endpoint must be nonempty and at most 1024 bytes"
+    );
+    Ok(text)
+}
+
+fn normalize(text: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    text.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn context_alias(text: &str) -> String {
+    let text = normalize(text.trim());
+    match text.as_str() {
+        "calls" | "called" | "caller" | "callers" | "invoke" | "invokes" | "invoked"
+        | "invocation" => "call".into(),
+        "imports" | "imported" | "module" | "modules" => "import".into(),
+        "exports" | "exported" => "export".into(),
+        "fields" | "property" | "properties" | "member" | "members" => "field".into(),
+        "param" | "params" | "parameter" | "parameters" | "argument" | "arguments" | "arg"
+        | "args" => "parameter_type".into(),
+        "return" | "returns" | "returned" => "return_type".into(),
+        "generic" | "generics" | "template" | "templates" => "generic_arg".into(),
+        "annotation" | "annotations" | "decorator" | "decorators" => "attribute".into(),
+        "references" | "referenced" => "reference".into(),
+        _ => text,
+    }
+}
+
+fn contexts(text: &str, options: &SearchOptions) -> Vec<String> {
+    let mut values: BTreeSet<_> = options.contexts.iter().map(|s| context_alias(s)).collect();
+    if values.is_empty() && options.infer_context {
+        for token in text.split(|c: char| !c.is_alphanumeric()) {
+            let context = context_alias(token);
+            if matches!(
+                context.as_str(),
+                "call"
+                    | "import"
+                    | "export"
+                    | "field"
+                    | "parameter_type"
+                    | "return_type"
+                    | "generic_arg"
+                    | "attribute"
+                    | "reference"
+            ) {
+                values.insert(context);
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn attributes(mut value: &serde_json::Value) -> &serde_json::Value {
+    while let Some(original) = value.get("original_metadata") {
+        value = original;
+    }
+    value
+}
+
+fn context_matches(edge: &Edge, contexts: &[String]) -> bool {
+    if contexts.is_empty() {
+        return true;
+    }
+    let attrs = attributes(&edge.metadata);
+    match attrs.get("context") {
+        Some(serde_json::Value::String(value)) => contexts.contains(&context_alias(value)),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|v| contexts.contains(&context_alias(v))),
+        Some(_) => false,
+        // Native facts often have a relation but no redundant context attribute.
+        None => contexts.contains(&context_alias(&edge.relation)),
+    }
+}
+
+fn node_matches(node: &Node, options: &SearchOptions) -> bool {
+    (options.files.is_empty() || options.files.contains(&node.file))
+        && (options.kinds.is_empty() || options.kinds.contains(&node.kind))
+}
+
+fn filter_sql(options: &SearchOptions, values: &mut Vec<rusqlite::types::Value>) -> String {
+    let mut sql = String::new();
+    for (column, filters) in [
+        ("n.file", &options.files),
+        ("json_extract(n.payload,'$.kind')", &options.kinds),
+    ] {
+        if !filters.is_empty() {
+            sql.push_str(&format!(
+                " AND {column} IN ({})",
+                vec!["?"; filters.len()].join(",")
+            ));
+            values.extend(filters.iter().cloned().map(Into::into));
+        }
+    }
+    sql
+}
+
+fn exact_filtered(
+    conn: &Connection,
+    text: &str,
+    options: &SearchOptions,
+    include_file: bool,
+) -> Result<Vec<Node>> {
+    if let Some(node) = node(conn, text)? {
+        return Ok(if node_matches(&node, options) {
+            vec![node]
+        } else {
+            Vec::new()
+        });
+    }
+    let mut matches = BTreeMap::new();
+    let columns: &[&str] = if include_file {
+        &["label", "qualified_name", "file"]
+    } else {
+        &["label", "qualified_name"]
+    };
+    for column in columns {
+        let mut values: Vec<rusqlite::types::Value> = vec![text.to_owned().into()];
+        let filters = filter_sql(options, &mut values);
+        let sql = format!(
+            "SELECT n.payload FROM nodes n WHERE n.{column}=?{filters} ORDER BY n.id LIMIT {}",
+            MAX_SEEDS + 1
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            r.get::<_, String>(0)
+        })? {
+            let node: Node = serde_json::from_str(&row?)?;
+            matches.insert(node.id.clone(), node);
+        }
+    }
+    if !matches.is_empty() {
+        return Ok(matches.into_values().take(MAX_SEEDS + 1).collect());
+    }
+    // A literal ID/label containing :: wins. Otherwise this is a strict file
+    // scope: an absent match must not drift to a similarly named foreign file.
+    if let Some((file, symbol)) = text.split_once("::") {
+        ensure!(
+            !file.is_empty() && !symbol.is_empty(),
+            "scoped endpoint requires file::symbol"
+        );
+        // Normalize only the scope, after raw whole-input matches. Exact symbol
+        // spelling must win for ./ and in-root absolute paths before accent
+        // folding; rebuilding the whole input could select an unrelated ID.
+        let file = source_path(conn, file)?;
+        for column in ["id", "label", "qualified_name"] {
+            let mut values: Vec<rusqlite::types::Value> =
+                vec![file.to_owned().into(), symbol.to_owned().into()];
+            let filters = filter_sql(options, &mut values);
+            let sql = format!(
+                "SELECT n.payload FROM nodes n WHERE n.file=? AND n.{column}=?{filters} ORDER BY n.id LIMIT {}",
+                MAX_SEEDS + 1
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            for row in stmt.query_map(rusqlite::params_from_iter(values), |r| {
+                r.get::<_, String>(0)
+            })? {
+                let node: Node = serde_json::from_str(&row?)?;
+                matches.insert(node.id.clone(), node);
+            }
+        }
+    }
+    Ok(matches.into_values().take(MAX_SEEDS + 1).collect())
+}
+
+fn unique_filtered(conn: &Connection, text: &str, options: &SearchOptions) -> Result<Node> {
+    let nodes = exact_filtered(conn, validate_text(text)?, options, false)?;
+    require_unique(nodes, text)
+}
+
+fn require_unique(nodes: Vec<Node>, text: &str) -> Result<Node> {
+    match nodes.len() {
+        0 => bail!("no symbol matches {text:?} within the requested scope"),
+        1 => Ok(nodes.into_iter().next().unwrap()),
+        _ => bail!(
+            "ambiguous symbol {text:?}; use an exact ID or file::symbol: {}{}",
+            nodes
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if nodes.len() > MAX_SEEDS {
+                " (additional matches may exist)"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+fn source_path(conn: &Connection, text: &str) -> Result<String> {
+    use std::path::{Component, Path};
+    let root: Option<String> =
+        conn.query_row("SELECT root FROM metadata WHERE singleton=1", [], |r| {
+            r.get(0)
+        })?;
+    let original = Path::new(text);
+    let path = if original.is_absolute() {
+        root.as_deref()
+            .and_then(|root| original.strip_prefix(root).ok())
+            .unwrap_or(original)
+    } else {
+        original
+    };
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(value) => parts.push(value.to_string_lossy()),
+            Component::CurDir => {}
+            _ => return Ok(text.to_owned()),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn file_root(node: &Node, file: &str) -> bool {
+    matches!(node.kind.as_str(), "file" | "module")
+        || (node.line == Some(1)
+            && std::path::Path::new(file)
+                .file_name()
+                .and_then(|s| s.to_str())
+                == Some(node.label.as_str()))
+}
+
+fn file_nodes(
+    conn: &Connection,
+    file: &str,
+    options: &SearchOptions,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let basename = std::path::Path::new(file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file);
+    let mut values: Vec<rusqlite::types::Value> = vec![file.to_owned().into()];
+    let filters = filter_sql(options, &mut values);
+    values.push(basename.to_owned().into());
+    values.push((limit as i64).into());
+    let sql = format!(
+        "SELECT n.payload FROM nodes n WHERE n.file=?{filters}
+        ORDER BY CASE WHEN json_extract(n.payload,'$.kind') IN ('file','module')
+        OR (json_extract(n.payload,'$.line')=1 AND n.label=?) THEN 0 ELSE 1 END,n.id LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        r.get::<_, String>(0)
+    })?
+    .map(|row| Ok(serde_json::from_str(&row?)?))
+    .collect()
+}
+
+fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -> Result<Node> {
+    let exact = exact_filtered(conn, text, options, false)?;
+    if !exact.is_empty() || node(conn, text)?.is_some() {
+        return require_unique(exact, text);
+    }
+    let scope = text.split_once("::");
+    if scope.is_none() {
+        let file = source_path(conn, text)?;
+        let mut candidates = file_nodes(conn, &file, options, 2)?;
+        if !candidates.is_empty() {
+            if file_root(&candidates[0], &file)
+                && candidates.get(1).is_none_or(|n| !file_root(n, &file))
+            {
+                return Ok(candidates.remove(0));
+            }
+            return require_unique(candidates, text);
+        }
+    }
+    let (file, term) = scope.map_or((None, text), |(file, term)| (Some(file), term));
+    let term = normalize(term);
+    // A combining-mark-only query must not become an empty prefix of all nodes.
+    ensure!(
+        !term.is_empty(),
+        "endpoint has no searchable normalized spelling"
+    );
+    let callable = term
+        .strip_suffix("()")
+        .map_or_else(|| format!("{term}()"), str::to_owned);
+    let mut values = Vec::new();
+    let mut filters = filter_sql(options, &mut values);
+    if let Some(file) = file {
+        filters.push_str(" AND n.file=?");
+        values.push(source_path(conn, file)?.into());
+    }
+    // FTS token candidates cannot prove completeness for literal substrings,
+    // punctuation or Unicode normalization. Stream only endpoint fields, keep
+    // two IDs per tier, and never claim uniqueness from an incomplete scan.
+    // ponytail: bounded scans suffice here; a write-side normalized index is
+    // needed if unscoped convenience must cover more than MAX_EXAMINED nodes.
+    let sql = format!(
+        "SELECT n.id,n.label,n.qualified_name FROM nodes n WHERE 1=1{filters}
+        ORDER BY n.id LIMIT {}",
+        MAX_EXAMINED + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+    let mut tiers: [Vec<String>; 3] = Default::default();
+    let start = Instant::now();
+    let mut bytes = 0;
+    let mut examined = 0;
+    while let Some(row) = rows.next()? {
+        ensure!(
+            examined < MAX_EXAMINED && start.elapsed() < Duration::from_secs(2),
+            "endpoint lookup exceeded its work/time budget; use an exact ID or a smaller file/kind scope"
+        );
+        examined += 1;
+        let id: &str = row.get_ref(0)?.as_str()?;
+        let label: &str = row.get_ref(1)?.as_str()?;
+        let qualified: Option<&str> = row.get_ref(2)?.as_str_or_null()?;
+        // Normalization runs outside SQLite's VM guard. Bound its input too,
+        // before allocating strings for arbitrarily long imported identifiers.
+        bytes += id.len() + label.len() + qualified.map_or(0, str::len);
+        ensure!(
+            bytes <= 8 * 1024 * 1024,
+            "endpoint lookup exceeded its normalization byte budget; use an exact ID or a smaller file/kind scope"
+        );
+        let normalized = [
+            normalize(id),
+            normalize(label),
+            normalize(qualified.unwrap_or("")),
+        ];
+        let tier = if normalized.iter().any(|s| s == &term) || normalized[1] == callable {
+            Some(0)
+        } else if normalized.iter().any(|s| s.starts_with(&term)) {
+            Some(1)
+        } else if normalized.iter().any(|s| s.contains(&term)) {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(tier) = tier
+            && tiers[tier].len() < 2
+        {
+            tiers[tier].push(id.to_owned());
+        }
+        // Two best-tier matches already prove ambiguity. Lower tiers must wait
+        // for the complete scan because a better match may occur later.
+        if tiers[0].len() == 2 {
+            break;
+        }
+    }
+    let ids = tiers
+        .into_iter()
+        .find(|ids| !ids.is_empty())
+        .unwrap_or_default();
+    let nodes = ids
+        .iter()
+        .map(|id| node(conn, id)?.ok_or_else(|| anyhow::anyhow!("missing endpoint {id}")))
+        .collect::<Result<Vec<_>>>()?;
+    require_unique(nodes, text)
+}
+
+fn impact_seeds(
+    conn: &Connection,
+    text: &str,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+) -> Result<(Vec<Node>, usize)> {
+    let exact = exact_filtered(conn, text, options, false)?;
+    let mut seeds = if !exact.is_empty() || node(conn, text)?.is_some() {
+        vec![require_unique(exact, text)?]
+    } else if !text.contains("::") {
+        file_nodes(
+            conn,
+            &source_path(conn, text)?,
+            options,
+            options.graph.limit + 1,
+        )?
+    } else {
+        Vec::new()
+    };
+    if seeds.is_empty() {
+        seeds.push(resolve_endpoint_in(conn, text, options)?);
+    }
+    if seeds.len() == 1 && !seeds[0].file.is_empty() && file_root(&seeds[0], &seeds[0].file) {
+        let root = seeds[0].id.clone();
+        for member in file_nodes(conn, &seeds[0].file, options, options.graph.limit + 1)? {
+            if member.id != root {
+                seeds.push(member);
+            }
+        }
+    }
+    let mut examined = seeds.len();
+    if seeds.len() > options.graph.limit {
+        truncate(output, "seed_limit");
+        seeds.truncate(options.graph.limit);
+    }
+    let mut seen: BTreeSet<_> = seeds.iter().map(|n| n.id.clone()).collect();
+    let mut cursor = 0;
+    // Only descendants of the original seeds are added here. Dependencies
+    // discovered by the later reverse walk never expand their own members.
+    'members: while cursor < seeds.len() && examined < MAX_EXAMINED {
+        let mut stmt = conn.prepare(
+            "SELECT target FROM edges WHERE source=?1
+            AND relation IN ('contains','method','defines') ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![seeds[cursor].id, (MAX_EXAMINED - examined) as i64])?;
+        cursor += 1;
+        while let Some(row) = rows.next()? {
+            examined += 1;
+            let id: String = row.get(0)?;
+            if seen.contains(&id) {
+                continue;
+            }
+            let member = node(conn, &id)?
+                .ok_or_else(|| anyhow::anyhow!("membership points to missing node {id}"))?;
+            if !node_matches(&member, options) {
+                continue;
+            }
+            if seeds.len() == options.graph.limit {
+                truncate(output, "seed_limit");
+                break 'members;
+            }
+            seen.insert(id);
+            seeds.push(member);
+        }
+    }
+    if examined == MAX_EXAMINED {
+        truncate(output, "work_limit");
+    }
+    Ok((seeds, examined))
+}
+
+fn search_terms(text: &str) -> Result<Vec<String>> {
+    let mut all = BTreeSet::new();
+    for token in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        // MATCH must see the indexed spelling. Ranking normalization decomposes
+        // Hangul and removes Greek accents that unicode61 keeps distinct.
+        let token = token.to_owned();
+        let chars: Vec<_> = token.chars().collect();
+        if chars.len() > 2 && chars.iter().all(|c| crate::store::cjk(*c)) {
+            for pair in chars.windows(2) {
+                all.insert(pair.iter().collect::<String>());
+            }
+        } else {
+            all.insert(token);
+        }
+    }
+    let mut terms: Vec<_> = all
+        .iter()
+        .filter(|s| {
+            !matches!(
+                normalize(s).as_str(),
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "does"
+                    | "for"
+                    | "how"
+                    | "in"
+                    | "is"
+                    | "of"
+                    | "or"
+                    | "the"
+                    | "to"
+                    | "what"
+                    | "where"
+                    | "which"
+                    | "who"
+                    | "why"
+            )
+        })
+        .cloned()
+        .collect();
+    if terms.is_empty() {
+        terms.extend(all);
+    }
+    let intent = |s: &str| {
+        matches!(
+            normalize(s).as_str(),
+            "call"
+                | "calls"
+                | "called"
+                | "caller"
+                | "callers"
+                | "invoke"
+                | "invokes"
+                | "use"
+                | "uses"
+                | "used"
+                | "using"
+                | "import"
+                | "imports"
+                | "export"
+                | "exports"
+                | "extend"
+                | "extends"
+                | "implement"
+                | "implements"
+                | "depend"
+                | "depends"
+                | "reference"
+                | "references"
+        )
+    };
+    if terms.iter().any(|t| !intent(t)) {
+        terms.retain(|t| !intent(t));
+    }
+    ensure!(
+        !terms.is_empty() && terms.len() <= 8,
+        "query must contain 1 to 8 distinct searchable terms after removing question words"
+    );
+    Ok(terms)
+}
+
+fn rank_seeds(
+    conn: &Connection,
+    text: &str,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+) -> Result<Vec<Node>> {
+    let exact = exact_filtered(conn, text, options, true)?;
+    if !exact.is_empty() || text.contains("::") {
+        return Ok(exact);
+    }
+    let terms = search_terms(text)?;
+    let normalized_terms: Vec<_> = terms.iter().map(|term| normalize(term)).collect();
+    let mut candidates: BTreeMap<String, (Node, Vec<f64>)> = BTreeMap::new();
+    for (index, literal) in terms.iter().enumerate() {
+        let expression = format!("\"{literal}\"*");
+        let term = &normalized_terms[index];
+        let mut values: Vec<rusqlite::types::Value> = vec![expression.into()];
+        let filters = filter_sql(options, &mut values);
+        // Rank only this capped rowid-ordered sample. FTS5's BM25 computes IDF
+        // by walking all phrase matches internally, outside the VM-step guard.
+        let sql = format!(
+            "SELECT n.payload FROM node_search JOIN nodes n ON n.rowid=node_search.rowid WHERE node_search MATCH ?{filters} ORDER BY node_search.rowid LIMIT {}",
+            CANDIDATES_PER_TERM + 1
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            if count == CANDIDATES_PER_TERM {
+                truncate(output, "candidate_limit");
+                break;
+            }
+            count += 1;
+            let node: Node = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let label = normalize(&node.label);
+            let label = label.trim_end_matches("()");
+            let tier = if label == term || normalize(&node.id) == *term {
+                12.0
+            } else if label
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|part| part == term)
+            {
+                8.0
+            } else if label.starts_with(term) {
+                6.0
+            } else if label.contains(term) {
+                3.0
+            } else if node
+                .qualified_name
+                .as_deref()
+                .is_some_and(|s| normalize(s).contains(term))
+            {
+                2.0
+            } else if [
+                "rationale",
+                "description",
+                "summary",
+                "text",
+                "excerpt",
+                "evidence",
+            ]
+            .iter()
+            .any(|field| {
+                attributes(&node.metadata)
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| normalize(value).contains(term))
+            }) {
+                1.5
+            } else {
+                1.0
+            };
+            let id = node.id.clone();
+            let entry = candidates
+                .entry(id)
+                .or_insert_with(|| (node, vec![0.0; terms.len()]));
+            entry.1[index] = tier;
+        }
+    }
+    let score = |node: &Node, weights: &[f64]| {
+        let label = normalize(&node.label);
+        let coverage = normalized_terms
+            .iter()
+            .filter(|t| label.contains(t.as_str()))
+            .count() as f64
+            / terms.len() as f64;
+        weights.iter().sum::<f64>() * (1.0 + coverage * coverage)
+    };
+    let mut ranked: Vec<_> = candidates.into_values().collect();
+    ranked.sort_by(|(a, aw), (b, bw)| {
+        score(b, bw)
+            .total_cmp(&score(a, aw))
+            .then(a.label.len().cmp(&b.label.len()))
+            .then(a.id.cmp(&b.id))
+    });
+    let Some((top, weights)) = ranked.first() else {
+        return Ok(Vec::new());
+    };
+    let cutoff = score(top, weights) * 0.2;
+    let mut chosen = BTreeSet::new();
+    let mut labels = BTreeSet::new();
+    let mut seeds = Vec::new();
+    for (node, weights) in &ranked {
+        if seeds.len() == 3 || score(node, weights) < cutoff {
+            break;
+        }
+        if labels.insert(normalize(&node.label)) {
+            chosen.insert(node.id.clone());
+            seeds.push(node.clone());
+        }
+    }
+    // Distinct terms get a candidate even if a common exact label dominates
+    // combined scores. This is still <= 3 + 8 seeds, below MAX_SEEDS.
+    for index in 0..terms.len() {
+        if let Some((node, _)) =
+            ranked
+                .iter()
+                .filter(|(_, w)| w[index] > 0.0)
+                .max_by(|(a, aw), (b, bw)| {
+                    aw[index]
+                        .total_cmp(&bw[index])
+                        .then_with(|| b.id.cmp(&a.id))
+                })
+            && !chosen.contains(&node.id)
+            && labels.insert(normalize(&node.label))
+        {
+            chosen.insert(node.id.clone());
+            seeds.push(node.clone());
+        }
+    }
+    Ok(seeds)
+}
+
+fn truncate(output: &mut SearchResult, reason: &str) {
+    output.graph.truncated = true;
+    if !output.truncation_reasons.iter().any(|r| r == reason) {
+        output.truncation_reasons.push(reason.into());
+    }
+}
+
+struct OutputBudget {
+    bytes: usize,
+    limit: Option<usize>,
+}
+impl OutputBudget {
+    fn new(graph: &GraphResult, options: &SearchOptions) -> Result<Self> {
+        let budget = Self {
+            bytes: serde_json::to_vec(graph)?.len() + 1,
+            limit: options.token_budget.map(|n| n * 4),
+        };
+        ensure!(
+            budget.limit.is_none_or(|limit| budget.bytes <= limit),
+            "token budget cannot hold the complete result; increase the budget"
+        );
+        Ok(budget)
+    }
+    fn cost(value: &impl serde::Serialize) -> Result<usize> {
+        Ok(serde_json::to_vec(value)?.len() + 1)
+    }
+    fn take(&mut self, bytes: usize, output: &mut SearchResult) -> bool {
+        if self
+            .limit
+            .is_some_and(|limit| bytes > limit.saturating_sub(self.bytes))
+        {
+            truncate(output, "token_budget");
+            false
+        } else {
+            self.bytes += bytes;
+            true
+        }
+    }
+}
+
+fn new_search(conn: &Connection, contexts: Vec<String>) -> Result<SearchResult> {
+    Ok(SearchResult {
+        graph: empty(conn)?,
+        seeds: Vec::new(),
+        estimated_tokens: 0,
+        contexts,
+        truncation_reasons: Vec::new(),
+    })
+}
+fn finish_search(mut output: SearchResult) -> Result<SearchResult> {
+    output.estimated_tokens = serde_json::to_vec(&output.graph)?.len().div_ceil(4);
+    Ok(output)
+}
+
+pub(crate) fn query_extended(
+    conn: &Connection,
+    text: &str,
+    options: &SearchOptions,
+    exact_only: bool,
+) -> Result<SearchResult> {
+    budgeted(conn, || {
+        validate_search(options)?;
+        let text = validate_text(text)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut output = new_search(&tx, contexts(text, options))?;
+        let seeds = if exact_only {
+            vec![unique_filtered(&tx, text, options)?]
+        } else {
+            rank_seeds(&tx, text, options, &mut output)?
+        };
+        explore(&tx, seeds, options, &mut output)?;
+        tx.commit()?;
+        finish_search(output)
+    })
+}
+
+#[derive(Debug)]
+enum Step {
+    Expand(String, u32),
+    Follow(String, u32, Edge),
+}
+
+fn explore(
+    conn: &Connection,
+    seeds: Vec<Node>,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+) -> Result<()> {
+    explore_filtered(conn, seeds, options, output, &[], 0, MAX_SEEDS)
+}
+
+fn explore_filtered(
+    conn: &Connection,
+    seeds: Vec<Node>,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+    relations: &[String],
+    mut examined: usize,
+    seed_limit: usize,
+) -> Result<()> {
+    let mut budget = OutputBudget::new(&output.graph, options)?;
+    let mut depths = BTreeMap::new();
+    let mut edge_ids = BTreeSet::new();
+    let mut steps = VecDeque::new();
+    for (index, node) in seeds.into_iter().enumerate() {
+        if index == seed_limit {
+            truncate(output, "seed_limit");
+            break;
+        }
+        if output.graph.nodes.len() == options.graph.limit {
+            truncate(output, "node_limit");
+            break;
+        }
+        let fits = budget.take(OutputBudget::cost(&node)?, output);
+        ensure!(
+            fits || !output.graph.nodes.is_empty(),
+            "token budget cannot hold the primary seed; increase the budget"
+        );
+        if !fits {
+            continue;
+        }
+        depths.insert(node.id.clone(), 0);
+        output.seeds.push(node.id.clone());
+        steps.push_back(Step::Expand(node.id.clone(), 0));
+        output.graph.nodes.push(node);
+    }
+    if options.traversal == Traversal::Dfs {
+        steps.make_contiguous().reverse();
+    }
+    let mut expanded = BTreeMap::<String, u32>::new();
+    loop {
+        let next = if options.traversal == Traversal::Bfs {
+            steps.pop_front()
+        } else {
+            steps.pop_back()
+        };
+        let Some(step) = next else {
+            break;
+        };
+        match step {
+            Step::Expand(id, depth) => {
+                if depth >= options.graph.depth
+                    || expanded.get(&id).is_some_and(|old| *old <= depth)
+                {
+                    continue;
+                }
+                expanded.insert(id.clone(), depth);
+                if examined == MAX_EXAMINED {
+                    truncate(output, "work_limit");
+                    break;
+                }
+                let mut edges = adjacency_filtered(
+                    conn,
+                    &id,
+                    &options.graph,
+                    MAX_EXAMINED - examined,
+                    relations,
+                )?;
+                examined += edges.len();
+                if examined == MAX_EXAMINED {
+                    truncate(output, "work_limit");
+                }
+                if options.traversal == Traversal::Dfs {
+                    edges.reverse();
+                }
+                for edge in edges {
+                    if context_matches(&edge, &output.contexts) {
+                        steps.push_back(Step::Follow(id.clone(), depth + 1, edge));
+                    }
+                }
+            }
+            Step::Follow(id, depth, edge) => {
+                let next = opposite(&edge, &id).to_owned();
+                let candidate = if !depths.contains_key(&next) {
+                    let node = node(conn, &next)?
+                        .ok_or_else(|| anyhow::anyhow!("edge points to missing node {next}"))?;
+                    if !node_matches(&node, options) {
+                        continue;
+                    }
+                    if output.graph.nodes.len() == options.graph.limit {
+                        truncate(output, "node_limit");
+                        continue;
+                    }
+                    Some(node)
+                } else {
+                    None
+                };
+                let edge_cost = if edge_ids.contains(&edge.id) {
+                    0
+                } else {
+                    OutputBudget::cost(&edge)?
+                };
+                let node_cost = candidate
+                    .as_ref()
+                    .map(OutputBudget::cost)
+                    .transpose()?
+                    .unwrap_or(0);
+                if !budget.take(edge_cost + node_cost, output) {
+                    continue;
+                }
+                if let Some(node) = candidate {
+                    output.graph.nodes.push(node);
+                }
+                if edge_ids.insert(edge.id.clone()) {
+                    output.graph.edges.push(edge);
+                }
+                if depths.get(&next).is_none_or(|old| depth < *old) {
+                    depths.insert(next.clone(), depth);
+                    steps.push_back(Step::Expand(next, depth));
+                }
+            }
+        }
+    }
+    if options.induced_edges {
+        close_edges(conn, options, output, &mut budget, &mut examined, relations)?;
+    }
+    collect_unresolved(conn, options, output, &mut budget, &mut examined)?;
+    Ok(())
+}
+
+fn close_edges(
+    conn: &Connection,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+    budget: &mut OutputBudget,
+    examined: &mut usize,
+    relations: &[String],
+) -> Result<()> {
+    let ids: BTreeSet<_> = output.graph.nodes.iter().map(|n| n.id.clone()).collect();
+    let mut edge_ids: BTreeSet<_> = output.graph.edges.iter().map(|e| e.id.clone()).collect();
+    for id in &ids {
+        if *examined == MAX_EXAMINED {
+            truncate(output, "work_limit");
+            break;
+        }
+        // Outgoing storage stream visits every induced edge only once, including
+        // undirected edges, mutual arcs, parallel relations and self loops.
+        let mut sql = "SELECT payload FROM edges WHERE source=?".to_owned();
+        let mut values: Vec<rusqlite::types::Value> = vec![id.clone().into()];
+        if let Some(relation) = &options.graph.relation {
+            sql.push_str(" AND relation=?");
+            values.push(relation.clone().into());
+        }
+        relation_sql(&mut sql, &mut values, relations);
+        sql.push_str(" ORDER BY id LIMIT ?");
+        values.push(((MAX_EXAMINED - *examined) as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            *examined += 1;
+            let edge: Edge = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if ids.contains(&edge.target)
+                && !edge_ids.contains(&edge.id)
+                && context_matches(&edge, &output.contexts)
+                && budget.take(OutputBudget::cost(&edge)?, output)
+            {
+                edge_ids.insert(edge.id.clone());
+                output.graph.edges.push(edge);
+            }
+        }
+        if *examined == MAX_EXAMINED {
+            truncate(output, "work_limit");
+        }
+    }
+    Ok(())
+}
+
+fn collect_unresolved(
+    conn: &Connection,
+    options: &SearchOptions,
+    output: &mut SearchResult,
+    budget: &mut OutputBudget,
+    examined: &mut usize,
+) -> Result<()> {
+    if options.graph.direction == Direction::Incoming {
+        return Ok(());
+    }
+    let ids: Vec<_> = output.graph.nodes.iter().map(|n| n.id.clone()).collect();
+    for id in ids {
+        if *examined == MAX_EXAMINED {
+            truncate(output, "work_limit");
+            break;
+        }
+        let mut sql =
+            "SELECT payload,resolution_reason FROM refs WHERE source=? AND resolved_target IS NULL"
+                .to_owned();
+        let mut values: Vec<rusqlite::types::Value> = vec![id.into()];
+        if let Some(relation) = &options.graph.relation {
+            sql.push_str(" AND relation=?");
+            values.push(relation.clone().into());
+        }
+        sql.push_str(" ORDER BY id LIMIT ?");
+        let limit = MAX_EXAMINED - *examined;
+        values.push((limit as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            *examined += 1;
+            let reference: Reference = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if !output.contexts.is_empty()
+                && !output
+                    .contexts
+                    .contains(&context_alias(&reference.relation))
+            {
+                continue;
+            }
+            if output.graph.unresolved.len() == options.graph.limit {
+                truncate(output, "unresolved_limit");
+                return Ok(());
+            }
+            let reference = UnresolvedReference {
+                source: reference.source,
+                label: reference.label,
+                relation: reference.relation,
+                file: reference.file,
+                line: reference.line,
+                reason: row.get(1)?,
+            };
+            if budget.take(OutputBudget::cost(&reference)?, output) {
+                output.graph.unresolved.push(reference);
+            }
+        }
+        if *examined == MAX_EXAMINED {
+            truncate(output, "work_limit");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn path_extended(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+    options: &SearchOptions,
+) -> Result<PathSearchResult> {
+    budgeted(conn, || {
+        validate_search(options)?;
+        ensure!(
+            options.traversal == Traversal::Bfs,
+            "shortest path requires bfs traversal"
+        );
+        let tx = conn.unchecked_transaction()?;
+        let mut output = new_search(&tx, contexts("", options))?;
+        let start = resolve_endpoint_in(&tx, validate_text(source)?, options)?;
+        let end = resolve_endpoint_in(&tx, validate_text(target)?, options)?;
+        output.seeds = vec![start.id.clone()];
+        if end.id != start.id {
+            output.seeds.push(end.id.clone());
+        }
+        let mut queue = VecDeque::from([(start.id.clone(), 0)]);
+        let mut visited = BTreeSet::from([start.id.clone()]);
+        let mut parents = BTreeMap::new();
+        let mut examined = 0;
+        let mut found = start.id == end.id;
+        'search: while !found {
+            let Some((id, depth)) = queue.pop_front() else {
+                break;
+            };
+            if examined == MAX_EXAMINED {
+                truncate(&mut output, "work_limit");
+                break;
+            }
+            let edges = adjacency(&tx, &id, &options.graph, MAX_EXAMINED - examined)?;
+            examined += edges.len();
+            if examined == MAX_EXAMINED {
+                truncate(&mut output, "work_limit");
+            }
+            for edge in edges {
+                if !context_matches(&edge, &output.contexts) {
+                    continue;
+                }
+                let next = opposite(&edge, &id).to_owned();
+                if visited.contains(&next) {
+                    continue;
+                }
+                let candidate = node(&tx, &next)?
+                    .ok_or_else(|| anyhow::anyhow!("edge points to missing node {next}"))?;
+                if !node_matches(&candidate, options) {
+                    continue;
+                }
+                if depth >= options.graph.depth {
+                    truncate(&mut output, "depth_limit");
+                    continue;
+                }
+                if visited.len() == options.graph.limit {
+                    truncate(&mut output, "node_limit");
+                    continue;
+                }
+                visited.insert(next.clone());
+                parents.insert(next.clone(), (id.clone(), edge));
+                if next == end.id {
+                    found = true;
+                    break 'search;
+                }
+                queue.push_back((next, depth + 1));
+            }
+        }
+        if found {
+            let mut id = end.id.clone();
+            let mut ids = vec![id.clone()];
+            while id != start.id {
+                let (parent, edge) = parents.remove(&id).expect("path has predecessor");
+                output.graph.edges.push(edge);
+                ids.push(parent.clone());
+                id = parent;
+            }
+            output.graph.edges.reverse();
+            ids.reverse();
+            for id in ids {
+                output
+                    .graph
+                    .nodes
+                    .push(node(&tx, &id)?.expect("path node exists"));
+            }
+        } else {
+            output.graph.nodes.push(start);
+            if output.graph.nodes[0].id != end.id {
+                if options.graph.limit > 1 {
+                    output.graph.nodes.push(end);
+                } else {
+                    truncate(&mut output, "node_limit");
+                    output.seeds.truncate(1);
+                }
+            }
+        }
+        // A partial path must never masquerade as a complete found path.
+        let mut budget = OutputBudget::new(&output.graph, options)?;
+        if options.induced_edges {
+            close_edges(&tx, options, &mut output, &mut budget, &mut examined, &[])?;
+        }
+        tx.commit()?;
+        Ok(PathSearchResult {
+            found,
+            result: finish_search(output)?,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_term_search_does_not_invoke_corpus_ranking() -> Result<()> {
+        use crate::store::Store;
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let dir = tempfile::tempdir()?;
+        let mut store = Store::create(&dir.path().join("graph.db"))?;
+        store.import_graph(ImportedGraph {
+            nodes: (0..1_024)
+                .map(|i| Node {
+                    id: format!("n{i:04}"),
+                    label: format!("Common{i:04}"),
+                    kind: "function".into(),
+                    file: "file.rs".into(),
+                    line: None,
+                    end_line: None,
+                    qualified_name: None,
+                    binding_key: None,
+                    metadata: serde_json::Value::Null,
+                })
+                .collect(),
+            edges: vec![],
+            metadata: serde_json::Value::Null,
+        })?;
+        // A result cap cannot catch BM25's hidden posting-list scan. Reject
+        // both explicit BM25 and FTS5's implicit rank column at preparation.
+        store
+            .conn
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Function { function_name }
+                    if function_name.eq_ignore_ascii_case("bm25") =>
+                {
+                    Authorization::Deny
+                }
+                AuthAction::Read {
+                    table_name: "node_search",
+                    column_name: "rank",
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+        assert!(store.conn.prepare(
+            "SELECT bm25(node_search) FROM node_search WHERE node_search MATCH 'Common*' LIMIT 1"
+        ).is_err());
+        assert!(
+            store
+                .conn
+                .prepare("SELECT rank FROM node_search WHERE node_search MATCH 'Common*' LIMIT 1")
+                .is_err()
+        );
+        let result = store.query_extended(
+            "Common",
+            &SearchOptions {
+                graph: QueryOptions {
+                    depth: 0,
+                    limit: 2,
+                    ..QueryOptions::default()
+                },
+                ..SearchOptions::default()
+            },
+        )?;
+        assert_eq!(
+            result
+                .graph
+                .nodes
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            ["n0000", "n0001"]
+        );
+        assert!(
+            result
+                .truncation_reasons
+                .iter()
+                .any(|s| s == "candidate_limit")
+        );
+        Ok(())
+    }
 
     #[test]
     fn interrupted_query_removes_its_handler() -> Result<()> {
