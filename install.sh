@@ -6,21 +6,24 @@ main() (
     fail() { printf 'graf installer: %s\n' "$*" >&2; exit 1; }
     version=${GRAF_VERSION:-}
     install_dir=${GRAF_INSTALL_DIR:-}
+    from=${GRAF_FROM:-}
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --version|--install-dir)
+            --version|--install-dir|--from)
                 [ "$#" -ge 2 ] || fail "$1 requires a value"
                 [ -n "$2" ] || fail "$1 requires a nonempty value"
-                case "$1" in --version) version=$2 ;; --install-dir) install_dir=$2 ;; esac
+                case "$1" in --version) version=$2 ;; --install-dir) install_dir=$2 ;; --from) from=$2 ;; esac
                 shift 2 ;;
             -h|--help)
-                printf '%s\n' 'Install Graf: sh install.sh [--version 0.1.0] [--install-dir DIR]' \
+                printf '%s\n' 'Install Graf: sh install.sh [--version 0.2.0] [--install-dir DIR] [--from graphify]' \
                     'Defaults: latest release, $HOME/.local/bin.' \
-                    'Environment: GRAF_VERSION, GRAF_INSTALL_DIR. Shell profiles are not changed.'
+                    'Environment: GRAF_VERSION, GRAF_INSTALL_DIR, GRAF_FROM. Shell profiles are not changed.' \
+                    '--from graphify runs Graf migration from your current directory after installation (requires Graf 0.2+).'
                 exit 0 ;;
             *) fail "unknown argument: $1" ;;
         esac
     done
+    case "$from" in ''|graphify) ;; *) fail 'GRAF_FROM/--from must be graphify' ;; esac
     valid_version() {
         case "$1" in ''|*[!0-9.]*) return 1 ;; esac
         printf '%s\n' "$1" | LC_ALL=C grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
@@ -138,6 +141,10 @@ GRAF_RELEASE_KEY
     mv -f "$graf_stage/notices" "$install_dir/graf.third-party-notices.txt"
     mv -f "$graf_stage/graf" "$install_dir/graf"
     printf 'Installed Graf %s to %s/graf\n' "$version" "$install_dir"
+    if [ "$from" = graphify ]; then
+        "$install_dir/graf" switch graphify || fail \
+            'Installation succeeded, but Graphify migration failed. Migration requires Graf 0.2 or later; if pinned to an older release, update GRAF_VERSION/--version and retry. Otherwise, resolve the error above and rerun the installed Graf with: switch graphify'
+    fi
     case :${PATH:-}: in
         *:"$install_dir":*) printf 'Run: graf --help\n' ;;
         *) printf 'Add %s to your PATH, then run: graf --help\n' "$install_dir" ;;

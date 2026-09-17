@@ -81,7 +81,7 @@ To choose a version or directory:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh \
-  | sh -s -- --version 0.1.0 --install-dir "$HOME/bin"
+  | sh -s -- --version 0.2.0 --install-dir "$HOME/bin"
 ```
 
 On Windows:
@@ -92,7 +92,7 @@ irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 
 The default directory is `%LOCALAPPDATA%\Graf\bin`. Add it to your `PATH` in
 Windows environment settings if needed. To select a version or another directory,
-set `$env:GRAF_VERSION = '0.1.0'` or `$env:GRAF_INSTALL_DIR = 'C:\Tools\Graf'`
+set `$env:GRAF_VERSION = '0.2.0'` or `$env:GRAF_INSTALL_DIR = 'C:\Tools\Graf'`
 before running the command. Those same environment variables work with the
 Unix installer. Neither script requires administrator access for its default
 directory or modifies your shell profiles.
@@ -101,6 +101,30 @@ Rerun the installer to upgrade to the latest release, or set a version to instal
 that release explicitly. A failed download or verification leaves the existing
 executable intact. Graph indexes are separate from the installed executable;
 `graf update` refreshes indexed source, not the Graf application.
+
+## Install and switch from Graphify
+
+Run from the Graphify project directory. On Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh \
+  | sh -s -- --from graphify
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:GRAF_FROM = 'graphify'
+irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
+Remove-Item Env:GRAF_FROM
+```
+
+The installer first verifies and installs Graf, then runs the installed
+executable's `switch graphify` command from your current directory. Graf 0.2 or
+later is required. If migration fails, the installed executable remains available
+and the installer reports the migration error; resolve it and rerun
+`graf switch graphify`. Use Graf directly for `--project`, `--config`, `--graph`,
+and `--server` selection. See [switching and undo](../README.md#switch-from-graphify).
 
 ## Install manually
 
