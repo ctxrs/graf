@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tree_sitter::{Node as Syntax, Parser};
 use unicode_normalization::UnicodeNormalization;
 
@@ -69,11 +69,22 @@ struct PendingCall {
     parts: Vec<String>,
 }
 
+struct PendingReference {
+    site: PendingCall,
+    owner: String,
+    relation: &'static str,
+    context: &'static str,
+}
+
 struct Extractor<'a> {
     source: &'a str,
     facts: FileFacts,
     scopes: Vec<Scope>,
     calls: Vec<PendingCall>,
+    evidence: Vec<PendingReference>,
+    builtin_methods: Vec<(usize, String, String)>,
+    stars: Vec<(String, usize, u32)>,
+    all: Value,
 }
 
 /// Extract static Python facts without executing source or guessing dynamic targets.
@@ -83,21 +94,62 @@ struct Extractor<'a> {
 /// Annotation expressions are conservatively omitted from call extraction across
 /// eager, lazy, and postponed annotation modes; evaluated defaults are retained.
 /// This is not a complete runtime call graph. Class-private names and implicit
-/// `__class__` stay unresolved.
+/// `__class__` stay unresolved. Module stars defer definition keys and aliases
+/// until `PythonContext::apply` can verify the binding against the inventory.
+/// Member candidates are lookup requests, not inferred runtime receiver types.
 /// Validation covers Tree-sitter syntax and duplicate parameters, not all Python
 /// compiler constraints.
 pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
+    parse_python_with_source_root(path, source, hash, None)
+}
+
+/// Parse with an explicit repository-relative source root. An empty root means
+/// repository root; `None` preserves the conventional `src/` layout.
+/// The caller selects the root from repository configuration; no filesystem is read.
+pub fn parse_python_with_source_root(
+    path: &str,
+    source: &str,
+    hash: &str,
+    source_root: Option<&str>,
+) -> Result<FileFacts> {
     if path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
         || path
             .split('/')
             .any(|p| p.is_empty() || p == "." || p == "..")
-        || !path.ends_with(".py")
+        || !(path.ends_with(".py")
+            || (std::path::Path::new(path).extension().is_none()
+                && crate::languages::scripted::shebang_language(source) == Some("python")))
     {
-        bail!("Python source path must be a normalized relative POSIX .py path");
+        bail!(
+            "Python source path must be a normalized relative POSIX .py path or an extensionless Python script"
+        );
     }
     let mut facts = empty_facts(path, hash);
+    if let Some(root) = source_root {
+        if !root.is_empty()
+            && (root.contains('\\')
+                || root
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == ".."))
+        {
+            bail!("Python source root must be a normalized relative POSIX directory");
+        }
+        let relative = if root.is_empty() {
+            path
+        } else {
+            path.strip_prefix(&format!("{root}/"))
+                .context("Python path is outside its source root")?
+        };
+        let module = relative.strip_suffix(".py").unwrap_or(relative);
+        let module = module.strip_suffix("/__init__").unwrap_or(module);
+        facts.module = if module == "__init__" {
+            String::new()
+        } else {
+            module.replace('/', ".")
+        };
+    }
     if source.len() > MAX_SOURCE_BYTES {
         facts.diagnostics.push(Diagnostic {
             file: path.into(),
@@ -163,6 +215,10 @@ pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         source,
         facts,
         calls: vec![],
+        evidence: vec![],
+        builtin_methods: vec![],
+        stars: vec![],
+        all: static_python_all(root, source),
         scopes: vec![Scope {
             parent: None,
             kind: ScopeKind::Module,
@@ -172,9 +228,78 @@ pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
             uncertain: false,
         }],
     };
+    if !extractor.generated_module(root) {
+        extractor.docstring(root, 0);
+    }
     extractor.visit(root, 0, false);
     extractor.finish();
     Ok(extractor.facts)
+}
+
+// A single literal list/tuple assignment is the entire supported __all__ language.
+// Any additional use (including mutation, aliasing, or a conditional assignment)
+// makes star enumeration opaque, without affecting explicit named imports.
+fn static_python_all(root: Syntax<'_>, source: &str) -> Value {
+    let mut pending = vec![root];
+    let mut mentions = 0;
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier" && identifier(&source[node.byte_range()]) == "__all__" {
+            mentions += 1;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    if mentions == 0 {
+        return Value::Null;
+    }
+    if mentions != 1 {
+        return json!(false);
+    }
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let Some(assignment) = statement
+            .named_child(0)
+            .filter(|n| statement.kind() == "expression_statement" && n.kind() == "assignment")
+        else {
+            continue;
+        };
+        if !assignment.child_by_field_name("left").is_some_and(|n| {
+            n.kind() == "identifier" && identifier(&source[n.byte_range()]) == "__all__"
+        }) {
+            continue;
+        }
+        let Some(value) = assignment.child_by_field_name("right") else {
+            break;
+        };
+        if !matches!(value.kind(), "list" | "tuple") {
+            break;
+        }
+        let mut names = BTreeSet::new();
+        let mut cursor = value.walk();
+        for item in value
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() != "comment")
+        {
+            let text = &source[item.byte_range()];
+            if item.kind() != "string"
+                || text.len() < 2
+                || !matches!(text.as_bytes()[0], b'\'' | b'"')
+                || text.as_bytes().last() != text.as_bytes().first()
+            {
+                return json!(false);
+            }
+            let name = &text[1..text.len() - 1];
+            if name.is_empty()
+                || !name.chars().all(|c| c == '_' || c.is_alphanumeric())
+                || name.chars().next().is_some_and(char::is_numeric)
+            {
+                return json!(false);
+            }
+            names.insert(name.to_owned());
+        }
+        return json!(names);
+    }
+    json!(false)
 }
 
 fn line(node: Syntax<'_>) -> u32 {
@@ -222,6 +347,299 @@ impl Extractor<'_> {
         &self.source[node.byte_range()]
     }
 
+    fn reference(
+        &mut self,
+        node: Syntax<'_>,
+        scope: usize,
+        owner: &str,
+        relation: &'static str,
+        context: &'static str,
+    ) {
+        if let Some(parts) = self.dotted(node) {
+            self.evidence.push(PendingReference {
+                site: PendingCall {
+                    scope,
+                    start: node.start_byte(),
+                    end: node.end_byte(),
+                    line: line(node),
+                    parts,
+                },
+                owner: owner.into(),
+                relation,
+                context,
+            });
+        }
+    }
+
+    fn type_references(
+        &mut self,
+        node: Syntax<'_>,
+        scope: usize,
+        owner: &str,
+        context: &'static str,
+    ) {
+        if self.dotted(node).is_some() {
+            self.reference(node, scope, owner, "references", context);
+            return;
+        }
+        if node.kind() == "string" {
+            // Forward references are syntax evidence only. Parse a plain quoted
+            // name with the same grammar; escaped or computed strings stay opaque.
+            if let Some(text) = self.string_text(node).filter(|s| !s.contains('\\')) {
+                let mut parser = Parser::new();
+                if parser
+                    .set_language(&tree_sitter_python::LANGUAGE.into())
+                    .is_ok()
+                    && let Some(tree) = parser
+                        .parse(&text, None)
+                        .filter(|t| !t.root_node().has_error())
+                {
+                    let root = tree.root_node();
+                    if root.named_child_count() == 1
+                        && let Some(expression) = root.named_child(0).and_then(|n| n.named_child(0))
+                        && let Some(parts) = dotted_text(expression, &text)
+                    {
+                        self.evidence.push(PendingReference {
+                            site: PendingCall {
+                                scope,
+                                start: node.start_byte(),
+                                end: node.end_byte(),
+                                line: line(node),
+                                parts,
+                            },
+                            owner: owner.into(),
+                            relation: "references",
+                            context,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        // These expressions contain values or bind names; traversing them as types
+        // would invent type dependencies (and annotations are never CALLS here).
+        if matches!(
+            node.kind(),
+            "call"
+                | "lambda"
+                | "string"
+                | "concatenated_string"
+                | "list_comprehension"
+                | "dictionary_comprehension"
+                | "constrained_type"
+        ) {
+            return;
+        }
+        if matches!(node.kind(), "subscript" | "generic_type") {
+            let head = node
+                .child_by_field_name("value")
+                .or_else(|| node.named_child(0));
+            if let Some(head) = head {
+                self.type_references(head, scope, owner, context);
+                // Literal arguments are values; Annotated arguments after the
+                // first are metadata. Avoid interpreting either as type names.
+                let head_parts = self.dotted(head).unwrap_or_default();
+                let special = head_parts.last().map(String::as_str);
+                if special == Some("Literal") {
+                    return;
+                }
+                let mut cursor = node.walk();
+                let arguments: Vec<_> = node
+                    .named_children(&mut cursor)
+                    .filter(|n| n.id() != head.id())
+                    .collect();
+                for argument in arguments {
+                    if argument.kind() == "type_parameter" {
+                        let mut cursor = argument.walk();
+                        for (index, item) in argument.named_children(&mut cursor).enumerate() {
+                            if special == Some("Annotated") && index > 0 {
+                                break;
+                            }
+                            self.type_references(item, scope, owner, "generic_arg");
+                        }
+                    } else {
+                        self.type_references(argument, scope, owner, "generic_arg");
+                        if special == Some("Annotated") {
+                            break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.type_references(child, scope, owner, context);
+        }
+    }
+
+    fn string_text(&self, node: Syntax<'_>) -> Option<String> {
+        if node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+            return self.string_text(node.named_child(0)?);
+        }
+        if node.kind() == "concatenated_string" {
+            let mut text = String::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                text.push_str(&self.string_text(child)?);
+            }
+            return Some(text);
+        }
+        if node.kind() != "string" {
+            return None;
+        }
+        let raw = self.text(node);
+        let quote = raw.find(['\'', '"'])?;
+        if raw[..quote]
+            .bytes()
+            .any(|b| matches!(b, b'b' | b'B' | b'f' | b'F'))
+        {
+            return None;
+        }
+        let width = if raw[quote..].starts_with("\"\"\"") || raw[quote..].starts_with("\'\'\'") {
+            3
+        } else {
+            1
+        };
+        Some(raw[quote + width..raw.len() - width].to_owned())
+    }
+
+    fn docstring(&mut self, body: Syntax<'_>, scope: usize) {
+        let mut cursor = body.walk();
+        let first = body
+            .named_children(&mut cursor)
+            .find(|n| n.kind() != "comment");
+        if let Some(statement) = first.filter(|n| n.kind() == "expression_statement")
+            && let Some(string) = statement.named_child(0)
+            && let Some(text) = self
+                .string_text(string)
+                .filter(|s| s.trim().chars().count() > 20)
+        {
+            self.rationale(string, text.trim().into(), scope, "docstring");
+        }
+    }
+
+    fn rationale(&mut self, node: Syntax<'_>, text: String, scope: usize, kind: &str) {
+        let id = format!("python:{}:rationale@{}", self.facts.path, node.start_byte());
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let label = if flat.chars().count() > 80 {
+            let prefix: String = flat.chars().take(79).collect();
+            let cut = if flat.chars().nth(79) == Some(' ') {
+                prefix.as_str()
+            } else {
+                prefix
+                    .rsplit_once(' ')
+                    .map_or(prefix.as_str(), |(words, _)| words)
+            };
+            format!("{}…", cut.trim_end())
+        } else {
+            flat
+        };
+        self.facts.nodes.push(Node {
+            id: id.clone(),
+            label,
+            kind: "rationale".into(),
+            file: self.facts.path.clone(),
+            line: Some(line(node)),
+            end_line: Some(line_end(node)),
+            qualified_name: None,
+            binding_key: None,
+            metadata: json!({"kind": kind, "text": text, "source_text": self.text(node)}),
+        });
+        self.facts.edges.push(Edge {
+            id: format!("rationale_for:{id}"),
+            source: id,
+            target: self.scopes[scope].owner.clone(),
+            relation: "rationale_for".into(),
+            directed: true,
+            file: Some(self.facts.path.clone()),
+            line: Some(line(node)),
+            confidence: "static".into(),
+            metadata: json!({"context": kind}),
+        });
+    }
+
+    fn generated_module(&self, root: Syntax<'_>) -> bool {
+        let head: String = self.source.chars().take(2048).collect();
+        if [
+            "DO NOT EDIT",
+            "@generated",
+            "Generated by the protocol buffer",
+        ]
+        .iter()
+        .any(|marker| head.contains(marker))
+        {
+            return true;
+        }
+        let mut revision = false;
+        let mut down_revision = false;
+        let mut upgrade = false;
+        let mut cursor = root.walk();
+        for statement in root.named_children(&mut cursor) {
+            if statement.kind() == "function_definition" {
+                upgrade |= statement
+                    .child_by_field_name("name")
+                    .is_some_and(|n| self.text(n) == "upgrade");
+            }
+            if statement.kind() == "expression_statement"
+                && let Some(assignment) = statement
+                    .named_child(0)
+                    .filter(|n| n.kind() == "assignment")
+                && let Some(name) = assignment.child_by_field_name("left")
+            {
+                revision |= self.text(name) == "revision";
+                down_revision |= self.text(name) == "down_revision";
+            }
+            if statement.kind() == "class_definition"
+                && statement
+                    .child_by_field_name("name")
+                    .is_some_and(|n| self.text(n) == "Migration")
+                && statement
+                    .child_by_field_name("superclasses")
+                    .is_some_and(|n| self.text(n).contains("migrations.Migration"))
+                && statement
+                    .child_by_field_name("body")
+                    .is_some_and(|n| self.text(n).contains("operations"))
+            {
+                return true;
+            }
+        }
+        revision && down_revision && upgrade
+    }
+
+    fn decorator_noise(&self, site: &PendingCall, key: Option<&str>) -> bool {
+        if matches!(
+            key,
+            Some(
+                "python:dataclasses:dataclass"
+                    | "python:functools:wraps"
+                    | "python:functools:lru_cache"
+                    | "python:functools:cache"
+                    | "python:abc:abstractmethod"
+            )
+        ) {
+            return true;
+        }
+        if site.parts.len() != 1
+            || !matches!(
+                site.parts[0].as_str(),
+                "property" | "staticmethod" | "classmethod"
+            )
+        {
+            return false;
+        }
+        let mut current = Some(site.scope);
+        while let Some(index) = current {
+            if self.scopes[index].uncertain
+                || self.scopes[index].bindings.contains_key(&site.parts[0])
+            {
+                return false;
+            }
+            current = self.scopes[index].parent;
+        }
+        true
+    }
+
     fn bind(&mut self, scope: usize, name: String, binding: Binding) {
         self.scopes[scope]
             .bindings
@@ -260,9 +678,66 @@ impl Extractor<'_> {
 
     fn visit(&mut self, node: Syntax<'_>, scope: usize, conditional: bool) {
         if node.kind() == "type" {
+            self.type_references(
+                node,
+                scope,
+                &self.scopes[scope].owner.clone(),
+                "variable_type",
+            );
             return;
         }
         match node.kind() {
+            "comment" => {
+                if [
+                    "# NOTE:",
+                    "# IMPORTANT:",
+                    "# HACK:",
+                    "# WHY:",
+                    "# RATIONALE:",
+                    "# TODO:",
+                    "# FIXME:",
+                ]
+                .iter()
+                .any(|prefix| self.text(node).starts_with(prefix))
+                {
+                    self.rationale(node, self.text(node).to_owned(), scope, "comment");
+                }
+                return;
+            }
+            "decorated_definition" => {
+                if let Some(definition) = node.child_by_field_name("definition") {
+                    let mut cursor = node.walk();
+                    let decorators: Vec<_> = node
+                        .named_children(&mut cursor)
+                        .filter(|n| n.kind() == "decorator")
+                        .collect();
+                    let builtin = decorators.len() == 1
+                        && self.scopes[scope].kind == ScopeKind::Class
+                        && decorators[0].named_child(0).is_some_and(|n| {
+                            n.kind() == "identifier"
+                                && matches!(self.text(n), "staticmethod" | "classmethod")
+                        });
+                    let owner = self.definition_id(definition, scope);
+                    if builtin && !conditional {
+                        self.builtin_methods.push((
+                            scope,
+                            self.text(decorators[0].named_child(0).unwrap()).into(),
+                            owner.clone(),
+                        ));
+                    }
+                    for decorator in decorators {
+                        if let Some(expression) = decorator.named_child(0) {
+                            let head = expression
+                                .child_by_field_name("function")
+                                .unwrap_or(expression);
+                            self.reference(head, scope, &owner, "references", "decorator");
+                            self.visit(expression, scope, conditional);
+                        }
+                    }
+                    self.definition(definition, scope, conditional || !builtin);
+                }
+                return;
+            }
             "function_definition" | "class_definition" => {
                 self.definition(node, scope, conditional);
                 return;
@@ -381,6 +856,21 @@ impl Extractor<'_> {
         }
     }
 
+    fn definition_id(&self, node: Syntax<'_>, scope: usize) -> String {
+        let name = self.text(node.child_by_field_name("name").unwrap());
+        let prefix = &self.scopes[scope].qualified;
+        let qualified = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        format!(
+            "python:{}:{qualified}@{}",
+            self.facts.path,
+            node.start_byte()
+        )
+    }
+
     fn definition(&mut self, node: Syntax<'_>, scope: usize, conditional: bool) {
         let name = self
             .text(node.child_by_field_name("name").unwrap())
@@ -448,7 +938,7 @@ impl Extractor<'_> {
             } else {
                 ScopeKind::Function
             },
-            owner: id,
+            owner: id.clone(),
             qualified,
             bindings: HashMap::new(),
             uncertain: false,
@@ -460,11 +950,65 @@ impl Extractor<'_> {
             self.parameters(parameters, child);
         }
         let body = node.child_by_field_name("body").unwrap();
+        self.docstring(body, child);
+        if let Some(parameters) = node.child_by_field_name("parameters") {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if let Some(annotation) = parameter.child_by_field_name("type") {
+                    self.type_references(annotation, scope, &id, "parameter_type");
+                }
+            }
+        }
+        if let Some(annotation) = node.child_by_field_name("return_type") {
+            self.type_references(annotation, scope, &id, "return_type");
+        }
+        if class {
+            let literal = node
+                .child_by_field_name("superclasses")
+                .is_none_or(|bases| {
+                    let mut cursor = bases.walk();
+                    bases
+                        .named_children(&mut cursor)
+                        .filter(|n| n.kind() != "comment")
+                        .all(|base| self.dotted(base).is_some())
+                });
+            self.facts
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .unwrap()
+                .metadata = json!({"python_literal_bases": literal});
+        }
+        if let Some(bases) = node.child_by_field_name("superclasses") {
+            let mut cursor = bases.walk();
+            for base in bases.named_children(&mut cursor) {
+                if !matches!(
+                    base.kind(),
+                    "keyword_argument" | "list_splat" | "dictionary_splat"
+                ) {
+                    let head = base.child_by_field_name("value").unwrap_or(base);
+                    self.reference(head, scope, &id, "inherits", "base_class");
+                    if base.kind() == "subscript" {
+                        let mut cursor = base.walk();
+                        for argument in base.children_by_field_name("subscript", &mut cursor) {
+                            self.type_references(argument, scope, &id, "generic_arg");
+                        }
+                    }
+                }
+            }
+        }
         let mut cursor = node.walk();
         for n in node.named_children(&mut cursor) {
             if n.id() == body.id() {
                 self.visit(n, child, false);
-            } else {
+            } else if n.kind() == "parameters" {
+                let mut cursor = n.walk();
+                for parameter in n.named_children(&mut cursor) {
+                    if let Some(default) = parameter.child_by_field_name("value") {
+                        self.visit(default, scope, conditional);
+                    }
+                }
+            } else if n.kind() != "type" {
                 self.visit(n, scope, conditional);
             }
         }
@@ -505,13 +1049,23 @@ impl Extractor<'_> {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "wildcard_import" {
-                self.scopes[scope].uncertain = true;
+                let keys = if scope == 0
+                    && !conditional
+                    && let Some(module) = &module
+                {
+                    self.stars
+                        .push((module.clone(), node.end_byte(), line(node)));
+                    vec![format!("module:{module}")]
+                } else {
+                    self.scopes[scope].uncertain = true;
+                    vec![]
+                };
                 self.import_reference(
                     child,
                     scope,
                     "*".into(),
-                    vec![],
-                    "star import is not resolved",
+                    keys,
+                    "star module is unavailable or ambiguous",
                 );
             }
         }
@@ -611,18 +1165,7 @@ impl Extractor<'_> {
     }
 
     fn dotted(&self, node: Syntax<'_>) -> Option<Vec<String>> {
-        match node.kind() {
-            "identifier" => Some(vec![self.text(node).into()]),
-            "attribute" => {
-                let mut parts = self.dotted(node.child_by_field_name("object")?)?;
-                parts.push(self.text(node.child_by_field_name("attribute")?).into());
-                Some(parts)
-            }
-            "parenthesized_expression" if node.named_child_count() == 1 => {
-                self.dotted(node.named_child(0)?)
-            }
-            _ => None,
-        }
+        dotted_text(node, self.source)
     }
 
     fn call_key(&self, call: &PendingCall) -> Option<String> {
@@ -649,6 +1192,30 @@ impl Extractor<'_> {
                         {
                             Some(key.clone())
                         }
+                        Binding::Definition { key, id, start }
+                            if parts.len() > 1
+                                && (deferred || *start <= call.start)
+                                && self
+                                    .facts
+                                    .nodes
+                                    .iter()
+                                    .any(|n| n.id == *id && n.kind == "class") =>
+                        {
+                            Some(format!(
+                                "python-member:{}.{}",
+                                key.strip_prefix("python:")?,
+                                parts[1..].join(".")
+                            ))
+                        }
+                        Binding::Symbol { key, start }
+                            if parts.len() > 1 && (deferred || *start <= call.start) =>
+                        {
+                            Some(format!(
+                                "python-member:{}.{}",
+                                key.strip_prefix("python:")?,
+                                parts[1..].join(".")
+                            ))
+                        }
                         Binding::Module {
                             module,
                             prefix,
@@ -656,15 +1223,25 @@ impl Extractor<'_> {
                         } if deferred || *start <= call.start => {
                             let dotted = parts.join(".");
                             let suffix = dotted.strip_prefix(&format!("{prefix}."))?;
-                            if suffix.contains('.') {
-                                None
-                            } else {
-                                Some(format!("python:{module}:{suffix}"))
-                            }
+                            Some(PythonContext::module_member(module, suffix))
                         }
                         _ => None,
-                    };
+                    }
+                    .map(|key| {
+                        // Keep the consuming module's binding name until context
+                        // checks its stars. The provider key alone loses collisions
+                        // with explicit imports, including module aliases and bases.
+                        if scope.kind == ScopeKind::Module && !self.stars.is_empty() {
+                            format!("python-local:{}:{name}:{key}", self.facts.module)
+                        } else {
+                            key
+                        }
+                    });
                 }
+            }
+            if scope.kind == ScopeKind::Module && !self.stars.is_empty() {
+                return (deferred || self.stars.iter().all(|(_, start, _)| *start <= call.start))
+                    .then(|| PythonContext::module_member(&self.facts.module, &parts.join(".")));
             }
             deferred |= scope.kind == ScopeKind::Function;
             index = scope.parent;
@@ -683,7 +1260,102 @@ impl Extractor<'_> {
         false
     }
 
+    fn exports(&mut self) {
+        // Only final, unambiguous module bindings are public import evidence.
+        // __all__ governs star imports, not an explicit named import; do not
+        // execute it or infer names from mutations of that value.
+        let mut exports = BTreeMap::new();
+        let mut blocked = BTreeSet::new();
+        let mut definitions = BTreeMap::new();
+        for (name, binding) in &self.scopes[0].bindings {
+            let public = !name.starts_with('_')
+                || self
+                    .all
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(name)));
+            let (key, start) = match binding {
+                Binding::Symbol { key, start } if public => (key.clone(), *start),
+                Binding::Module {
+                    module,
+                    prefix,
+                    start,
+                } if public && prefix == name => (format!("module:{module}"), *start),
+                Binding::Definition { key, .. } => {
+                    definitions.insert(name.clone(), key.clone());
+                    continue;
+                }
+                _ => {
+                    blocked.insert(name.clone());
+                    continue;
+                }
+            };
+            if self.scopes[0].uncertain {
+                continue;
+            }
+            let line = self.source[..start].lines().count() as u32;
+            exports.insert(name.clone(), json!({"target": key, "line": line}));
+            let module = key
+                .strip_prefix("module:")
+                .or_else(|| {
+                    key.strip_prefix("python:")
+                        .and_then(|s| s.split_once(':').map(|(module, _)| module))
+                })
+                .unwrap();
+            self.facts.references.push(Reference {
+                id: format!("reexport:{}:{name}", self.scopes[0].owner),
+                source: self.scopes[0].owner.clone(),
+                label: name.clone(),
+                relation: "re_exports".into(),
+                file: self.facts.path.clone(),
+                line,
+                candidate_keys: vec![format!("module:{module}")],
+                reason: "explicit public import target is unavailable or ambiguous".into(),
+            });
+        }
+        for (target, start, line) in &self.stars {
+            self.facts.references.push(Reference {
+                id: format!("reexport-star:{}:{start}", self.scopes[0].owner),
+                source: self.scopes[0].owner.clone(),
+                label: "*".into(),
+                relation: "re_exports".into(),
+                file: self.facts.path.clone(),
+                line: *line,
+                candidate_keys: vec![format!("module:{target}")],
+                reason: "static star module is unavailable or ambiguous".into(),
+            });
+        }
+        let module = &mut self.facts.nodes[0];
+        if module.metadata.is_null() {
+            module.metadata = json!({});
+        }
+        module.metadata["python_exports"] = json!(exports);
+        module.metadata["python_blocked_exports"] = json!(blocked);
+        module.metadata["python_uncertain"] = json!(self.scopes[0].uncertain);
+        module.metadata["python_all"] = self.all.clone();
+        module.metadata["python_definitions"] = json!(definitions);
+        module.metadata["python_stars"] =
+            json!(self.stars.iter().map(|(m, _, _)| m).collect::<Vec<_>>());
+    }
+
     fn finish(&mut self) {
+        for (scope, name, id) in &self.builtin_methods {
+            let mut current = Some(*scope);
+            // Star imports can replace decorator builtins. Without inventory at
+            // extraction time, do not certify the decorated method's identity.
+            let mut shadowed = !self.stars.is_empty();
+            while let Some(index) = current {
+                shadowed |=
+                    self.scopes[index].uncertain || self.scopes[index].bindings.contains_key(name);
+                current = self.scopes[index].parent;
+            }
+            if shadowed {
+                for binding in self.scopes[*scope].bindings.values_mut() {
+                    if matches!(binding, Binding::Definition { id: bound, .. } if bound == id) {
+                        *binding = Binding::Unknown;
+                    }
+                }
+            }
+        }
         let valid: HashMap<_, _> = self
             .scopes
             .iter()
@@ -699,6 +1371,108 @@ impl Extractor<'_> {
             .collect();
         for node in self.facts.nodes.iter_mut().filter(|n| n.kind != "module") {
             node.binding_key = valid.get(&node.id).cloned();
+        }
+        // Only verified class ownership exports member aliases. A nested function
+        // with the same qualified spelling must never satisfy an imported member.
+        for scope in &self.scopes {
+            if scope.kind != ScopeKind::Class
+                || !valid.contains_key(&scope.owner)
+                || scope.uncertain
+                || scope.qualified.split('.').any(private_name)
+            {
+                continue;
+            }
+            let mut ancestor = scope.parent;
+            let mut uncertain = false;
+            while let Some(index) = ancestor {
+                let parent = &self.scopes[index];
+                uncertain |= parent.uncertain
+                    || (parent.kind != ScopeKind::Module && !valid.contains_key(&parent.owner));
+                ancestor = parent.parent;
+            }
+            if uncertain {
+                continue;
+            }
+            for binding in scope.bindings.values() {
+                if let Binding::Definition { id, key, .. } = binding
+                    && let Some(node) = self.facts.nodes.iter_mut().find(|n| {
+                        n.id == *id
+                            && n.kind == "method"
+                            && n.binding_key.is_some()
+                            && !private_name(&n.label)
+                    })
+                {
+                    if node.metadata.is_null() {
+                        node.metadata = json!({});
+                    }
+                    node.metadata["binding_aliases"] = json!([format!(
+                        "python-member:{}",
+                        key.strip_prefix("python:").unwrap()
+                    )]);
+                }
+            }
+        }
+        if !self.scopes[0].uncertain
+            && let Some((package, module)) = self.facts.module.rsplit_once('.')
+        {
+            for binding in self.scopes[0].bindings.values() {
+                if let Binding::Definition { id, .. } = binding
+                    && let Some(node) = self.facts.nodes.iter_mut().find(|n| {
+                        n.id == *id
+                            && matches!(n.kind.as_str(), "class" | "function")
+                            && n.binding_key.is_some()
+                    })
+                {
+                    if node.metadata.is_null() {
+                        node.metadata = json!({});
+                    }
+                    node.metadata["binding_aliases"] = json!([format!(
+                        "python-member:{package}:{module}.{}",
+                        node.qualified_name.as_deref().unwrap()
+                    )]);
+                }
+            }
+        }
+        for evidence in &self.evidence {
+            let key = self.call_key(&evidence.site);
+            if evidence.context == "decorator"
+                && self.decorator_noise(&evidence.site, key.as_deref())
+            {
+                continue;
+            }
+            let reference_id = format!(
+                "{}:{}:{}:{}-{}",
+                evidence.relation,
+                evidence.context,
+                evidence.owner,
+                evidence.site.start,
+                evidence.site.end
+            );
+            if let Some(node) = self.facts.nodes.iter_mut().find(|n| n.id == evidence.owner) {
+                if node.metadata.is_null() {
+                    node.metadata = json!({});
+                }
+                if node.metadata.get("python_references").is_none() {
+                    node.metadata["python_references"] = json!([]);
+                }
+                node.metadata["python_references"].as_array_mut().unwrap().push(json!({
+                    "reference_id": reference_id, "context": evidence.context,
+                    "line": evidence.site.line, "text": &self.source[evidence.site.start..evidence.site.end],
+                }));
+            }
+            self.facts.references.push(Reference {
+                id: reference_id,
+                source: evidence.owner.clone(),
+                label: evidence.site.parts.join("."),
+                relation: evidence.relation.into(),
+                file: self.facts.path.clone(),
+                line: evidence.site.line,
+                candidate_keys: key.into_iter().collect(),
+                reason: format!(
+                    "{}: target is unavailable, shadowed, or uncertain",
+                    evidence.context
+                ),
+            });
         }
         for call in &self.calls {
             let key = self.call_key(call);
@@ -725,5 +1499,713 @@ impl Extractor<'_> {
                 reason: reason.into(),
             });
         }
+        for scope in self.scopes.iter().filter(|s| s.kind == ScopeKind::Class) {
+            let bases: Vec<_> = self
+                .evidence
+                .iter()
+                .filter(|e| e.owner == scope.owner && e.relation == "inherits")
+                .map(|e| {
+                    self.call_key(&e.site).or_else(|| {
+                        if e.site.parts != ["object"] || !self.stars.is_empty() {
+                            return None;
+                        }
+                        let mut current = Some(e.site.scope);
+                        while let Some(index) = current {
+                            let parent = &self.scopes[index];
+                            if parent.uncertain || parent.bindings.contains_key("object") {
+                                return None;
+                            }
+                            current = parent.parent;
+                        }
+                        Some("python-builtin:object".into())
+                    })
+                })
+                .collect();
+            let members: BTreeMap<_, _> = scope
+                .bindings
+                .iter()
+                .map(|(name, binding)| {
+                    let key = match binding {
+                        Binding::Definition { key, id, .. } if valid.contains_key(id) => {
+                            Some(key.clone())
+                        }
+                        _ => None,
+                    };
+                    (name.clone(), key)
+                })
+                .collect();
+            if let Some(node) = self.facts.nodes.iter_mut().find(|n| n.id == scope.owner) {
+                node.metadata["python_bases"] = json!(bases);
+                node.metadata["python_members"] = json!(members);
+                node.metadata["python_class_uncertain"] = json!(scope.uncertain);
+            }
+        }
+        self.exports();
+        if !self.stars.is_empty() {
+            // File-local syntax cannot prove that a star leaves these names in
+            // place. Keep the candidate inventory for context, but do not publish
+            // keys or aliases to Store until the whole module set proves them.
+            for node in &mut self.facts.nodes {
+                if node.kind == "module" {
+                    continue;
+                }
+                if let Some(key) = node.binding_key.take() {
+                    let name = node
+                        .qualified_name
+                        .as_deref()
+                        .unwrap()
+                        .split('.')
+                        .next()
+                        .unwrap();
+                    let aliases = node
+                        .metadata
+                        .get("binding_aliases")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    if node.metadata.is_null() {
+                        node.metadata = json!({});
+                    }
+                    node.metadata["python_pending_binding"] =
+                        json!({"name": name, "key": key, "aliases": aliases});
+                    node.metadata
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("binding_aliases");
+                }
+            }
+        }
+    }
+}
+
+fn dotted_text(node: Syntax<'_>, source: &str) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => Some(vec![source[node.byte_range()].into()]),
+        "attribute" => {
+            let mut parts = dotted_text(node.child_by_field_name("object")?, source)?;
+            parts.push(source[node.child_by_field_name("attribute")?.byte_range()].into());
+            Some(parts)
+        }
+        "parenthesized_expression" if node.named_child_count() == 1 => {
+            dotted_text(node.named_child(0)?, source)
+        }
+        _ => None,
+    }
+}
+
+fn python_definition_key(node: &Node) -> Option<&str> {
+    node.binding_key
+        .as_deref()
+        .or_else(|| node.metadata["python_pending_binding"]["key"].as_str())
+}
+
+/// Explicit Python import forwarding over a complete, visible parser inventory.
+/// Rebuild this context after inventory changes and include `fingerprint()` in
+/// Python file stamps before calling `apply` on parsed files. No filesystem or
+/// Python execution is performed. Only literal export lists, verified public
+/// bindings, and literal class bases participate; runtime aliases stay opaque.
+#[derive(Default)]
+pub struct PythonContext {
+    modules: BTreeMap<String, Vec<PythonModule>>,
+    bindings: BTreeSet<String>,
+    classes: BTreeMap<String, Vec<PythonClass>>,
+    fingerprint: String,
+}
+
+type PythonExports = BTreeMap<String, Option<String>>;
+
+struct PythonModule {
+    exports: BTreeMap<String, String>,
+    definitions: BTreeMap<String, String>,
+    stars: Vec<String>,
+    all: Value,
+    blocked: BTreeSet<String>,
+    uncertain: bool,
+}
+
+struct PythonClass {
+    bases: Vec<Option<String>>,
+    members: BTreeMap<String, Option<String>>,
+    uncertain: bool,
+}
+
+impl PythonContext {
+    pub fn from_facts(facts: &[FileFacts]) -> Self {
+        let mut context = Self::default();
+        let mut inventory: Vec<_> = facts.iter().collect();
+        inventory.sort_by(|a, b| a.path.cmp(&b.path));
+        for facts in inventory {
+            // Failed Python parses still reserve module identity, so a second
+            // root's same module cannot silently win over an invalid source.
+            let root = facts
+                .nodes
+                .iter()
+                .find(|n| n.kind == "module" && n.id.starts_with("python:"));
+            if root.is_none() && !facts.path.ends_with(".py") {
+                continue;
+            }
+            let mut bindings = BTreeSet::new();
+            for node in &facts.nodes {
+                if node.kind == "class"
+                    && let Some(name) = &node.qualified_name
+                {
+                    context
+                        .classes
+                        .entry(format!("python:{}:{name}", facts.module))
+                        .or_default()
+                        .push(PythonClass {
+                            bases: serde_json::from_value(node.metadata["python_bases"].clone())
+                                .unwrap_or_default(),
+                            members: serde_json::from_value(
+                                node.metadata["python_members"].clone(),
+                            )
+                            .unwrap_or_default(),
+                            uncertain: python_definition_key(node).is_none()
+                                || node.metadata["python_literal_bases"] != true
+                                || node.metadata["python_class_uncertain"] == true,
+                        });
+                }
+                bindings.extend(python_definition_key(node).map(str::to_owned));
+                for aliases in [
+                    node.metadata.get("binding_aliases"),
+                    node.metadata["python_pending_binding"].get("aliases"),
+                ] {
+                    bindings.extend(
+                        aliases
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+            }
+            let metadata = root.map_or(&Value::Null, |n| &n.metadata);
+            let exports = metadata
+                .get("python_exports")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, entry)| {
+                    Some((name.clone(), entry.get("target")?.as_str()?.to_owned()))
+                })
+                .collect();
+            let blocked = metadata
+                .get("python_blocked_exports")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            context
+                .modules
+                .entry(facts.module.clone())
+                .or_default()
+                .push(PythonModule {
+                    exports,
+                    definitions: serde_json::from_value(metadata["python_definitions"].clone())
+                        .unwrap_or_default(),
+                    stars: serde_json::from_value(metadata["python_stars"].clone())
+                        .unwrap_or_default(),
+                    all: metadata["python_all"].clone(),
+                    blocked,
+                    uncertain: root.is_none()
+                        || metadata
+                            .get("python_uncertain")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                });
+            context.bindings.extend(bindings);
+        }
+        // Stamp binding context, not reference usage or source locations.
+        // Ordinary terminal definitions/body edits keep per-file parsing; Store
+        // already rebinds references when those defining keys change.
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"python-import-context-5");
+        for (module, files) in &context.modules {
+            if files.len() == 1 && files[0].exports.is_empty() && files[0].stars.is_empty() {
+                continue;
+            }
+            let mut variants: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    let resolved: BTreeMap<_, _> = file
+                        .exports
+                        .keys()
+                        .map(|name| {
+                            (
+                                name,
+                                context.resolve(
+                                    &format!("python:{module}:{name}"),
+                                    &mut BTreeSet::new(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    let stars = (!file.stars.is_empty()).then(|| {
+                        context
+                            .star_bindings(
+                                file,
+                                &mut BTreeSet::from([module.clone()]),
+                                &mut BTreeMap::new(),
+                            )
+                            .map(|bindings| {
+                                bindings
+                                    .into_iter()
+                                    .map(|(name, target)| {
+                                        let resolved = target.and_then(|_| {
+                                            context.resolve(
+                                                &format!("python:{module}:{name}"),
+                                                &mut BTreeSet::new(),
+                                            )
+                                        });
+                                        (name, resolved)
+                                    })
+                                    .collect::<BTreeMap<_, _>>()
+                            })
+                    });
+                    json!([file.exports, resolved, file.stars, stars]).to_string()
+                })
+                .collect();
+            variants.sort();
+            let input = json!([module, variants]).to_string();
+            hash.update(&(input.len() as u64).to_le_bytes());
+            hash.update(input.as_bytes());
+        }
+        // Fingerprint the available member routes, never their call sites.
+        // Adding/removing an inherited call is only a body edit. Inherited
+        // endpoints and suppressed aliases still need consumer refresh when the
+        // binding context changes; unchanged terminal keys rebind in Store.
+        let mut member_keys: BTreeSet<_> = context
+            .bindings
+            .iter()
+            .filter(|key| key.starts_with("python-member:"))
+            .cloned()
+            .collect();
+        let mut mros = BTreeMap::new();
+        for class in context.classes.keys() {
+            let mro = context.mro(class, &mut BTreeSet::new(), &mut mros);
+            // Unknown/changed bases can change a cleared lookup into a direct
+            // key even without inherited methods. Ordinary root classes still
+            // use Store's terminal-key addition/deletion handling.
+            let root_class = mro.as_ref().is_some_and(|order| {
+                order.len() == 2 && order[0] == *class && order[1] == "python-builtin:object"
+            });
+            if !root_class {
+                let input = json!(["class", class, mro]).to_string();
+                hash.update(&(input.len() as u64).to_le_bytes());
+                hash.update(input.as_bytes());
+            }
+            if let Some(mro) = mro {
+                for ancestor in mro {
+                    for info in context.classes.get(&ancestor).into_iter().flatten() {
+                        for name in info.members.keys() {
+                            member_keys.insert(format!(
+                                "python-member:{}.{name}",
+                                class.strip_prefix("python:").unwrap()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for key in member_keys {
+            let resolved = context
+                .resolve(&key, &mut BTreeSet::new())
+                .map(|(key, _)| key);
+            if resolved.as_deref() != Some(&key) {
+                let input = json!([key, resolved]).to_string();
+                hash.update(&(input.len() as u64).to_le_bytes());
+                hash.update(input.as_bytes());
+            }
+        }
+        context.fingerprint = hash.finalize().to_hex().to_string();
+        context
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Publish verified star-dependent bindings and rewrite references to their
+    /// defining keys; native IDs and ownership never move to a forwarding module.
+    /// Reparse callers when the context fingerprint changes, including on export
+    /// deletion or ambiguity.
+    pub fn apply(&self, facts: &mut FileFacts) {
+        if !facts
+            .nodes
+            .iter()
+            .any(|n| n.kind == "module" && n.id.starts_with("python:"))
+        {
+            return;
+        }
+        for node in &mut facts.nodes {
+            let Some(pending) = node.metadata.get("python_pending_binding").cloned() else {
+                continue;
+            };
+            let publish = pending["name"]
+                .as_str()
+                .is_some_and(|name| self.unshadowed_binding(&facts.module, name));
+            node.binding_key = if publish {
+                pending["key"].as_str().map(str::to_owned)
+            } else {
+                None
+            };
+            let metadata = node.metadata.as_object_mut().unwrap();
+            metadata.remove("binding_aliases");
+            if publish
+                && pending["aliases"]
+                    .as_array()
+                    .is_some_and(|aliases| !aliases.is_empty())
+            {
+                metadata.insert("binding_aliases".into(), pending["aliases"].clone());
+            }
+        }
+        let mut expanded = Vec::new();
+        for reference in &facts.references {
+            if reference.relation != "imports" || reference.label != "*" {
+                continue;
+            }
+            let Some(module) = reference
+                .candidate_keys
+                .first()
+                .and_then(|k| k.strip_prefix("module:"))
+            else {
+                continue;
+            };
+            if let Some(exports) =
+                self.star_exports(module, &mut BTreeSet::new(), &mut BTreeMap::new())
+            {
+                for (name, target) in exports {
+                    let Some(target) = target else { continue };
+                    let mut symbol = reference.clone();
+                    symbol.id = format!("{}:{name}", symbol.id);
+                    symbol.label = name;
+                    symbol.candidate_keys = vec![target];
+                    if !facts.references.iter().any(|r| r.id == symbol.id) {
+                        expanded.push(symbol);
+                    }
+                }
+            }
+        }
+        facts.references.extend(expanded);
+        for reference in &mut facts.references {
+            let mut keys = Vec::new();
+            for key in &reference.candidate_keys {
+                match self.resolve(key, &mut BTreeSet::new()) {
+                    Some((target, claimed)) => {
+                        // Calling an imported module is not a statically known
+                        // function call, even when its module identity is known.
+                        if (reference.relation != "calls" || !target.starts_with("module:"))
+                            && !keys.contains(&target)
+                        {
+                            keys.push(target);
+                        }
+                        if claimed {
+                            break;
+                        }
+                    }
+                    None => {
+                        keys.clear();
+                        break;
+                    }
+                }
+            }
+            reference.candidate_keys = keys;
+        }
+    }
+
+    // The bool means an explicit binding owns this name, preventing a missing
+    // named re-export from falling through to an unrelated same-named submodule.
+    fn resolve(&self, key: &str, seen: &mut BTreeSet<String>) -> Option<(String, bool)> {
+        if seen.len() >= 64 || !seen.insert(key.to_owned()) {
+            return None;
+        }
+        if let Some(local) = key.strip_prefix("python-local:") {
+            let (module, local) = local.split_once(':')?;
+            let (name, target) = local.split_once(':')?;
+            if !self.unshadowed_binding(module, name) {
+                return None;
+            }
+            return self.resolve(target, seen);
+        }
+        if let Some(module) = key.strip_prefix("module:") {
+            if self
+                .modules
+                .get(module)
+                .is_some_and(|files| files.len() != 1)
+            {
+                return None;
+            }
+            return Some((key.into(), self.bindings.contains(key)));
+        }
+        let (member, rest) = if let Some(rest) = key.strip_prefix("python-member:") {
+            (true, rest)
+        } else if let Some(rest) = key.strip_prefix("python:") {
+            (false, rest)
+        } else {
+            return Some((key.into(), false));
+        };
+        let Some((module, name)) = rest.split_once(':') else {
+            return Some((key.into(), false));
+        };
+        let (head, suffix) = name
+            .split_once('.')
+            .map_or((name, None), |(head, tail)| (head, Some(tail)));
+        let mut known_name = false;
+        if let Some(files) = self.modules.get(module) {
+            if files.len() != 1 {
+                return None;
+            }
+            let info = &files[0];
+            if info.uncertain || info.blocked.contains(head) {
+                // A terminal name keeps its original lookup key. The Store
+                // removes/rebinds that definition when this module changes,
+                // without reparsing unrelated callers. Claim the name to stop
+                // an invalid named import falling back to a sibling submodule.
+                let missing_member = member
+                    && !self.bindings.contains(key)
+                    && name.rsplit_once('.').is_some_and(|(class, _)| {
+                        !self
+                            .classes
+                            .contains_key(&format!("python:{module}:{class}"))
+                    });
+                return ((!member && suffix.is_none()) || missing_member)
+                    .then(|| (key.into(), true));
+            }
+            let stars = self.star_bindings(
+                info,
+                &mut BTreeSet::from([module.to_owned()]),
+                &mut BTreeMap::new(),
+            )?;
+            let star = stars.get(head);
+            if star.is_some()
+                && (info.exports.contains_key(head) || info.definitions.contains_key(head))
+            {
+                return None;
+            }
+            let target = match star {
+                Some(target) => Some(target.as_ref()?),
+                None => info.exports.get(head),
+            };
+            if let Some(target) = target {
+                let forwarded = match (target.strip_prefix("module:"), suffix) {
+                    (Some(module), Some(tail)) => Self::module_member(module, tail),
+                    (Some(_), None) => target.clone(),
+                    (None, Some(tail)) => {
+                        let symbol = target.strip_prefix("python:")?;
+                        format!(
+                            "{}:{symbol}.{tail}",
+                            if member { "python-member" } else { "python" }
+                        )
+                    }
+                    (None, None) => target.clone(),
+                };
+                return self.resolve(&forwarded, seen).map(|(key, _)| (key, true));
+            }
+            known_name = self.bindings.contains(&format!("python:{module}:{head}"));
+            if !info.stars.is_empty() && !known_name {
+                return None;
+            }
+        }
+        if member && let Some((class, method)) = name.rsplit_once('.') {
+            let class_key = format!("python:{module}:{class}");
+            if self.classes.contains_key(&class_key) {
+                let mro = self.mro(&class_key, &mut BTreeSet::new(), &mut BTreeMap::new())?;
+                for class in mro {
+                    if class == "python-builtin:object" {
+                        continue;
+                    }
+                    let info = self.classes.get(&class)?.first()?;
+                    if let Some(target) = info.members.get(method) {
+                        let target = target.as_ref()?;
+                        let alias = format!("python-member:{}", target.strip_prefix("python:")?);
+                        // A same-spelled submodule alias cannot prove an inherited member.
+                        if alias != key && self.bindings.contains(key) {
+                            return None;
+                        }
+                        return self.bindings.contains(&alias).then_some((alias, true));
+                    }
+                }
+                // Preserve an unavailable terminal lookup for Store to bind if
+                // the method is added later. A submodule alias with that spelling
+                // cannot stand in for the verified class's missing member.
+                return (!self.bindings.contains(key)).then(|| (key.into(), true));
+            }
+        }
+        if self.bindings.contains(key) || known_name {
+            return Some((key.into(), true));
+        }
+        // `from package import child` can import a visible submodule, including
+        // namespace packages. Never select one when a named binding owns child.
+        let submodule = format!("{module}.{head}");
+        if self.modules.contains_key(&submodule) {
+            let target = match suffix {
+                Some(tail) => Self::module_member(&submodule, tail),
+                None => format!("module:{submodule}"),
+            };
+            return self.resolve(&target, seen).map(|(key, _)| (key, true));
+        }
+        Some((key.into(), false))
+    }
+
+    fn unshadowed_binding(&self, module: &str, name: &str) -> bool {
+        let Some(files) = self.modules.get(module) else {
+            return false;
+        };
+        files.len() == 1
+            && !files[0].uncertain
+            && self
+                .star_bindings(
+                    &files[0],
+                    &mut BTreeSet::from([module.to_owned()]),
+                    &mut BTreeMap::new(),
+                )
+                .is_some_and(|stars| !stars.contains_key(name))
+    }
+
+    // Keep blocked names in the map: absence and an explicitly unknown export
+    // have different meanings when a consumer also has other star imports.
+    fn star_bindings(
+        &self,
+        info: &PythonModule,
+        seen: &mut BTreeSet<String>,
+        cache: &mut BTreeMap<String, Option<PythonExports>>,
+    ) -> Option<PythonExports> {
+        let mut names = BTreeMap::new();
+        for module in &info.stars {
+            for (name, target) in self.star_exports(module, seen, cache)? {
+                names
+                    .entry(name)
+                    .and_modify(|value| *value = None)
+                    .or_insert(target);
+            }
+        }
+        Some(names)
+    }
+
+    fn star_exports(
+        &self,
+        module: &str,
+        seen: &mut BTreeSet<String>,
+        cache: &mut BTreeMap<String, Option<PythonExports>>,
+    ) -> Option<PythonExports> {
+        if let Some(result) = cache.get(module) {
+            return result.clone();
+        }
+        if seen.len() >= 64 || !seen.insert(module.to_owned()) {
+            return None;
+        }
+        let result = (|| {
+            let files = self.modules.get(module)?;
+            if files.len() != 1 {
+                return None;
+            }
+            let info = &files[0];
+            if info.uncertain || info.all == false {
+                return None;
+            }
+            let mut names = self.star_bindings(info, seen, cache)?;
+            for (name, target) in info.definitions.iter().chain(&info.exports) {
+                names
+                    .entry(name.clone())
+                    .and_modify(|value| *value = None)
+                    .or_insert_with(|| Some(target.clone()));
+            }
+            for name in &info.blocked {
+                names.insert(name.clone(), None);
+            }
+            if let Some(all) = info.all.as_array() {
+                Some(
+                    all.iter()
+                        .filter_map(Value::as_str)
+                        .map(|name| (name.to_owned(), names.get(name).cloned().flatten()))
+                        .collect(),
+                )
+            } else {
+                names.retain(|name, _| !name.starts_with('_'));
+                Some(names)
+            }
+        })();
+        seen.remove(module);
+        cache.insert(module.to_owned(), result.clone());
+        result
+    }
+
+    // C3 linearization: never select a convenient base when the written order
+    // is inconsistent, cyclic, incomplete, or depends on a custom metaclass.
+    fn mro(
+        &self,
+        key: &str,
+        seen: &mut BTreeSet<String>,
+        cache: &mut BTreeMap<String, Option<Vec<String>>>,
+    ) -> Option<Vec<String>> {
+        if let Some(result) = cache.get(key) {
+            return result.clone();
+        }
+        if key == "python-builtin:object" {
+            return Some(vec![key.to_owned()]);
+        }
+        if seen.len() >= 64 || !seen.insert(key.to_owned()) {
+            return None;
+        }
+        let result = (|| {
+            let (resolved, _) = self.resolve(key, &mut BTreeSet::new())?;
+            if resolved != key {
+                return self.mro(&resolved, seen, cache);
+            }
+            let classes = self.classes.get(key)?;
+            if classes.len() != 1 || classes[0].uncertain {
+                return None;
+            }
+            let info = &classes[0];
+            let mut bases = Vec::new();
+            let mut sequences = Vec::new();
+            for base in &info.bases {
+                let (base, _) = self.resolve(base.as_ref()?, &mut BTreeSet::new())?;
+                if bases.contains(&base) {
+                    return None;
+                }
+                sequences.push(self.mro(&base, seen, cache)?);
+                bases.push(base);
+            }
+            if bases.is_empty() {
+                bases.push("python-builtin:object".into());
+            }
+            sequences.push(bases);
+            let mut result = vec![key.to_owned()];
+            while sequences.iter().any(|s| !s.is_empty()) {
+                let head = sequences
+                    .iter()
+                    .filter_map(|s| s.first())
+                    .find(|candidate| {
+                        sequences
+                            .iter()
+                            .all(|s| !s.iter().skip(1).any(|n| n == *candidate))
+                    })?
+                    .clone();
+                result.push(head.clone());
+                for sequence in &mut sequences {
+                    if sequence.first() == Some(&head) {
+                        sequence.remove(0);
+                    }
+                }
+            }
+            Some(result)
+        })();
+        seen.remove(key);
+        cache.insert(key.to_owned(), result.clone());
+        result
+    }
+
+    fn module_member(module: &str, name: &str) -> String {
+        format!(
+            "{}:{module}:{name}",
+            if name.contains('.') {
+                "python-member"
+            } else {
+                "python"
+            }
+        )
     }
 }

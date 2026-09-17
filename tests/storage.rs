@@ -58,6 +58,44 @@ fn edge(id: &str, source: &str, target: &str, directed: bool) -> Edge {
 }
 
 #[test]
+fn bounded_snapshots_include_unresolved_evidence_and_check_payload_before_loading()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("index.db");
+    let mut store = Store::create(&db)?;
+    let mut source = node("caller", "caller.py", "caller");
+    source.metadata = json!({"evidence":"é".repeat(1000)});
+    store.apply_native(
+        "repo",
+        vec![file(
+            "caller.py",
+            vec![source],
+            vec![reference("pending", &["missing"])],
+        )],
+        vec![],
+        Coverage::default(),
+    )?;
+    drop(store);
+    let before = std::fs::read(&db)?;
+    let store = Store::open_read_only(&db)?;
+    assert!(store.snapshot_bounded(1, 0, 0, 10000).is_err());
+    assert!(store.snapshot_bounded(0, 0, 1, 10000).is_err());
+    assert!(store.snapshot_bounded(1, 0, 1, 1500).is_err());
+    let snapshot = store.snapshot_bounded(1, 0, 1, 10000)?;
+    let references: Vec<Reference> =
+        serde_json::from_value(snapshot.metadata["graf_unresolved_references"].clone())?;
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].candidate_keys, ["missing"]);
+    assert_eq!(references[0].source, "caller");
+    assert_eq!(
+        serde_json::to_value(snapshot)?,
+        serde_json::to_value(store.snapshot()?)?
+    );
+    assert_eq!(std::fs::read(&db)?, before);
+    Ok(())
+}
+
+#[test]
 fn deltas_revisit_negative_and_ambiguous_bindings_without_losing_call_sites() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
@@ -122,6 +160,141 @@ fn deltas_revisit_negative_and_ambiguous_bindings_without_losing_call_sites() ->
     assert_eq!(result.unresolved.len(), 1);
     assert_eq!(result.unresolved[0].line, 2);
     assert_eq!(store.file_stamps()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn target_only_replacement_preserves_direct_edges_and_rebinds_references() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut store = Store::create(&dir.path().join("index.db"))?;
+    let mut caller = file(
+        "caller.py",
+        vec![node("caller", "caller.py", "caller")],
+        vec![reference("site", &["work"])],
+    );
+    caller.edges = vec![
+        edge("direct-a", "caller", "target", true),
+        edge("direct-b", "caller", "target", false),
+    ];
+    store.apply_native(
+        "repo",
+        vec![
+            caller,
+            file(
+                "target.py",
+                vec![node("target", "target.py", "work")],
+                vec![],
+            ),
+        ],
+        vec![],
+        Coverage::default(),
+    )?;
+    let before = store.snapshot()?;
+    assert_eq!(before.edges.len(), 3);
+    let mut target = node("target", "target.py", "work");
+    target.label = "updated label".into();
+    store.apply_native(
+        "repo",
+        vec![file("target.py", vec![target], vec![])],
+        vec![],
+        Coverage::default(),
+    )?;
+    let after = store.snapshot()?;
+    assert_eq!(after.generation, before.generation + 1);
+    assert_eq!(
+        serde_json::to_value(after.edges)?,
+        serde_json::to_value(before.edges)?
+    );
+    assert_eq!(store.stats()?.unresolved_references, 0);
+
+    // A different target ID removes direct assertions; a reference still
+    // resolves to the surviving binding instead of retaining its old edge.
+    store.apply_native(
+        "repo",
+        vec![file(
+            "target.py",
+            vec![node("replacement", "target.py", "work")],
+            vec![],
+        )],
+        vec![],
+        Coverage::default(),
+    )?;
+    let rebound = store.snapshot()?;
+    assert_eq!(rebound.edges.len(), 1);
+    assert_eq!(rebound.edges[0].target, "replacement");
+    assert!(!rebound.edges[0].id.starts_with("direct-"));
+    assert_eq!(store.stats()?.unresolved_references, 0);
+    store.apply_native(
+        "repo",
+        vec![],
+        vec!["target.py".into()],
+        Coverage::default(),
+    )?;
+    assert!(store.snapshot()?.edges.is_empty());
+    assert_eq!(store.stats()?.unresolved_references, 1);
+    Ok(())
+}
+
+#[test]
+fn preserved_direct_edges_follow_owner_changes_and_transaction_rollback() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut store = Store::create(&dir.path().join("index.db"))?;
+    let mut caller = file(
+        "caller.py",
+        vec![node("caller", "caller.py", "caller")],
+        vec![],
+    );
+    caller.edges.push(edge("direct", "caller", "target", true));
+    let target = file(
+        "target.py",
+        vec![node("target", "target.py", "work")],
+        vec![],
+    );
+    store.apply_native(
+        "repo",
+        vec![caller.clone(), target.clone()],
+        vec![],
+        Coverage::default(),
+    )?;
+    let before = serde_json::to_value(store.snapshot()?)?;
+    let mut bad = target.clone();
+    bad.edges.push(edge("broken", "target", "absent", true));
+    assert!(
+        store
+            .apply_native("repo", vec![bad], vec![], Coverage::default())
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+
+    // Replacing both files must respect the owner's removal of its assertion.
+    let mut without_edge = caller.clone();
+    without_edge.edges.clear();
+    store.apply_native(
+        "repo",
+        vec![without_edge, target.clone()],
+        vec![],
+        Coverage::default(),
+    )?;
+    assert!(store.snapshot()?.edges.is_empty());
+    store.apply_native("repo", vec![caller.clone()], vec![], Coverage::default())?;
+    store.apply_native(
+        "repo",
+        vec![target.clone()],
+        vec!["caller.py".into()],
+        Coverage::default(),
+    )?;
+    assert!(store.snapshot()?.edges.is_empty());
+
+    // Deleting the target outright also removes an unchanged owner's edge.
+    store.apply_native("repo", vec![caller], vec![], Coverage::default())?;
+    assert_eq!(store.snapshot()?.edges.len(), 1);
+    store.apply_native(
+        "repo",
+        vec![],
+        vec!["target.py".into()],
+        Coverage::default(),
+    )?;
+    assert!(store.snapshot()?.edges.is_empty());
     Ok(())
 }
 

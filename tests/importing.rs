@@ -27,6 +27,101 @@ fn read_export(value: Value) -> anyhow::Result<ImportedGraph> {
 }
 
 #[test]
+fn export_legacy_numbers_and_types_keep_original_evidence() {
+    let input = json!({
+        "nodes":[{"id":"a","name":"Guide","file_type":"markdown","path":"guide.md"},
+                 {"id":"b","file_type":"tool"},{"id":"c","file_type":null}],
+        "links":[{"from":"a","to":"b","type":"references","confidence":0.9,"confidence_score":"0.4","weight":"2.5"},
+                 {"source":"b","target":"c","relation":"uses","confidence":"0.75"}]
+    });
+    let graph = read_export(input.clone()).unwrap();
+    assert_eq!(graph.nodes[0].kind, "document");
+    assert_eq!(graph.nodes[0].metadata["file_type"], "markdown");
+    assert_eq!(graph.nodes[1].kind, "code");
+    assert_eq!(graph.nodes[2].kind, "concept");
+    assert_eq!(graph.edges[0].confidence, "INFERRED");
+    assert_eq!(graph.edges[0].metadata["confidence_score"], 0.4);
+    assert_eq!(graph.edges[0].metadata["weight"], 2.5);
+    assert_eq!(
+        graph.edges[0].metadata["_graf_import_original"],
+        input["links"][0]
+    );
+    assert_eq!(graph.edges[1].metadata["confidence_score"], 0.75);
+    let snapshot = graf::model::GraphSnapshot {
+        schema_version: 1,
+        generation: 1,
+        kind: "imported".into(),
+        root: None,
+        nodes: graph.nodes,
+        edges: graph.edges,
+        metadata: graph.metadata,
+    };
+    let encoded =
+        graf::export::render(&snapshot, graf::export::ExportFormat::GraphifyJson).unwrap();
+    let restored = read_export_text(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.edges).unwrap(),
+        serde_json::to_value(&snapshot.edges).unwrap()
+    );
+    assert!(graf::analysis::analyze(&snapshot, &Default::default()).is_ok());
+}
+
+#[test]
+fn export_external_stubs_require_a_declared_import_source() {
+    let graph = read_export(json!({"nodes":[{"id":"local"}],"edges":[
+        {"source":"local","target":"vendor","relation":"imports"},
+        {"source":"vendor","target":"local","_src":"local","_tgt":"vendor","relation":"re_exports"}
+    ]}))
+    .unwrap();
+    assert_eq!(graph.nodes.len(), 2);
+    assert_eq!(graph.edges.len(), 2);
+    let external = graph.nodes.iter().find(|n| n.id == "vendor").unwrap();
+    assert_eq!(external.metadata["external"], true);
+    assert!(external.file.is_empty());
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|e| e.source == "local" && e.target == "vendor")
+    );
+    for edges in [
+        json!([{"source":"local","target":"absent","relation":"calls"}]),
+        json!([{"source":"absent","target":"local","relation":"imports"}]),
+        json!([{"source":"local","target":"vendor","relation":"imports"},
+               {"source":"vendor","target":"second","relation":"imports"}]),
+        json!([{"source":"local","target":"other","_src":"local","_tgt":"vendor","relation":"imports"}]),
+    ] {
+        assert!(read_export(json!({"nodes":[{"id":"local"}],"edges":edges})).is_err());
+    }
+    assert!(
+        read(
+            json!({"directed":true,"multigraph":false,"nodes":[{"id":"local"}],
+        "edges":[{"source":"local","target":"vendor","relation":"imports"}]})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn export_legacy_invalid_numbers_are_not_silently_repaired() {
+    for (field, value) in [
+        ("weight", json!(-1)),
+        ("weight", json!("NaN")),
+        ("weight", json!(true)),
+        ("confidence", json!(1.1)),
+        ("confidence_score", json!("Infinity")),
+    ] {
+        let mut edge = json!({"source":"a","target":"b"});
+        edge[field] = value;
+        assert!(read_export(json!({"nodes":[{"id":"a"},{"id":"b"}],"edges":[edge]})).is_err());
+    }
+    let inferred = read_export(json!({"nodes":[{"id":"a"},{"id":"b"}],
+        "edges":[{"source":"a","target":"b","confidence_score":0.8}]}))
+    .unwrap();
+    assert_eq!(inferred.edges[0].confidence, "INFERRED");
+}
+
+#[test]
 fn preserves_legacy_direction_and_opaque_attributes() {
     let graph = read(json!({
         "directed": false, "multigraph": false,
@@ -98,7 +193,7 @@ fn edges_alias_preserves_keyed_parallel_edges_and_typed_ids() {
 }
 
 #[test]
-fn rejects_ambiguous_structure_and_hyperedges() {
+fn rejects_ambiguous_structure_and_malformed_hyperedges() {
     let base = json!({"directed": true, "multigraph": false, "nodes": [], "links": []});
     for (field, value) in [
         ("edges", json!([])),
@@ -412,8 +507,8 @@ fn malformed_exports_fail_before_any_graph_is_published() {
     }
     for (field, value) in [
         ("links", json!([])),
-        ("hyperedges", json!([{"nodes":["a","b"]}])),
-        ("graph", json!({"hyperedges":[{"nodes":["a","b"]}]})),
+        ("hyperedges", json!([{"nodes":["a","missing"]}])),
+        ("graph", json!({"hyperedges":[{"nodes":["a","missing"]}]})),
         ("multigraph", json!(true)), // missing keys
     ] {
         let mut input = base.clone();
@@ -467,7 +562,7 @@ fn rejects_non_regular_inputs_without_blocking() {
     // Re-exec this test so a FIFO regression can be killed and reaped rather
     // than hanging the suite or leaving a blocked thread behind.
     if let Some(path) = std::env::var_os("GRAF_IMPORT_FIFO_TEST_PATH") {
-        for reader in [read_graphify, read_graphify_export] {
+        for reader in [read_graphify, read_graphify_export, graf::snapshot::read] {
             let error = reader(std::path::Path::new(&path)).unwrap_err();
             assert!(error.to_string().contains("regular file"), "{error:#}");
         }
@@ -520,4 +615,141 @@ fn rejects_non_regular_inputs_without_blocking() {
         assert!(reader(&regular).is_ok());
         assert!(reader(&regular_link).is_ok());
     }
+    std::fs::write(&regular, r#"{"schema_version":1,"generation":0,"kind":"empty","root":null,"nodes":[],"edges":[],"metadata":null}"#).unwrap();
+    assert!(graf::snapshot::read(&regular).is_ok());
+    assert!(graf::snapshot::read(&regular_link).is_ok());
+}
+
+#[test]
+fn groups_preserve_records_members_and_queries_through_graf_roundtrip_and_merge() {
+    let groups = json!([
+        {"id":"team", "label":"Review Team", "nodes":[7,"b",7], "relation":"participate_in", "extra":{"x":[1,2]}},
+        {"label":"Singleton", "members":["b"]}
+    ]);
+    let input = json!({
+        "directed":false, "multigraph":false,
+        "nodes":[{"id":7},{"id":"b"},{"id":"graphify:group:0"}], "links":[],
+        "hyperedges":groups, "graph":{"hyperedges":groups}
+    });
+    for reader in [read, read_export] {
+        let graph = reader(input.clone()).unwrap();
+        assert_eq!((graph.nodes.len(), graph.edges.len()), (5, 4));
+        let group = graph
+            .nodes
+            .iter()
+            .find(|n| n.label == "Review Team")
+            .unwrap();
+        assert_eq!(group.kind, "group");
+        assert_ne!(group.id, "graphify:group:0");
+        assert_eq!(group.metadata["graphify_group"], groups[0]);
+        assert_eq!(graph.metadata["hyperedges"], groups);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| !e.directed && e.relation == "member_of")
+        );
+        let group_id = group.id.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&directory.path().join("groups.db")).unwrap();
+        store.import_graph(graph).unwrap();
+        let result = store
+            .neighbors(&group_id, &QueryOptions::default())
+            .unwrap();
+        assert_eq!(result.edges.len(), 3); // duplicate membership retains its ordinal
+        assert_eq!(result.nodes.len(), 3);
+        assert!(
+            store
+                .query("Review Team", &QueryOptions::default())
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|n| n.id == group_id)
+        );
+        let before = store.snapshot().unwrap();
+        let mut file = NamedTempFile::new().unwrap();
+        serde_json::to_writer(&mut file, &before).unwrap();
+        let reread = graf::snapshot::read(file.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reread.nodes).unwrap(),
+            serde_json::to_value(&before.nodes).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&reread.edges).unwrap(),
+            serde_json::to_value(&before.edges).unwrap()
+        );
+        let merged =
+            graf::snapshot::merge(vec![("one".into(), before.clone()), ("two".into(), before)])
+                .unwrap();
+        let groups: Vec<_> = merged.nodes.iter().filter(|n| n.kind == "group").collect();
+        assert_eq!(groups.len(), 4);
+        for group in groups {
+            let incidence: Vec<_> = merged
+                .edges
+                .iter()
+                .filter(|e| e.target == group.id)
+                .collect();
+            assert!(!incidence.is_empty());
+            for edge in incidence {
+                let member = merged.nodes.iter().find(|n| n.id == edge.source).unwrap();
+                assert_eq!(member.metadata["project"], group.metadata["project"]);
+            }
+        }
+    }
+    // Alternate producer slots are equivalent, including empty companions.
+    let graph = read_export(json!({"nodes":[{"id":"x"}],"edges":[],"hyperedges":[],
+        "graph":{"groups":[{"id":1,"nodes":["x"]}]}}))
+    .unwrap();
+    assert_eq!((graph.nodes.len(), graph.edges.len()), (2, 1));
+    let record = json!({"node_ids":[{"id":"x","role":"lead"},7]});
+    let graph =
+        read_export(json!({"nodes":[{"id":"x"},{"id":7}],"edges":[],"groups":[record]})).unwrap();
+    assert_eq!((graph.nodes.len(), graph.edges.len()), (3, 2));
+    assert_eq!(graph.nodes[2].metadata["graphify_group"], record);
+    assert_eq!(graph.edges[0].source, "x");
+    assert_eq!(graph.edges[1].source, "graphify:integer:7");
+}
+
+#[test]
+fn malformed_groups_fail_before_refresh_and_preserve_previous_graph() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("groups.db")).unwrap();
+    store
+        .import_graph(read_export(raw_export()).unwrap())
+        .unwrap();
+    let before = serde_json::to_value(store.snapshot().unwrap()).unwrap();
+    for groups in [
+        json!({}),
+        json!([null]),
+        json!([{}]),
+        json!([{"nodes":[]}]),
+        json!([{"nodes":"a"}]),
+        json!([{"nodes":["missing"]}]),
+        json!([{"nodes":[true]}]),
+        json!([{"nodes":[{}]}]),
+        json!([{"node_ids":[{"id":[]}]}]),
+        json!([{"nodes":["a"],"node_ids":["b"]}]),
+        json!([{"nodes":["a"],"id":false}]),
+        json!([{"nodes":["a"],"members":["b"]}]),
+        json!([{"nodes":["a"],"label":1}]),
+        json!([{"nodes":["a"],"confidence_score":2}]),
+        json!([{"nodes":["a"],"relation":false}]),
+        json!([{"id":"x","nodes":["a"]},{"id":"x","nodes":["b"]}]),
+    ] {
+        let mut input = raw_export();
+        input["hyperedges"] = groups;
+        assert!(
+            read_export(input)
+                .and_then(|g| store.refresh_import(g))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.snapshot().unwrap()).unwrap(),
+            before
+        );
+    }
+    let mut conflict = raw_export();
+    conflict["hyperedges"] = json!([{"nodes":["a"]}]);
+    conflict["graph"] = json!({"hyperedges":[{"nodes":["b"]}]});
+    assert!(read_export(conflict).is_err());
 }
