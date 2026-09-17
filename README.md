@@ -6,10 +6,27 @@ Graf stores its graph in SQLite. Queries use persistent search and adjacency ind
 
 ## Install
 
-Download a prebuilt executable from [Releases](https://github.com/ctxrs/graf/releases).
-Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64 are supported release
-targets. See [download verification](docs/downloads.md) for platform requirements,
-signatures, checksums, and installation instructions.
+On Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh
+```
+
+On Windows x64, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
+```
+
+The installers verify the signed release manifest and download hashes before
+installing. Linux and macOS default to `~/.local/bin`; Windows defaults to
+`%LOCALAPPDATA%\Graf\bin`. Add that directory to your `PATH` if needed; the
+installers do not change shell profiles. Run the installer again to upgrade.
+
+Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64 are supported.
+See [installation and download verification](docs/downloads.md) for prerequisites,
+version selection, custom directories, and manual downloads from
+[Releases](https://github.com/ctxrs/graf/releases).
 
 To build from source, use Rust 1.90 or newer and a C compiler:
 
