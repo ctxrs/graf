@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Graf graph explorer</title>
+<style>
+:root{color-scheme:light dark;font:15px system-ui}body{margin:0;background:#101827;color:#e5edf8}header{padding:1rem;border-bottom:1px solid #455269}h1{margin:0 0 .6rem;font-size:1.3rem}.controls{display:flex;gap:.8rem;flex-wrap:wrap;align-items:end}label{display:grid;gap:.3rem}input,select,button{font:inherit;padding:.4rem;border:1px solid #718096;border-radius:4px;background:#19263b;color:inherit}button{cursor:pointer}:focus-visible{outline:3px solid #fbbf24}main{display:grid;grid-template-columns:minmax(0,3fr) minmax(260px,1fr)}#canvas{width:100%;height:68vh;background:#111c30;touch-action:none}aside{min-width:0;overflow-wrap:anywhere;padding:1rem;overflow:auto;max-height:68vh}pre{white-space:pre-wrap;overflow-wrap:anywhere}#status{margin:.8rem 0 0}#list{padding:1rem;max-height:30vh;overflow:auto}#list button{margin:.2rem;text-align:left;max-width:100%;overflow-wrap:anywhere}svg text{fill:#e5edf8;pointer-events:none;font:12px system-ui}.node{cursor:pointer}.node circle{stroke:#e5edf8;stroke-width:1.5}.edge{stroke:#718096;stroke-width:1.5;fill:none}small{color:#becbe0}@media(max-width:700px){main{display:block}aside{max-height:35vh}}
+</style></head><body>
+<header><h1>Graf graph explorer</h1><div class="controls">
+<label>Search labels, IDs, sources or metadata<input id="search" type="search" placeholder="Search graph"></label>
+<label>Kind<input id="kind" list="kind-options" placeholder="All kinds"><datalist id="kind-options"></datalist></label>
+<label>Community ID<input id="community" list="community-options" placeholder="All communities"><datalist id="community-options"></datalist></label>
+<label>Relation<input id="relation" list="relation-options" placeholder="All relations"><datalist id="relation-options"></datalist></label>
+<label>View<select id="mode"><option value="auto">Automatic</option><option value="detail">Detailed pages</option><option value="aggregate">Communities</option></select></label><button id="metadata" type="button">Graph metadata</button><button id="reset" type="button">Reset view</button><button id="download" type="button">Download snapshot JSON</button>
+</div><div><button id="previous" type="button">Previous page</button><span id="page-status"></span><button id="next" type="button">Next page</button></div><p id="status" role="status" aria-live="polite"></p><small>Scroll to zoom; drag the background to pan. Select a node for evidence or a community to open its members. Large views aggregate and page automatically; downloads always contain the complete snapshot. Communities describe connectivity, not inferred responsibilities. No network access.</small></header>
+<main><svg id="canvas" role="img" aria-label="Interactive graph with directed arrows and curved parallel edges"></svg><aside><h2 id="selected">Node details</h2><pre id="details">Select a node in the graph or the accessible list below.</pre></aside></main>
+<section id="list" aria-label="Visible nodes"></section>
+<script id="graf-data" type="application/json">__GRAF_DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('graf-data').textContent), graph=data.snapshot, analysis=data.analysis;
+const nodeLimit=data.viewer.node_limit,edgeLimit=data.viewer.edge_limit;
+const el=id=>document.getElementById(id), svg=el('canvas'), ns='http://www.w3.org/2000/svg';
+const metrics=new Map(analysis.nodes.map(n=>[n.id,n])),communities=new Map(analysis.communities.map(c=>[c.id,c]));
+const nodeById=new Map(graph.nodes.map(n=>[n.id,n]));
+const searchable=new Map(graph.nodes.map(n=>[n.id,JSON.stringify(n).toLocaleLowerCase()]));
+const incidence=new Map(graph.nodes.map(n=>[n.id,[]]));
+for(const edge of graph.edges){incidence.get(edge.source).push(edge);if(edge.source!==edge.target)incidence.get(edge.target).push(edge);}
+function options(id,values){for(const value of [...new Set(values)].sort().slice(0,nodeLimit)){const option=document.createElement('option');option.value=String(value);option.textContent=String(value);el(id+'-options').append(option);}}
+options('kind',graph.nodes.map(n=>n.kind));options('community',analysis.nodes.map(n=>n.community));options('relation',graph.edges.map(e=>e.relation));
+function element(tag,attrs,parent){const node=document.createElementNS(ns,tag);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));if(parent)parent.append(node);return node;}
+function title(parent,text){const node=element('title',{},parent);node.textContent=text;}
+function select(id){const node=nodeById.get(id),relations=incidence.get(id);el('selected').textContent=node.label;el('details').textContent=JSON.stringify({node,metrics:metrics.get(id),relation_count:relations.length,relations:relations.slice(0,edgeLimit),note:relations.length>edgeLimit?'Relation preview capped; download the full snapshot for every record.':undefined},null,2);}
+let view={x:0,y:0,w:1000,h:800},page=0,pageCount=1;
+function setView(){svg.setAttribute('viewBox',`${view.x} ${view.y} ${view.w} ${view.h}`);}
+function draw(){
+ const query=el('search').value.toLocaleLowerCase(),kind=el('kind').value,community=el('community').value,relation=el('relation').value;
+ const related=relation?new Set(graph.edges.filter(e=>e.relation===relation).flatMap(e=>[e.source,e.target])):null;
+ const matched=graph.nodes.filter(n=>(!query||searchable.get(n.id).includes(query))&&(!kind||n.kind===kind)&&(community===''||String(metrics.get(n.id).community)===community)&&(!related||related.has(n.id)));
+ const matchedIds=new Set(matched.map(n=>n.id)),matchedEdges=graph.edges.filter(e=>matchedIds.has(e.source)&&matchedIds.has(e.target)&&(!relation||e.relation===relation));
+ const aggregate=el('mode').value==='aggregate'||(el('mode').value==='auto'&&matched.length>nodeLimit);
+ let allNodes,allEdges;
+ if(aggregate){
+  const groups=new Map();
+  for(const node of matched){const id=metrics.get(node.id).community;if(!groups.has(id))groups.set(id,{id:String(id),community:id,label:communities.get(id).label,count:0});groups.get(id).count++;}
+  allNodes=[...groups.values()].sort((a,b)=>a.community-b.community);
+  const links=new Map();
+  for(const edge of matchedEdges){let a=metrics.get(edge.source).community,b=metrics.get(edge.target).community;if(!edge.directed&&a>b)[a,b]=[b,a];const key=JSON.stringify([a,b,edge.directed,edge.relation]);if(!links.has(key))links.set(key,{id:key,source:String(a),target:String(b),directed:edge.directed,relation:edge.relation,count:0});links.get(key).count++;}
+  allEdges=[...links.values()];
+ }else{allNodes=matched.map(n=>({...n,community:metrics.get(n.id).community,count:1}));allEdges=matchedEdges;}
+ pageCount=Math.max(1,Math.ceil(allNodes.length/nodeLimit));page=Math.min(page,pageCount-1);
+ const nodes=allNodes.slice(page*nodeLimit,(page+1)*nodeLimit),ids=new Set(nodes.map(n=>n.id)),pageEdges=allEdges.filter(e=>ids.has(e.source)&&ids.has(e.target)),edges=pageEdges.slice(0,edgeLimit);
+ svg.replaceChildren();el('list').replaceChildren();
+ const defs=element('defs',{},svg), marker=element('marker',{id:'arrow',viewBox:'0 0 10 10',refX:10,refY:5,markerWidth:7,markerHeight:7,orient:'auto-start-reverse'},defs);element('path',{d:'M0 0 L10 5 L0 10 z',fill:'#a6b5cf'},marker);
+ const positions=new Map(nodes.map((n,i)=>{const angle=i*Math.PI*2/Math.max(nodes.length,1);return[n.id,[500+350*Math.cos(angle),400+300*Math.sin(angle)]];}));
+ const order=new Map(nodes.map((n,i)=>[n.id,i])),pairs=new Map();
+ for(const edge of edges){const [x,y]=positions.get(edge.source),[u,v]=positions.get(edge.target),a=order.get(edge.source),b=order.get(edge.target),key=JSON.stringify([Math.min(a,b),Math.max(a,b)]),ordinal=(pairs.get(key)||0)+1;pairs.set(key,ordinal);const bend=18*ordinal;let path;
+  if(a===b)path=`M${x} ${y} C${x+bend} ${y-bend*2} ${x-bend} ${y-bend*2} ${x-2} ${y-12}`;
+  else{const len=Math.hypot(u-x,v-y),sign=a<b?1:-1;path=`M${x} ${y} Q${(x+u)/2-(v-y)/len*bend*sign} ${(y+v)/2+(u-x)/len*bend*sign} ${u-(u-x)/len*14} ${v-(v-y)/len*14}`;}
+  const line=element('path',{d:path,class:'edge'},svg);if(edge.directed)line.setAttribute('marker-end','url(#arrow)');title(line,`${edge.relation} · ${edge.source} ${edge.directed?'→':'↔'} ${edge.target} · ${aggregate?edge.count+' records':edge.id}`);
+ }
+ for(const node of nodes){const [x,y]=positions.get(node.id),group=element('g',{class:'node',transform:`translate(${x} ${y})`},svg),color=`hsl(${node.community*137.508%360} 60% 55%)`;
+  const label=aggregate?`${node.label} (${node.count} nodes)`:node.label;
+  const activate=()=>{if(aggregate){el('community').value=String(node.community);el('mode').value='detail';page=0;el('selected').textContent=`Community ${node.community}: ${node.label}`;el('details').textContent=`${node.count} matching members. Detailed pages show at most ${nodeLimit} nodes and ${edgeLimit} edges. Select a member for evidence; the download contains all records.`;draw();}else select(node.id);};
+  element('circle',{r:aggregate?18:12,fill:color},group);const text=element('text',{x:22,y:4},group);text.textContent=Array.from(label).slice(0,50).join('')+(Array.from(label).length>50?'…':'');title(group,aggregate?label:`${node.label} · ${node.file}`);group.addEventListener('click',activate);
+  const button=document.createElement('button');button.type='button';button.textContent=aggregate?`Community ${node.community}: ${label}`:`${node.label} · ${node.kind} · ${node.file}`;button.addEventListener('click',activate);el('list').append(button);
+ }
+ el('status').textContent=`${matched.length} / ${graph.nodes.length} matching nodes · ${matchedEdges.length} / ${graph.edges.length} matching edges · ${aggregate?'Community summary':'Detailed view'}: ${nodes.length} ${aggregate?'communities':'nodes'}, ${edges.length} / ${allEdges.length} drawn ${aggregate?'relation groups':'edges'} · limits ${nodeLimit} nodes / ${edgeLimit} edges · full data in download`;
+ el('page-status').textContent=` Page ${page+1} of ${pageCount} `;el('previous').disabled=page===0;el('next').disabled=page+1>=pageCount;
+ setView();
+}
+for(const id of ['search','kind','community','relation','mode'])el(id).addEventListener('input',()=>{page=0;draw();});
+el('previous').addEventListener('click',()=>{if(page>0){page--;draw();}});el('next').addEventListener('click',()=>{if(page+1<pageCount){page++;draw();}});
+el('metadata').addEventListener('click',()=>{el('selected').textContent='Graph metadata';el('details').textContent=JSON.stringify({schema_version:graph.schema_version,generation:graph.generation,kind:graph.kind,root:graph.root,metadata:graph.metadata,methodology:analysis.methodology,excluded_hubs:analysis.excluded_hubs,noise_filtered_hubs:analysis.noise_filtered_hubs},null,2);});
+el('reset').addEventListener('click',()=>{for(const id of ['search','kind','community','relation'])el(id).value='';el('mode').value='auto';page=0;view={x:0,y:0,w:1000,h:800};draw();});
+svg.addEventListener('wheel',event=>{event.preventDefault();const factor=event.deltaY>0?1.15:1/1.15,rect=svg.getBoundingClientRect(),x=(event.clientX-rect.left)/rect.width,y=(event.clientY-rect.top)/rect.height;if(view.w*factor<20||view.w*factor>100000)return;view.x+=view.w*x*(1-factor);view.y+=view.h*y*(1-factor);view.w*=factor;view.h*=factor;setView();},{passive:false});
+let dragging=null;
+svg.addEventListener('pointerdown',event=>{if(event.target.closest('.node'))return;dragging={x:event.clientX,y:event.clientY,vx:view.x,vy:view.y};svg.setPointerCapture(event.pointerId);});
+svg.addEventListener('pointermove',event=>{if(!dragging)return;const rect=svg.getBoundingClientRect();view.x=dragging.vx-(event.clientX-dragging.x)*view.w/rect.width;view.y=dragging.vy-(event.clientY-dragging.y)*view.h/rect.height;setView();});
+for(const type of ['pointerup','pointercancel'])svg.addEventListener(type,()=>dragging=null);
+el('download').addEventListener('click',()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(graph,null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download='graf-snapshot.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+draw();
+</script></body></html>
