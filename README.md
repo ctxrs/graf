@@ -26,8 +26,11 @@ On Windows x64, in PowerShell:
 irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 ```
 
-The installers verify the signed release manifest and download hashes before
-installing. Linux and macOS default to `~/.local/bin`; Windows defaults to
+The installers verify the signed release manifest and download hashes, decompress
+gzip releases, and verify the executable's signed hash and size before installing.
+Linux and macOS need `curl`, `openssl`, `gzip`, and standard shell utilities;
+Windows needs PowerShell 5.1 or newer. Linux and macOS default to `~/.local/bin`;
+Windows defaults to
 `%LOCALAPPDATA%\Graf\bin`. Add that directory to your `PATH` if needed; the
 installers do not change shell profiles. Run the installer again to upgrade.
 
@@ -35,6 +38,20 @@ Release downloads cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows
 x64. See [installation and download verification](docs/downloads.md) for
 prerequisites, version selection, custom directories, and manual downloads from
 [Releases](https://github.com/ctxrs/graf/releases).
+
+For manual downloads, choose your platform's gzip file:
+
+| Platform | Download |
+| --- | --- |
+| Linux x64 | [graf-linux-x64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-linux-x64.gz) |
+| Linux ARM64 | [graf-linux-aarch64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-linux-aarch64.gz) |
+| macOS Intel | [graf-macos-x64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-macos-x64.gz) |
+| macOS Apple Silicon | [graf-macos-arm64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-macos-arm64.gz) |
+| Windows x64 | [graf-windows-x64.exe.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-windows-x64.exe.gz) |
+
+Follow the [download verification and extraction guide](docs/downloads.md#verify-the-download)
+before running a manual download. Each platform also has an SBOM and license
+notices. The installers continue to support older releases with raw executables.
 
 ### Build from source
 

@@ -1,19 +1,21 @@
 # Release downloads
 
-Graf releases provide these standalone executables:
+Graf 0.3 and later provide these gzip-compressed standalone executables:
 
 | Platform | Asset | Requirement |
 | --- | --- | --- |
-| Linux x64 | `graf-linux-x64` | glibc 2.28 or newer |
-| Linux ARM64 | `graf-linux-aarch64` | glibc 2.28 or newer |
-| macOS Intel | `graf-macos-x64` | macOS 13 or newer |
-| macOS Apple Silicon | `graf-macos-arm64` | macOS 13 or newer |
-| Windows x64 | `graf-windows-x64.exe` | 64-bit Windows |
+| Linux x64 | `graf-linux-x64.gz` | glibc 2.28 or newer |
+| Linux ARM64 | `graf-linux-aarch64.gz` | glibc 2.28 or newer |
+| macOS Intel | `graf-macos-x64.gz` | macOS 13 or newer |
+| macOS Apple Silicon | `graf-macos-arm64.gz` | macOS 13 or newer |
+| Windows x64 | `graf-windows-x64.exe.gz` | 64-bit Windows |
 
 Get the executable for your platform from the same tagged
 [GitHub release](https://github.com/ctxrs/graf/releases) as its verification files.
 Each executable also has a CycloneDX software bill of materials (`.cdx.json`)
-and third-party license notices (`.third-party-notices.txt`).
+and third-party license notices (`.third-party-notices.txt`), named using the
+uncompressed executable basename, such as `graf-linux-x64.cdx.json`.
+Earlier releases provide raw executables; both installers still support them.
 
 ## Verify the download
 
@@ -30,24 +32,51 @@ openssl dgst -sha256 -verify release-key.pem \
 
 The command must report `Verified OK`. Check that the manifest names `graf`,
 the repository `https://github.com/ctxrs/graf`, and the version you selected.
-Compare your download's SHA-256 with its entry in the verified manifest.
+Compare your download's SHA-256 with its entry in the verified manifest's
+`artifacts` array before decompressing it.
 
 On Linux:
 
 ```sh
-sha256sum graf-linux-x64
+sha256sum graf-linux-x64.gz
 ```
 
 On macOS:
 
 ```sh
-shasum -a 256 graf-macos-arm64
+shasum -a 256 graf-macos-arm64.gz
 ```
 
 On Windows PowerShell:
 
 ```powershell
-Get-FileHash .\graf-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\graf-windows-x64.exe.gz -Algorithm SHA256
+```
+
+Extract the verified file on Unix with `gzip -dk graf-linux-x64.gz`, substituting
+your platform's filename. On Windows, use a gzip-capable utility or PowerShell:
+
+```powershell
+$inputFile = [IO.File]::OpenRead("$PWD\graf-windows-x64.exe.gz")
+try {
+    $gzip = [IO.Compression.GZipStream]::new($inputFile, [IO.Compression.CompressionMode]::Decompress)
+    try {
+        $outputFile = [IO.File]::Open("$PWD\graf-windows-x64.exe", [IO.FileMode]::CreateNew)
+        try { $gzip.CopyTo($outputFile) } finally { $outputFile.Dispose() }
+    } finally { $gzip.Dispose() }
+} finally { $inputFile.Dispose() }
+```
+
+Before execution, compare the extracted file's SHA-256 and byte length with
+`binary_sha256` and `binary_size` in your platform's `targets` entry of the
+authenticated schema-2 manifest. Use `sha256sum` (Linux) or `shasum -a 256`
+(macOS) and `wc -c`; on Windows use `Get-FileHash` and `(Get-Item FILE).Length`.
+Schema-1 releases are already uncompressed: their artifact hash is the executable
+hash, so skip extraction and the schema-2 fields.
+
+Check the extracted Windows executable's native signature:
+
+```powershell
 Get-AuthenticodeSignature .\graf-windows-x64.exe
 ```
 
@@ -58,9 +87,10 @@ manifest authenticates those hashes.
 
 ## Install with a script
 
-Linux and macOS need `curl`, `openssl`, and standard shell utilities. Windows
+Linux and macOS need `curl`, `openssl`, `gzip`, and standard shell utilities. Windows
 needs PowerShell 5.1 or newer. The scripts select the appropriate executable,
-verify the signed manifest and download hashes, and install `graf` with its
+verify the signed manifest, download hashes, and extracted executable hash/size,
+and install `graf` with its
 license notices. The new executable must report the expected version before
 replacing an existing installation. macOS code signatures and Windows
 Authenticode signatures are checked as well.
@@ -128,7 +158,7 @@ and `--server` selection. See [switching and undo](../README.md#switch-from-grap
 
 ## Install manually
 
-After verification, install the downloaded Unix executable as `graf` in a
+After verification and extraction, install the Unix executable as `graf` in a
 directory on your `PATH`. For example, on Linux x64:
 
 ```sh
