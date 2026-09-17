@@ -542,7 +542,8 @@ fn url_addresses(
                 Some(resolver) => resolver,
                 None => TokioResolver::builder_tokio()
                     .map_err(|_| anyhow::anyhow!("cannot read DNS configuration"))?
-                    .build(),
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("cannot initialize DNS resolver"))?,
             };
             remaining(deadline)?;
             let response = tokio::time::timeout_at(deadline.into(), resolver.lookup_ip(host))
@@ -570,12 +571,13 @@ fn url_addresses(
 mod tests {
     use super::*;
     use hickory_resolver::{
-        config::{LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig},
-        name_server::TokioConnectionProvider,
+        config::{
+            ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
+        },
+        net::runtime::TokioRuntimeProvider,
         proto::{
-            op::{Message, MessageType},
+            op::Message,
             rr::{RData, Record, rdata::A},
-            xfer::Protocol,
         },
     };
     use std::{
@@ -587,18 +589,20 @@ mod tests {
     fn resolver_at(address: SocketAddr) -> TokioResolver {
         // Fixtures use .test: Hickory returns NXDOMAIN for .invalid locally,
         // before contacting even an explicitly configured mock name server.
+        let mut connection = ConnectionConfig::udp();
+        connection.port = address.port();
         let config = ResolverConfig::from_parts(
             None,
             vec![],
-            vec![NameServerConfig::new(address, Protocol::Udp)],
+            vec![NameServerConfig::new(address.ip(), true, vec![connection])],
         );
         let mut builder =
-            TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         builder.options_mut().use_hosts_file = ResolveHosts::Never;
         builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
         builder.options_mut().attempts = 1;
         builder.options_mut().timeout = Duration::from_secs(5);
-        builder.build()
+        builder.build().unwrap()
     }
 
     #[test]
@@ -639,14 +643,11 @@ mod tests {
             let mut packet = [0; 4096];
             let (size, client) = socket.recv_from(&mut packet).unwrap();
             let request = Message::from_vec(&packet[..size]).unwrap();
-            let query = request.queries()[0].clone();
-            let mut response = Message::new();
-            response
-                .set_id(request.id())
-                .set_message_type(MessageType::Response)
-                .set_recursion_desired(true)
-                .set_recursion_available(true)
-                .add_query(query.clone());
+            let query = request.queries[0].clone();
+            let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+            response.metadata.recursion_desired = true;
+            response.metadata.recursion_available = true;
+            response.add_query(query.clone());
             for ip in ips {
                 response.add_answer(Record::from_rdata(
                     query.name().clone(),

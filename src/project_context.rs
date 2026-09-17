@@ -858,7 +858,12 @@ fn csharp_namespace(source: &str) -> Option<Option<String>> {
                     let text = if empty {
                         String::new()
                     } else {
-                        reader.read_text(element.name()).ok()?.into_owned()
+                        reader
+                            .read_text(element.name())
+                            .ok()?
+                            .decode()
+                            .ok()?
+                            .into_owned()
                     };
                     let value = text.trim();
                     let literal = !value.is_empty()

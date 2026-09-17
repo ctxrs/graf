@@ -121,7 +121,10 @@ and C++/CLI accept bounded, position-preserving syntax adaptations. Unsupported
 dialect constructs produce diagnostics. Template and Robot
 support does not execute templates or test libraries. Images and audio/video
 need explicit OCR, vision, or transcription adapters for content extraction.
-Scanned PDFs may need a configured converter. Unrecognized files are counted as
+PDF text extraction does not preserve page layout. Scanned PDFs and unsupported
+font encodings need a configured converter. Symbol and ZapfDingbats fonts need an
+explicit supported encoding or a ToUnicode map for native extraction.
+Unrecognized files are counted as
 unsupported; recognized files that cannot be parsed produce errors or diagnostics.
 Check `graf stats` for coverage.
 
