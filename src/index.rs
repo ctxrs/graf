@@ -102,6 +102,9 @@ pub fn run(root: &Path, db: &Path) -> Result<IndexReport> {
         if let Some(error) = entry.error() {
             bail!("cannot apply ignore rules: {error}");
         }
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            check_ignore_files(entry.path())?;
+        }
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -141,6 +144,35 @@ pub fn run(root: &Path, db: &Path) -> Result<IndexReport> {
     let mut deleted: Vec<_> = old.into_keys().collect();
     deleted.sort();
     store.apply_native(root_text, changed, deleted, coverage)
+}
+
+fn check_ignore_files(directory: &Path) -> Result<()> {
+    // WalkBuilder suppresses ignore-file I/O errors, including invalid UTF-8.
+    // Validate each visited directory so partial rules cannot publish a graph
+    // that silently includes excluded files. Pruned subtrees need no validation.
+    for name in [".ignore", ".gitignore", ".git/info/exclude"] {
+        let path = directory.join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_file(),
+                "ignore rules must be a regular file: {}",
+                path.display()
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).context("cannot inspect ignore rules"),
+        }
+        if let Some(error) = ignore::gitignore::GitignoreBuilder::new(directory).add(&path) {
+            bail!("cannot apply ignore rules: {error}");
+        }
+    }
+    Ok(())
 }
 
 fn diagnostic(path: &str, hash: &str, message: &str) -> FileFacts {
