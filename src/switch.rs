@@ -127,7 +127,9 @@ fn private_dir(path: &Path) -> Result<()> {
             "migration directory must not be a symlink"
         );
     } else {
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

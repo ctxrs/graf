@@ -1,6 +1,7 @@
-//! Pure, bounded MCP configuration planning. No files are read or written.
+//! Bounded MCP configuration planning. No file contents are read or written.
 //!
-//! Paths retain parent components; the caller must resolve filesystem identity
+//! Candidate paths use filesystem identity when available and retain parent
+//! components; the caller must recheck filesystem identity
 //! and containment, select a candidate graph, and check any explicit graph agrees before
 //! applying the plan. Discovery of config files belongs to the caller.
 
@@ -313,9 +314,11 @@ fn graph_path(entry: &Value, project: &Path) -> Option<PathBuf> {
         None => project.to_owned(),
     };
     let graph = resolve(graph, &cwd, project)?;
-    // The lexical check narrows candidates only. Return the original path:
-    // `alias/..` must be resolved by the filesystem before importing anything.
-    normalize(&graph).starts_with(project).then_some(graph)
+    // Existing aliases (including macOS /var -> /private/var) must identify the
+    // same project. Keep the original path for the caller's final resolution.
+    // Missing snapshots retain lexical discovery and fail during that check.
+    let resolved = graph.canonicalize().unwrap_or_else(|_| graph.clone());
+    normalize(&resolved).starts_with(project).then_some(graph)
 }
 
 fn python(command: &str) -> bool {

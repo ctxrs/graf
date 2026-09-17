@@ -362,3 +362,59 @@ fn receipt_parent_traversal_is_rejected_even_when_config_bytes_match() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn absolute_graph_alias_selects_same_project_for_json_and_toml() {
+    for toml in [false, true] {
+        let dir = project();
+        let root = dir.path().canonicalize().unwrap();
+        let links = tempdir().unwrap();
+        let alias = links.path().join("project-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let graph_path = alias.join("graphify-out/graph.json");
+        let config_path = root.join(if toml { "client.toml" } else { ".mcp.json" });
+        let original = if toml {
+            format!(
+                "# keep\n[mcp_servers.graphify]\ncommand = \"python\"\nargs = [\"-m\", \"graphify.serve\", {}]\n",
+                serde_json::to_string(&graph_path).unwrap()
+            )
+        } else {
+            config(graph_path.to_str().unwrap()).to_string()
+        };
+        write(&config_path, &original);
+        let options = if toml {
+            vec!["--config", "client.toml"]
+        } else {
+            vec![]
+        };
+        for (action, status) in [
+            ("graphify", "switched"),
+            ("graphify", "already_switched"),
+            ("--undo", "undone"),
+        ] {
+            let mut args = vec!["switch", action];
+            args.extend_from_slice(&options);
+            assert_eq!(success(cli(&root, &args))["status"], status);
+        }
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert_eq!(
+            success(cli(&root, &["show", "original"]))["nodes"][0]["id"],
+            "original"
+        );
+    }
+
+    // A symlink into a different project must still fail without changing config.
+    let dir = project();
+    let outside = project();
+    let root = dir.path();
+    std::os::unix::fs::symlink(outside.path(), root.join("elsewhere")).unwrap();
+    let original = config("elsewhere/graphify-out/graph.json").to_string();
+    write(&root.join(".mcp.json"), &original);
+    failure(cli(root, &["switch", "graphify"]));
+    assert_eq!(
+        fs::read_to_string(root.join(".mcp.json")).unwrap(),
+        original
+    );
+    assert!(!root.join(".graf").exists());
+}
