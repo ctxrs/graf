@@ -46,10 +46,10 @@ main() (
             fi ;;
     esac
     case "$system/$machine" in
-        Linux/x86_64) artifact=graf-linux-x64 ;;
-        Linux/aarch64|Linux/arm64) artifact=graf-linux-aarch64 ;;
-        Darwin/x86_64) artifact=graf-macos-x64 ;;
-        Darwin/arm64) artifact=graf-macos-arm64 ;;
+        Linux/x86_64) artifact=graf-linux-x64; target_id=linux-x64 ;;
+        Linux/aarch64|Linux/arm64) artifact=graf-linux-aarch64; target_id=linux-arm64 ;;
+        Darwin/x86_64) artifact=graf-macos-x64; target_id=macos-x64 ;;
+        Darwin/arm64) artifact=graf-macos-arm64; target_id=macos-arm64 ;;
         *) fail "unsupported platform: $system/$machine" ;;
     esac
     if [ -z "$install_dir" ]; then
@@ -111,7 +111,10 @@ GRAF_RELEASE_KEY
         "$graf_stage/manifest.json" >/dev/null 2>&1 || fail 'release manifest signature verification failed'
     [ "$(field product)" = graf ] || fail 'unexpected release product'
     [ "$(field repository)" = https://github.com/ctxrs/graf ] || fail 'unexpected release repository'
-    [ "$(grep -c '^  "schema_version": 1,$' "$graf_stage/manifest.json")" = 1 ] || fail 'unsupported release schema'
+    schema=$(awk '
+        /^  "schema_version":/ { count++; if ($0 ~ /^  "schema_version": [12],$/) value=$2 }
+        END { if (count != 1 || value == "") exit 1; sub(/,$/, "", value); print value }
+    ' "$graf_stage/manifest.json") || fail 'unsupported release schema'
     artifact_hash() {
         awk -F '"' -v name="$1" '
             $0 == "      \"name\": \"" name "\"," {
@@ -129,7 +132,51 @@ GRAF_RELEASE_KEY
         [ "${actual_hash##* }" = "$expected_hash" ] || fail "download checksum mismatch: $1"
     }
     printf 'Installing Graf %s (%s)...\n' "$version" "$artifact"
-    verified_download "$artifact" "$graf_stage/graf"
+    if [ "$schema" = 2 ]; then
+        command -v gzip >/dev/null 2>&1 || fail 'required command not found: gzip'
+        encoded_hash=$(artifact_hash "$artifact.gz") || fail 'missing or malformed compressed release hash'
+        # Schema 2 binds the fixed platform filename to both transport and native
+        # bytes. Read a unique target object in the canonical signed JSON format.
+        proof=$(awk -F '"' -v id="$target_id" -v binary="$artifact" -v hash="$encoded_hash" '
+            /^  "targets": \[$/ { targets++; inside=1; next }
+            inside && /^  \],?$/ { inside=0 }
+            inside && /^    \{$/ { delete value; delete seen; selected=0; next }
+            inside && /^      "[a-z_0-9]+":/ {
+                key=$2; seen[key]++; value[key]=$4
+                if (key == "id" && $4 == id) selected=1
+                if (key == "binary_size") {
+                    if ($0 !~ /^      "binary_size": [1-9][0-9]*,?$/) value[key]=""
+                    else { value[key]=$0; sub(/^      "binary_size": /, "", value[key]); sub(/,$/, "", value[key]) }
+                } else if ($0 !~ /^      "[a-z_0-9]+": "[^"]+",?$/) value[key]=""
+            }
+            inside && /^    \},?$/ && selected {
+                count++
+                for (key in seen) if (seen[key] != 1) bad=1
+                if (value["id"] != id || value["artifact"] != binary ".gz" ||
+                    value["sha256"] != hash || value["binary"] != binary ||
+                    value["binary_sha256"] !~ /^[0-9a-f]+$/ || length(value["binary_sha256"]) != 64 ||
+                    value["binary_size"] == "" || length(value["binary_size"]) > 10 ||
+                    value["binary_size"] + 0 > 1073741824) bad=1
+                raw_hash=value["binary_sha256"]; raw_size=value["binary_size"]
+            }
+            END { if (targets != 1 || count != 1 || bad) exit 1; print raw_hash, raw_size }
+        ' "$graf_stage/manifest.json") || fail 'invalid compressed release target'
+        # Both values contain only validated hexadecimal/digits.
+        set -- $proof
+        binary_hash=$1
+        binary_size=$2
+        verified_download "$artifact.gz" "$graf_stage/download.gz"
+        # Bound output even if an authenticated release has a malformed stream.
+        # Shell file-size limits use 512- or 1024-byte blocks; allow rounding.
+        (ulimit -f "$(( (binary_size + 511) / 512 ))" || exit 1; gzip -dc "$graf_stage/download.gz") \
+            > "$graf_stage/graf" || fail 'gzip decompression failed'
+        [ "$(wc -c < "$graf_stage/graf" | tr -d '[:space:]')" = "$binary_size" ] \
+            || fail 'executable size mismatch'
+        actual_hash=$(openssl dgst -sha256 "$graf_stage/graf") || fail 'could not hash executable'
+        [ "${actual_hash##* }" = "$binary_hash" ] || fail 'executable checksum mismatch'
+    else
+        verified_download "$artifact" "$graf_stage/graf"
+    fi
     verified_download "$artifact.third-party-notices.txt" "$graf_stage/notices"
     chmod 0755 "$graf_stage/graf"
     chmod 0644 "$graf_stage/notices"
