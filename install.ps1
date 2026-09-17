@@ -1,8 +1,11 @@
 # Install the latest stable Graf release, or set GRAF_VERSION and GRAF_INSTALL_DIR.
+# Set GRAF_FROM=graphify to migrate from the current directory after installation (Graf 0.2+).
 # Works in Windows PowerShell 5.1, including: irm <installer-url> | iex
 function Install-Graf {
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version 2.0
+    $from = $env:GRAF_FROM
+    if ($from -and $from -cne 'graphify') { throw 'GRAF_FROM must be graphify.' }
 
     function Get-GrafDownload([string] $Url, [string] $Path) {
         if ($Url -cnotmatch '\Ahttps://github\.com/ctxrs/graf/releases/(?:latest/download/graf-release\.json|download/v[0-9]+\.[0-9]+\.[0-9]+/(?:graf-release\.json(?:\.sig)?|graf-windows-x64\.exe(?:\.third-party-notices\.txt)?))\z') {
@@ -173,6 +176,15 @@ function Install-Graf {
         Move-GrafFile $noticesPath $noticesDestination
         Move-GrafFile $binaryPath $destination
         Write-Host "Installed Graf $releaseVersion at $destination"
+        if ($from -ceq 'graphify') {
+            try {
+                & $destination switch graphify
+                if ($LASTEXITCODE -ne 0) { throw "Graf exited with code $LASTEXITCODE." }
+            }
+            catch {
+                throw "Installation succeeded, but Graphify migration failed: $_ Migration requires Graf 0.2 or later; if pinned to an older release, update GRAF_VERSION and retry. Otherwise, resolve the error above and rerun the installed Graf with: switch graphify"
+            }
+        }
         Write-Host "Add $installDir to your user PATH to run graf by name. PATH was not changed."
     }
     finally {

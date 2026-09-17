@@ -745,3 +745,47 @@ fn an_active_writer_cannot_commit_mixed_file_contents() {
     assert_eq!(stable.nodes, 2);
     assert!(stable.diagnostics.is_empty());
 }
+
+#[test]
+fn unreadable_ignore_rules_preserve_generation_and_recover() {
+    for name in [
+        ".gitignore",
+        ".ignore",
+        ".git/info/exclude",
+        "nested/.gitignore",
+    ] {
+        let root = tempdir().unwrap();
+        let db = root.path().join(".graf/index.db");
+        let rules = root.path().join(name);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        let scope = if name.starts_with("nested/") {
+            root.path().join("nested")
+        } else {
+            root.path().to_path_buf()
+        };
+        let source = scope.join("visible.py");
+        fs::write(&source, "def before():\n    pass\n").unwrap();
+        fs::create_dir_all(scope.join("privaté")).unwrap();
+        fs::write(scope.join("privaté/hidden.py"), "def hidden():\n    pass\n").unwrap();
+        // Invalid rules inside an excluded subtree must remain irrelevant.
+        fs::write(scope.join("privaté/.gitignore"), [0xff]).unwrap();
+        fs::write(&rules, "privaté/\n").unwrap();
+        let before = index::run(root.path(), &db).unwrap();
+        let original = Store::open(&db).unwrap().file_stamps().unwrap();
+        assert_eq!(original.len(), 1);
+        fs::write(&source, "def after():\n    pass\n").unwrap();
+        fs::write(&rules, b"privat\xe9/\n").unwrap();
+        let error = index::run(root.path(), &db).unwrap_err().to_string();
+        assert!(error.contains("ignore"), "{error}");
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.stats().unwrap().generation, before.generation);
+        assert_eq!(store.file_stamps().unwrap()[0].hash, original[0].hash);
+        assert_eq!(store.stats().unwrap().files, 1);
+        drop(store);
+        fs::write(&rules, "privaté/\n").unwrap();
+        let after = index::run(root.path(), &db).unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.parsed_files, 1);
+        assert_eq!(Store::open(&db).unwrap().stats().unwrap().files, 1);
+    }
+}
