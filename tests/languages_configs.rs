@@ -283,7 +283,7 @@ mod cargo_package_context {
     }
 
     #[test]
-    fn internal_edges_require_visible_members_static_paths_names_and_unconditional_declarations() {
+    fn declared_internal_edges_require_visible_members_static_paths_and_valid_names() {
         let f = Fixture::new();
         f.write("Cargo.toml", "[workspace]\nmembers = ['crates/*', 'broken/*']\nexclude = ['crates/excluded*']\n[workspace.dependencies]\ninherited = { package = 'storage', path = 'crates/storage', optional = true }\noverridden = { package = 'storage', path = 'crates/storage' }\n");
         f.package(
@@ -293,6 +293,7 @@ mod cargo_package_context {
 [dependencies]
 valid = { package = 'storage', path = '../storage', optional = false }
 registry = { package = 'storage', version = '1' }
+optional_registry = { package = 'storage', version = '1', optional = true }
 git = { package = 'storage', git = 'https://example.invalid/repo', path = '../storage' }
 named_registry = { package = 'storage', registry = 'alternate', path = '../storage' }
 optional = { package = 'storage', path = '../storage', optional = true }
@@ -308,6 +309,7 @@ ignored = { path = '../ignored' }
 deep = { path = '../nested/deep' }
 isolated = { path = '../isolated' }
 duplicate = { package = 'duplicate', path = '../duplicate-one' }
+optional_duplicate = { package = 'duplicate', path = '../duplicate-one', optional = true }
 broken_child = { path = '../../broken/child' }
 dynamic = { package = 'storage', path = '${ROOT}/storage' }
 outside = { path = '../../../outside' }
@@ -315,10 +317,13 @@ absolute = { package = 'storage', path = '/storage' }
 self_dep = { package = 'app', path = '.' }
 [target.'cfg(unix)'.dependencies]
 conditional = { package = 'storage', path = '../storage' }
+optional_conditional = { package = 'storage', path = '../storage', optional = true }
 [dev-dependencies]
 dev = { package = 'storage', path = '../storage' }
+optional_dev = { package = 'storage', path = '../storage', optional = true }
 [build-dependencies]
 build = { package = 'storage', path = '../storage' }
+optional_build = { package = 'storage', path = '../storage', optional = true }
 "#,
         );
         f.package("crates/storage/Cargo.toml", "storage", "");
@@ -350,8 +355,25 @@ build = { package = 'storage', path = '../storage' }
         ];
         let graph = f.update(&paths);
         let edges = dependencies(&graph);
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].metadata["alias"], "valid");
+        let aliases: std::collections::BTreeSet<_> = edges
+            .iter()
+            .map(|e| e.metadata["alias"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            aliases,
+            std::collections::BTreeSet::from(["inherited", "optional", "valid"])
+        );
+        for edge in &edges {
+            if edge.metadata["alias"] == "valid" {
+                assert_eq!(
+                    edge.metadata,
+                    serde_json::json!({"context":"cargo_dependency", "alias":"valid"})
+                );
+            } else {
+                assert_eq!(edge.metadata["optional"], true);
+                assert_eq!(edge.metadata["activation"], "not_evaluated");
+            }
+        }
         assert!(linked(&graph, paths[1], paths[2]));
         assert_eq!(
             graph
@@ -359,7 +381,7 @@ build = { package = 'storage', path = '../storage' }
                 .iter()
                 .filter(|e| e.relation == "depends_on")
                 .count(),
-            1
+            3
         );
         for path in [paths[3], paths[4], paths[9]] {
             assert!(package(&graph, path).metadata["workspace_manifest"].is_null());
@@ -371,17 +393,120 @@ build = { package = 'storage', path = '../storage' }
                 .iter()
                 .all(|n| n.label != "ignored" && n.label != "outside")
         );
-        // The ordinary static form of the same inherited declaration must bind.
+        // Removing the optional declaration changes evidence, not topology.
         let root = fs::read_to_string(f.root().join("Cargo.toml"))
             .unwrap()
             .replace("optional = true", "optional = false");
         f.write("Cargo.toml", &root);
         let graph = f.update(&paths);
-        assert_eq!(dependencies(&graph).len(), 2);
+        assert_eq!(dependencies(&graph).len(), 3);
+        let inherited = dependencies(&graph)
+            .into_iter()
+            .find(|e| e.metadata["alias"] == "inherited")
+            .unwrap();
+        assert_eq!(
+            inherited.metadata,
+            serde_json::json!({"context":"cargo_dependency", "alias":"inherited"})
+        );
+    }
+
+    #[test]
+    fn optional_declarations_refresh_evidence_and_remove_deleted_members() {
+        let f = Fixture::new();
+        let workspace = "[workspace]\nmembers = ['app', 'storage']\n[workspace.dependencies]\nshared = { package = 'storage-core', path = 'storage', optional = true }\nlocal_flag = { package = 'storage-core', path = 'storage' }\n";
+        let declarations = "[dependencies]\ndirect = { package = 'storage-core', path = '../storage', optional = true }\nshared = { workspace = true }\nlocal_flag = { workspace = true, optional = true }\n";
+        f.write("Cargo.toml", workspace);
+        f.package("app/Cargo.toml", "app", declarations);
+        f.package("storage/Cargo.toml", "storage-core", "");
+        let paths = ["Cargo.toml", "app/Cargo.toml", "storage/Cargo.toml"];
+        let first = f.update(&paths);
+        let target = package(&first, paths[2]).id.clone();
+        let source = package(&first, paths[1]).id.clone();
+        let edges = dependencies(&first);
+        assert_eq!(edges.len(), 3);
+        let identities: std::collections::BTreeSet<_> =
+            edges.iter().map(|e| e.id.clone()).collect();
+        for edge in edges {
+            assert_eq!(edge.source, source);
+            assert_eq!(edge.target, target);
+            assert_eq!(edge.file.as_deref(), Some(paths[1]));
+            assert_eq!(edge.metadata["optional"], true);
+            assert_eq!(edge.metadata["activation"], "not_evaluated");
+            assert!(first.edges.iter().any(|r| r.relation == "depends_on"
+                && r.source == source
+                && r.target == target
+                && r.id != edge.id));
+        }
+        // The package context never adds aliases/targets to real source import facts.
+        let mut rust =
+            graf::languages::parse("app/src/lib.rs", "use direct::Thing; pub fn run() {}", "h")
+                .unwrap()
+                .unwrap();
+        let before = serde_json::to_value(&rust).unwrap();
+        f.context(&paths).apply(&mut rust);
+        assert_eq!(before, serde_json::to_value(&rust).unwrap());
+
+        let optional_fingerprint = f.context(&paths).fingerprint().to_owned();
+        f.write(
+            paths[0],
+            &workspace.replace("optional = true", "optional = false"),
+        );
+        f.package(
+            paths[1],
+            "app",
+            &declarations.replace("optional = true", "optional = false"),
+        );
+        let required = f.update(&paths);
+        assert_ne!(f.context(&paths).fingerprint(), optional_fingerprint);
+        assert_eq!(
+            dependencies(&required)
+                .into_iter()
+                .map(|e| e.id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            identities
+        );
+        for edge in dependencies(&required) {
+            assert_eq!(
+                edge.metadata,
+                serde_json::json!({"context":"cargo_dependency", "alias":edge.metadata["alias"]})
+            );
+        }
+        // Flip back: neither the old evidence nor membership may survive replacement.
+        f.write(paths[0], workspace);
+        f.package(paths[1], "app", declarations);
+        let optional_again = f.update(&paths);
+        assert_eq!(dependencies(&optional_again).len(), 3);
         assert!(
-            dependencies(&graph)
+            dependencies(&optional_again)
                 .iter()
-                .any(|e| e.metadata["alias"] == "inherited")
+                .all(|e| e.metadata["optional"] == true
+                    && e.metadata["activation"] == "not_evaluated")
+        );
+        f.write(
+            paths[0],
+            &workspace.replace(
+                "members = ['app', 'storage']",
+                "members = ['app', 'storage']\nexclude = ['storage']",
+            ),
+        );
+        let excluded = f.update(&paths);
+        assert_eq!(package(&excluded, paths[2]).id, target);
+        assert!(excluded.edges.iter().all(|e| e.source != source
+            || !matches!(e.relation.as_str(), "depends_on" | "crate_depends_on")));
+        f.write(paths[0], workspace);
+        assert_eq!(dependencies(&f.update(&paths)).len(), 3);
+        fs::remove_file(f.root().join(paths[2])).unwrap();
+        let deleted = f.update(&paths[..2]);
+        assert!(deleted.nodes.iter().all(|n| n.id != target));
+        assert!(deleted.edges.iter().all(|e| e.source != source
+            || !matches!(e.relation.as_str(), "depends_on" | "crate_depends_on")));
+        f.package(paths[2], "storage-core", "");
+        let restored = f.update(&paths);
+        assert_eq!(dependencies(&restored).len(), 3);
+        assert!(
+            dependencies(&restored)
+                .iter()
+                .all(|e| e.target == target && e.metadata["activation"] == "not_evaluated")
         );
     }
 
