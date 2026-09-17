@@ -65,6 +65,8 @@ Updates hash source files and parse only changed files. Changed definitions also
 
 Native indexing covers Python definitions, containment, imports, and syntactic call sites. It supports conventional packages and `src/` layouts. It respects ignore rules, skips symlinks and common dependency/build directories, and does not execute project code.
 
+The fixed directory exclusions include `env`, `venv`, `build`, `dist`, and `target`, even if they contain project-owned Python files.
+
 Call resolution is deliberately conservative: lexical functions and explicit local import aliases can resolve to definitions. Dynamic dispatch, ambiguous bindings, and unsupported import patterns remain unresolved. Results include source locations and unresolved references; an empty caller list does not prove a function is unused. Tree-sitter syntax errors and duplicate parameters are diagnosed, and their old facts are removed on update. Graf does not validate every Python compiler or type-system rule. Annotation evaluation is omitted from call edges; class-private names and implicit `__class__` calls remain unresolved. Files larger than 4 MiB, non-UTF-8 source, and excessively nested syntax are also diagnosed instead of indexed.
 
 ## Switch from Graphify
