@@ -988,6 +988,7 @@ impl<'s, 't> Compiled<'s, 't> {
                         && matches!(c.kind(), "user_type" | "nullable_type" | "receiver_type")
                 })
             });
+        let parameterless = self.parameterless(n);
         let uncertain = self.uncertain(scope) || extension || simple_name(&name).is_none();
         let child = self.define(
             n,
@@ -1011,6 +1012,7 @@ impl<'s, 't> Compiled<'s, 't> {
             json!(matches!(self.e.language, "c" | "cpp") && !hidden && !dynamic && !uncertain);
         node.metadata["static"] = json!(static_member);
         node.metadata["extension"] = json!(extension);
+        node.metadata["parameterless"] = json!(parameterless);
         node.metadata["declaration_certain"] = json!(!uncertain);
         node.metadata["dynamic_dispatch"] = json!(dynamic);
         if member && !dynamic && !uncertain && !hidden {
@@ -1140,6 +1142,10 @@ impl<'s, 't> Compiled<'s, 't> {
         true
     }
     fn prototype(&mut self, n: Syntax<'t>, declarator: Syntax<'t>, scope: usize, name: &str) {
+        let parameterless = !n
+            .parent()
+            .is_some_and(|p| p.kind() == "template_declaration")
+            && self.parameterless(declarator);
         let q = format!("{}.{name}", self.scopes[&scope].prefix);
         let child = self.define(n, scope, name, "declaration", q.clone(), false);
         let symbol = q
@@ -1156,6 +1162,7 @@ impl<'s, 't> Compiled<'s, 't> {
         let node = self.e.facts.nodes.last_mut().unwrap();
         node.metadata["header_declaration"] = json!(symbol);
         node.metadata["static"] = json!(static_member);
+        node.metadata["parameterless"] = json!(parameterless);
         node.metadata["dynamic_dispatch"] = json!(dynamic);
         if safe && is_header(&self.e.facts.path) {
             node.binding_key = Some(header_key("declaration", &self.e.facts.path, &symbol));
@@ -1189,6 +1196,44 @@ impl<'s, 't> Compiled<'s, 't> {
             if let Some(d) = d.child_by_field_name("declarator") {
                 pending.push(d);
             }
+        }
+    }
+    // Only a written empty parameter list, without method type parameters,
+    // supplies this declaration-shape proof. It is never overload resolution.
+    fn parameterless(&self, mut n: Syntax<'_>) -> bool {
+        loop {
+            if children(n)
+                .iter()
+                .any(|c| matches!(c.kind(), "type_parameters" | "type_parameter_list"))
+                || n.parent()
+                    .is_some_and(|p| p.kind() == "template_declaration")
+            {
+                return false;
+            }
+            if let Some(parameters) = n.child_by_field_name("parameters").or_else(|| {
+                children(n)
+                    .into_iter()
+                    .find(|c| c.kind() == "function_value_parameters")
+            }) {
+                let mut cursor = parameters.walk();
+                return parameters
+                    .children(&mut cursor)
+                    .all(|c| matches!(c.kind(), "(" | ")" | "comment"));
+            }
+            if self.e.language == "swift" {
+                let mut cursor = n.walk();
+                let tokens: Vec<_> = n
+                    .children(&mut cursor)
+                    .filter(|c| c.kind() != "comment")
+                    .collect();
+                return tokens
+                    .windows(2)
+                    .any(|pair| pair[0].kind() == "(" && pair[1].kind() == ")");
+            }
+            let Some(declarator) = n.child_by_field_name("declarator") else {
+                return false;
+            };
+            n = declarator;
         }
     }
     fn uncertain(&self, mut scope: usize) -> bool {
@@ -2821,6 +2866,62 @@ impl CompiledInventory {
                 })
         })
     }
+    // Declaration navigation can retain separate known branches even when a
+    // call cannot select one. An overload or uncertain branch poisons this
+    // lookup; repeated names only shadow proven parameterless declarations.
+    fn declared_members(
+        &self,
+        id: &str,
+        name: &str,
+        static_call: bool,
+        seen: &mut HashSet<String>,
+    ) -> Option<Vec<String>> {
+        if seen.len() >= 64 || !seen.insert(id.into()) {
+            return None;
+        }
+        let group = self.group(id);
+        let mut inherited = vec![];
+        for part in &group {
+            for base in self.bases.get(part)?.as_ref()? {
+                inherited.extend(self.declared_members(
+                    base,
+                    name,
+                    static_call,
+                    &mut seen.clone(),
+                )?);
+            }
+        }
+        inherited.sort();
+        inherited.dedup();
+        let own: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.label == name && self.parents.get(&n.id).is_some_and(|p| group.contains(p))
+            })
+            .collect();
+        if own.is_empty() {
+            return Some(inherited);
+        }
+        if own.len() != 1
+            || !matches!(own[0].kind.as_str(), "method" | "function" | "declaration")
+            || (static_call && own[0].metadata["static"] != true)
+            || own[0].metadata["member_accessible"] != true
+            || own[0].metadata["declaration_certain"] != true
+        {
+            return None;
+        }
+        if !inherited.is_empty()
+            && (own[0].metadata["parameterless"] != true
+                || inherited.iter().any(|id| {
+                    self.nodes[id].metadata["parameterless"] != true
+                        || self.nodes[id].metadata["static"] != own[0].metadata["static"]
+                }))
+        {
+            return None;
+        }
+        Some(vec![own[0].id.clone()])
+    }
     fn hierarchy_known(&self, id: &str, seen: &mut HashSet<String>) -> bool {
         if seen.len() >= 64 || !seen.insert(id.into()) {
             return false;
@@ -3117,6 +3218,44 @@ impl CompiledContext {
                             inventory.member(&owner, name, static_call, &mut HashSet::new())
                         };
                         let Some(target) = target else {
+                            // Keep declaration evidence separate from callable candidates.
+                            // base/super calls retain their existing single-base boundary.
+                            let declaration_owner = if base_call {
+                                inventory
+                                    .bases
+                                    .get(&owner)
+                                    .and_then(Option::as_ref)
+                                    .filter(|bases| bases.len() == 1)
+                                    .map(|bases| bases[0].as_str())
+                            } else {
+                                Some(owner.as_str())
+                            };
+                            if let Some(targets) = declaration_owner.and_then(|owner| {
+                                inventory.declared_members(
+                                    owner,
+                                    name,
+                                    static_call,
+                                    &mut HashSet::new(),
+                                )
+                            }) {
+                                for target in targets {
+                                    let node = &inventory.nodes[&target];
+                                    if node.metadata["swift_module"].is_string()
+                                        && node.metadata["swift_module"]
+                                            != source.metadata["swift_module"]
+                                        && node.metadata["swift_exported"] != true
+                                    {
+                                        continue;
+                                    }
+                                    result.link_reference(
+                                        &inventory,
+                                        r,
+                                        &target,
+                                        "declared_member",
+                                        "accessible declaration on a proven receiver-type branch; no overload selection or runtime dispatch claim",
+                                    );
+                                }
+                            }
                             continue;
                         };
                         let node = &inventory.nodes[&target];
@@ -3177,7 +3316,7 @@ impl CompiledContext {
         }
         let mut proof = vec![];
         for f in &files {
-            let mut nodes:Vec<_>=f.nodes.iter().map(|n|json!({"kind":n.kind,"name":n.qualified_name,"keys":node_keys(n),"parent":inventory.parents.get(&n.id).and_then(|id|inventory.nodes.get(id)).and_then(|n|n.qualified_name.as_ref()),"partial":n.metadata["partial"],"public":n.metadata["cross_project_public"],"explicit_public":n.metadata["explicit_public"],"explicit_access":n.metadata["explicit_access"],"certain":n.metadata["declaration_certain"],"accessible":n.metadata["member_accessible"],"dynamic":n.metadata["dynamic_dispatch"],"static":n.metadata["static"],"companion":n.metadata["companion"],"swift_module":n.metadata["swift_module"],"swift_exported":n.metadata["swift_exported"]})).collect();
+            let mut nodes:Vec<_>=f.nodes.iter().map(|n|json!({"kind":n.kind,"name":n.qualified_name,"keys":node_keys(n),"parent":inventory.parents.get(&n.id).and_then(|id|inventory.nodes.get(id)).and_then(|n|n.qualified_name.as_ref()),"partial":n.metadata["partial"],"public":n.metadata["cross_project_public"],"explicit_public":n.metadata["explicit_public"],"explicit_access":n.metadata["explicit_access"],"certain":n.metadata["declaration_certain"],"parameterless":n.metadata["parameterless"],"accessible":n.metadata["member_accessible"],"dynamic":n.metadata["dynamic_dispatch"],"static":n.metadata["static"],"companion":n.metadata["companion"],"swift_module":n.metadata["swift_module"],"swift_exported":n.metadata["swift_exported"]})).collect();
             nodes.sort_by_key(serde_json::Value::to_string);
             let mut relations:Vec<_>=f.references.iter().filter(|r|matches!(r.relation.as_str(),"inherits"|"implements"|"extends"|"delegates_to")).map(|r|json!({"owner":inventory.nodes.get(&r.source).and_then(|n|n.qualified_name.as_ref()),"relation":r.relation,"keys":r.candidate_keys})).collect();
             relations.sort_by_key(serde_json::Value::to_string);
@@ -3232,7 +3371,7 @@ impl CompiledContext {
             .or_default()
             .push(key.clone());
         let mut reference = original.clone();
-        reference.id = format!("compiled:{relation}:{}", original.id);
+        reference.id = format!("compiled:{relation}:{}:{target}", original.id);
         reference.relation = relation.into();
         reference.candidate_keys = vec![key];
         reference.reason = reason.into();

@@ -356,6 +356,7 @@ struct CargoPackageDependency {
     alias: String,
     label: String,
     target: Option<String>,
+    optional: bool,
 }
 struct CargoWorkspace {
     members: Vec<globset::GlobMatcher>,
@@ -376,7 +377,7 @@ impl CargoPackageContext {
         ensure!(root.is_dir(), "Cargo project root must be a directory");
         let mut result = Self::default();
         let mut hash = blake3::Hasher::new();
-        hash.update(b"cargo-package-context-1");
+        hash.update(b"cargo-package-context-2");
         let mut manifests = BTreeMap::new();
         let mut workspaces = BTreeMap::new();
         let paths: BTreeSet<_> = paths
@@ -510,10 +511,13 @@ impl CargoPackageContext {
                         .filter(|s| !s.is_empty())
                         .unwrap_or(alias)
                         .to_owned();
-                    let optional = |v: &Value| {
-                        v.get("optional")
-                            .is_some_and(|v| v.as_bool() != Some(false))
-                    };
+                    let optional =
+                        |v: &Value| v.get("optional").map_or(Some(false), Value::as_bool);
+                    // Preserve declared topology without evaluating optional activation.
+                    // Malformed flags still cannot establish a dependency target.
+                    let optional = optional(declaration)
+                        .zip(optional(spec))
+                        .map(|(local, inherited)| local || inherited);
                     let valid_inheritance = inherited.is_none()
                         || (inherited == Some(&Value::Bool(true))
                             && !["path", "package", "git", "registry", "version"]
@@ -521,8 +525,7 @@ impl CargoPackageContext {
                                 .any(|key| declaration.get(*key).is_some()));
                     let target = (!conditional
                         && valid_inheritance
-                        && !optional(declaration)
-                        && !optional(spec)
+                        && optional.is_some()
                         && spec.get("git").is_none()
                         && spec.get("registry").is_none()
                         && spec
@@ -550,6 +553,7 @@ impl CargoPackageContext {
                         alias: alias.clone(),
                         label,
                         target,
+                        optional: optional.unwrap_or(false),
                     });
                 }
             }
@@ -594,9 +598,15 @@ impl CargoPackageContext {
                     id: format!("cargo-context:{}:dependency:{index}", facts.path), source: package.id.clone(),
                     label: dependency.label.clone(), relation: "depends_on".into(), file: facts.path.clone(), line: 1,
                     candidate_keys: target.map(|(path, package)| vec![cargo_package_key(path, &package.name)]).unwrap_or_default(),
-                    reason: "Cargo dependency is external, optional, conditional, or outside the indexed workspace".into(),
+                    reason: "Cargo dependency is external, invalid, target-specific, or outside the indexed workspace".into(),
                 });
                 if let Some((_, target)) = target {
+                    let mut metadata =
+                        json!({"context":"cargo_dependency", "alias":dependency.alias});
+                    if dependency.optional {
+                        metadata["optional"] = json!(true);
+                        metadata["activation"] = json!("not_evaluated");
+                    }
                     facts.edges.push(Edge {
                         id: format!("cargo-context:{}:crate:{index}", facts.path),
                         source: package.id.clone(),
@@ -606,7 +616,7 @@ impl CargoPackageContext {
                         file: Some(facts.path.clone()),
                         line: Some(1),
                         confidence: "static".into(),
-                        metadata: json!({"context":"cargo_dependency", "alias":dependency.alias}),
+                        metadata,
                     });
                 }
             }

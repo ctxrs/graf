@@ -1976,3 +1976,216 @@ fn swift_extension_explicit_internal_access_overrides_public_default_on_updates(
         }
     }
 }
+
+#[test]
+fn inherited_parameterless_overrides_and_hiding_keep_nearest_declaration_navigation() {
+    for (path, source) in [
+        (
+            "Override.cs",
+            "namespace sample; public class Base { public virtual void work() {} } public class Middle : Base { public override void work() {} } public class Leaf : Middle {} class Use { void inspect(Leaf value) { value.work(); } }",
+        ),
+        (
+            "Hiding.cs",
+            "namespace sample; public class Base { public void work() {} } public class Middle : Base { public new void work() {} } public class Leaf : Middle {} class Use { void inspect(Leaf value) { value.work(); } }",
+        ),
+        (
+            "Override.java",
+            "package sample; class Base { public void work() {} } class Middle extends Base { public void work() {} } class Leaf extends Middle {} class Use { void inspect(Leaf value) { value.work(); } }",
+        ),
+        (
+            "override.cpp",
+            "namespace sample { struct Base { virtual void work() {} }; struct Middle : Base { void work() override {} }; struct Leaf : Middle {}; void inspect(Leaf value) { value.work(); } }",
+        ),
+        (
+            "Override.kt",
+            "package sample\nopen class Base {\n open fun work() {}\n}\nopen class Middle : Base() {\n override fun work() {}\n}\nclass Leaf : Middle()\nfun inspect(value: Leaf) { value.work() }\n",
+        ),
+        (
+            "Override.swift",
+            "class Base {\n func work() {}\n}\nclass Middle: Base {\n override func work() {}\n}\nclass Leaf: Middle {}\nfunc inspect(value: Leaf) { value.work() }\n",
+        ),
+    ] {
+        let f = facts(path, source);
+        let caller = node(&f, "inspect").id.clone();
+        let middle = node(&f, "Middle").id.clone();
+        let method = f
+            .nodes
+            .iter()
+            .find(|n| {
+                n.label == "work"
+                    && f.edges
+                        .iter()
+                        .any(|e| e.relation == "contains" && e.source == middle && e.target == n.id)
+            })
+            .unwrap();
+        let target = method.id.clone();
+        assert_eq!(method.metadata["parameterless"], true, "{path}");
+        let original_keys = calls(&f, "value.work")[0].candidate_keys.clone();
+        let files = compiled_context(vec![f]);
+        assert_eq!(
+            calls(&files[0], "value.work")[0].candidate_keys,
+            original_keys,
+            "{path}"
+        );
+        let snapshot = compiled_snapshot(files);
+        let declared: Vec<_> = snapshot
+            .edges
+            .iter()
+            .filter(|e| e.relation == "declared_member" && e.source == caller)
+            .map(|e| e.target.clone())
+            .collect();
+        assert_eq!(declared, [target], "{path}: {:?}", snapshot.edges);
+        assert!(
+            !snapshot
+                .edges
+                .iter()
+                .any(|e| e.relation == "calls" && e.source == caller),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn inherited_class_and_interface_branches_keep_distinct_declaration_evidence() {
+    // Both interface paths reach the same contract. Preserve its declaration
+    // once alongside the class declaration, without selecting a runtime target.
+    let provider = facts(
+        "Types.cs",
+        "namespace sample; public interface Contract { void work(); } public interface Left : Contract {} public interface Right : Contract {} public class Base { public void work() {} } public class Middle : Base, Left, Right {} public class Leaf : Middle {}",
+    );
+    let caller = facts(
+        "Use.cs",
+        "namespace sample; class Use { void inspect(Leaf value) { value.work(); } }",
+    );
+    let source = node(&caller, "inspect").id.clone();
+    let expected: std::collections::BTreeSet<_> = provider
+        .nodes
+        .iter()
+        .filter(|n| n.label == "work")
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(expected.len(), 2);
+    let original_keys = calls(&caller, "value.work")[0].candidate_keys.clone();
+    let files = compiled_context(vec![provider, caller]);
+    let refs: Vec<_> = files[1]
+        .references
+        .iter()
+        .filter(|r| r.relation == "declared_member")
+        .collect();
+    assert_eq!(refs.len(), 2);
+    assert_ne!(refs[0].id, refs[1].id);
+    assert_eq!(
+        calls(&files[1], "value.work")[0].candidate_keys,
+        original_keys
+    );
+    let snapshot = compiled_snapshot(files);
+    let actual: std::collections::BTreeSet<_> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.source == source && e.relation == "declared_member")
+        .map(|e| e.target.clone())
+        .collect();
+    assert_eq!(actual, expected);
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|e| e.source == source && e.relation == "calls")
+    );
+
+    for classes in [
+        // Unknown ancestry can supply another declaration.
+        "public class Base { public void work() {} } public class Leaf : Base, Missing {}",
+        // A field hides the callable name.
+        "public class Base { public void work() {} } public class Leaf : Base, Contract { public int work; }",
+        // Overloads on one branch cannot provide an exact declaration identity.
+        "public class Base { public void work() {} public void work(int n) {} } public class Leaf : Base, Contract {}",
+        // Unrelated duplicate owners cannot establish the receiver type.
+        "public class Base { public void work() {} } public class Leaf : Base, Contract {} public class Leaf : Base, Contract {}",
+    ] {
+        let files = compiled_context(vec![
+            facts(
+                "Types.cs",
+                &format!(
+                    "namespace sample; public interface Contract {{ void work(); }} {classes}"
+                ),
+            ),
+            facts(
+                "Use.cs",
+                "namespace sample; class Use { void inspect(Leaf value) { value.work(); } }",
+            ),
+        ]);
+        let source = node(&files[1], "inspect").id.clone();
+        let snapshot = compiled_snapshot(files);
+        assert!(
+            !snapshot.edges.iter().any(|e| e.source == source
+                && matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{classes}: {:?}",
+            snapshot.edges
+        );
+    }
+}
+
+#[test]
+fn inherited_declaration_navigation_updates_when_signature_or_access_proof_changes() {
+    use graf::languages::compiled::CompiledContext;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    let mut previous_fingerprint = None;
+    for (declaration, expected) in [
+        ("public override void work() {}", true),
+        ("public void work(int n) {}", false),
+        ("private void work() {}", false),
+        ("public override void work() {}", true),
+    ] {
+        let mut files = vec![
+            facts(
+                "Base.cs",
+                "namespace sample; public class Base { public virtual void work() {} }",
+            ),
+            facts(
+                "Middle.cs",
+                &format!("namespace sample; public class Middle : Base {{ {declaration} }}"),
+            ),
+            facts("Leaf.cs", "namespace sample; public class Leaf : Middle {}"),
+            facts(
+                "Use.cs",
+                "namespace sample; class Use { void inspect(Leaf value) { value.work(); } }",
+            ),
+        ];
+        let units = files
+            .iter()
+            .map(|f| (f.path.clone(), "assembly".into()))
+            .collect();
+        let context = CompiledContext::new(&files, &units);
+        if let Some(previous) = previous_fingerprint.replace(context.fingerprint().to_owned()) {
+            assert_ne!(previous, context.fingerprint());
+        }
+        for f in &mut files {
+            context.apply(f);
+        }
+        let source = node(&files[3], "inspect").id.clone();
+        let target = node(&files[1], "work").id.clone();
+        store
+            .apply_native("fixture", files, vec![], Coverage::default())
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let declared: Vec<_> = snapshot
+            .edges
+            .iter()
+            .filter(|e| e.source == source && e.relation == "declared_member")
+            .map(|e| e.target.clone())
+            .collect();
+        assert_eq!(
+            declared,
+            if expected { vec![target] } else { vec![] },
+            "{declaration}"
+        );
+        assert!(
+            !snapshot
+                .edges
+                .iter()
+                .any(|e| e.source == source && e.relation == "calls")
+        );
+    }
+}
