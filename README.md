@@ -6,7 +6,12 @@ Graf stores its graph in SQLite. Queries use persistent search and adjacency ind
 
 ## Install
 
-With Rust 1.90 or newer and a C compiler:
+Download a prebuilt executable from [Releases](https://github.com/ctxrs/graf/releases).
+Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64 are supported release
+targets. See [download verification](docs/downloads.md) for platform requirements,
+signatures, checksums, and installation instructions.
+
+To build from source, use Rust 1.90 or newer and a C compiler:
 
 ```sh
 cargo install --git https://github.com/ctxrs/graf --locked graf-cli
