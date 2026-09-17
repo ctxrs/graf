@@ -2700,8 +2700,11 @@ fn pascal_package_xml(path: &str, source: &str, hash: &str) -> FileFacts {
                         let attr = attr?;
                         if attr.key.as_ref() == b"Value" {
                             value = Some(
-                                attr.decode_and_unescape_value(reader.decoder())?
-                                    .into_owned(),
+                                attr.decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )?
+                                .into_owned(),
                             );
                         }
                     }

@@ -553,7 +553,7 @@ pub(super) fn office(bytes: &[u8], ext: &str, limit: usize) -> Result<OfficeCont
                         }
                         // Cell formulas are never executed. Only cached values/inline strings are read.
                         if cell && matches!(e.local_name().as_ref(), b"v" | b"t") {
-                            value.push_str(&reader.read_text(e.name())?);
+                            value.push_str(&reader.read_text(e.name())?.decode()?);
                             depth -= 1;
                         }
                     }
@@ -638,8 +638,11 @@ fn attributes(bytes: &[u8], tag: &[u8]) -> Result<Vec<std::collections::BTreeMap
                     let attr = attr?;
                     map.insert(
                         String::from_utf8(attr.key.local_name().as_ref().to_vec())?,
-                        attr.decode_and_unescape_value(reader.decoder())?
-                            .into_owned(),
+                        attr.decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )?
+                        .into_owned(),
                     );
                 }
                 result.push(map);
@@ -745,7 +748,7 @@ fn docx_markdown(
         let (table, xml) = match reader.read_event()? {
             Event::Start(e) if matches!(e.local_name().as_ref(), b"p" | b"tbl") => (
                 e.local_name().as_ref() == b"tbl",
-                reader.read_text(e.name())?.into_owned(),
+                reader.read_text(e.name())?.decode()?.into_owned(),
             ),
             Event::Eof => break,
             _ => continue,
@@ -838,7 +841,7 @@ fn word_children(xml: &[u8], tag: &[u8]) -> Result<Vec<String>> {
     loop {
         match reader.read_event()? {
             Event::Start(e) if depth == 0 && e.local_name().as_ref() == tag => {
-                children.push(reader.read_text(e.name())?.into_owned());
+                children.push(reader.read_text(e.name())?.decode()?.into_owned());
                 ensure!(
                     children.len() <= 20_000,
                     "DOCX table structure exceeds limit"
@@ -954,11 +957,14 @@ fn elements(
                     let attr = attr?;
                     attrs.insert(
                         String::from_utf8(attr.key.local_name().as_ref().to_vec())?,
-                        attr.decode_and_unescape_value(reader.decoder())?
-                            .into_owned(),
+                        attr.decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )?
+                        .into_owned(),
                     );
                 }
-                let xml = reader.read_text(e.name())?.into_owned();
+                let xml = reader.read_text(e.name())?.decode()?.into_owned();
                 out.push((attrs, xml));
                 ensure!(out.len() <= 20_000, "DOCX element limit exceeded");
             }

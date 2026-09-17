@@ -1024,7 +1024,11 @@ fn xml(source: &str) -> Result<Vec<Xml>> {
                     let a = a?;
                     attrs.insert(
                         String::from_utf8(a.key.local_name().as_ref().to_vec())?,
-                        a.decode_and_unescape_value(reader.decoder())?.into_owned(),
+                        a.decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )?
+                        .into_owned(),
                     );
                 }
                 let index = nodes.len();

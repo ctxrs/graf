@@ -235,6 +235,11 @@ fn pdf_bytes() -> Vec<u8> {
     let objects=["<< /Type /Catalog /Pages 2 0 R >>".into(),"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),format!("<< /Length {} >>\nstream\n{stream}\nendstream",stream.len())];
+    pdf_objects(&objects)
+}
+
+// Assemble fixtures independently of the PDF library under test.
+fn pdf_objects(objects: &[String]) -> Vec<u8> {
     let mut pdf = String::from("%PDF-1.4\n");
     let mut offsets = vec![0];
     for (i, object) in objects.iter().enumerate() {
@@ -270,6 +275,440 @@ fn pdf_native_extraction_and_binary_limits() {
     assert!(ingest::extract(&path, "sample.pdf", "h", &small).is_err());
     std::fs::write(&path, "not a pdf").unwrap();
     assert!(ingest::extract(&path, "sample.pdf", "h", &options()).is_err());
+}
+
+fn pdf_stream(content: &str) -> String {
+    format!(
+        "<< /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+}
+
+#[test]
+fn pdf_page_tree_order_and_to_unicode_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("pages.pdf");
+    // Page object IDs deliberately disagree with reading order.
+    let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n        /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n        /CMapName /Fixture def /CMapType 2 def\n        1 begincodespacerange <00> <FF> endcodespacerange\n        3 beginbfchar <01> <03A9> <02> <4E2D> <03> <00E9> endbfchar\n        endcmap CMapName currentdict /CMap defineresource pop end end";
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [6 0 R 3 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        pdf_stream("BT /F1 12 Tf (Second page) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 8 0 R >> >> /Contents 7 0 R >>".into(),
+        pdf_stream("BT /F1 12 Tf (First page) Tj ET BT /F2 12 Tf <010203> Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol /Encoding << /Type /Encoding /BaseEncoding 42 /Differences [] >> /ToUnicode 9 0 R >>".into(),
+        pdf_stream(cmap),
+    ];
+    std::fs::write(&path, pdf_objects(&objects)).unwrap();
+    let facts = ingest::extract(&path, "pages.pdf", "h", &options()).unwrap();
+    assert_eq!(
+        facts.nodes[0].metadata["text"],
+        "First page\nΩ中é\nSecond page\n"
+    );
+    assert_eq!(facts.nodes[0].metadata["converter"], "lopdf");
+    let mut small = options();
+    small.max_text_bytes = 8;
+    assert!(
+        ingest::extract(&path, "pages.pdf", "h", &small)
+            .unwrap_err()
+            .to_string()
+            .contains("text byte limit")
+    );
+}
+
+fn pdf_content_fixture(content: &str, resources: &str, extra: Vec<String>) -> Vec<u8> {
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources {resources} /Contents 5 0 R >>"
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+        pdf_stream(content),
+    ];
+    objects.extend(extra);
+    pdf_objects(&objects)
+}
+
+fn pdf_form(content: &str, entries: &str) -> String {
+    format!(
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] {entries} /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+}
+
+#[test]
+fn pdf_forms_keep_text_local_resources_and_caller_graphics() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("forms.pdf");
+    for page in [
+        "/Outer Do",
+        "BT /F1 12 Tf <80> Tj ET /Outer Do BT <80> Tj ET q BT /F2 12 Tf <80> Tj ET Q BT <80> Tj ET",
+    ] {
+        let bytes = pdf_content_fixture(page,
+            "<< /Font << /F1 4 0 R /F2 7 0 R >> /XObject << /Outer 6 0 R >> >>",
+            vec![
+                pdf_form("BT /F1 12 Tf (FormMarker) Tj <80> Tj ET /Nested Do",
+                    "/Resources << /Font << /F1 7 0 R >> /XObject << /Nested 8 0 R >> >>"),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>".into(),
+                pdf_form("BT <80> Tj ET", ""),
+            ]);
+        std::fs::write(&path, bytes).unwrap();
+        let facts = ingest::extract(&path, "forms.pdf", "h", &options()).unwrap();
+        let expected = if page == "/Outer Do" {
+            "FormMarkerÄ\nÄ\n"
+        } else {
+            "€\nFormMarkerÄ\nÄ\n€\nÄ\n€\n"
+        };
+        assert_eq!(facts.nodes[0].metadata["text"], expected);
+    }
+}
+
+#[test]
+fn pdf_positioned_lines_preserve_word_boundaries_and_same_baseline_fragments() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("position.pdf");
+    for (movement, expected) in [
+        ("0 -24 Td", "Alpha\nBeta\n"),
+        ("0 -24 TD", "Alpha\nBeta\n"),
+        ("1 0 0 1 72 696 Tm", "Alpha\nBeta\n"),
+        ("30 0 Td", "AlphaBeta\n"),
+        ("30 0 TD", "AlphaBeta\n"),
+        ("1 0 0 1 102 720 Tm", "AlphaBeta\n"),
+        ("", "AlphaBeta\n"),
+        ("24 TL T*", "Alpha\nBeta\n"),
+    ] {
+        let content = format!("BT /F1 12 Tf 1 0 0 1 72 720 Tm (Alpha) Tj {movement} (Beta) Tj ET");
+        std::fs::write(
+            &path,
+            pdf_content_fixture(&content, "<< /Font << /F1 4 0 R >> >>", vec![]),
+        )
+        .unwrap();
+        let facts = ingest::extract(&path, "position.pdf", "h", &options()).unwrap();
+        assert_eq!(facts.nodes[0].metadata["text"], expected, "{movement}");
+    }
+}
+
+#[test]
+fn pdf_repeated_forms_are_allowed_but_cycles_depth_and_work_are_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bounded.pdf");
+    let resources = "<< /Font << /F1 4 0 R >> /XObject << /Form 6 0 R >> >>";
+    let ordinary = pdf_form("BT /F1 12 Tf (Repeat) Tj ET", "");
+    std::fs::write(
+        &path,
+        pdf_content_fixture("/Form Do /Form Do", resources, vec![ordinary.clone()]),
+    )
+    .unwrap();
+    let facts = ingest::extract(&path, "bounded.pdf", "h", &options()).unwrap();
+    assert_eq!(facts.nodes[0].metadata["text"], "Repeat\nRepeat\n");
+    std::fs::write(
+        &path,
+        pdf_content_fixture("/Form Do", resources, vec![pdf_form("/Form Do", "")]),
+    )
+    .unwrap();
+    assert!(
+        ingest::extract(&path, "bounded.pdf", "h", &options())
+            .unwrap_err()
+            .to_string()
+            .contains("Form cycle")
+    );
+    for depth in [3, 70] {
+        let forms = (0..depth)
+            .map(|i| {
+                if i + 1 == depth {
+                    ordinary.clone()
+                } else {
+                    pdf_form(
+                        "/Form Do",
+                        &format!(
+                            "/Resources << /Font << /F1 4 0 R >> /XObject << /Form {} 0 R >> >>",
+                            7 + i
+                        ),
+                    )
+                }
+            })
+            .collect();
+        std::fs::write(&path, pdf_content_fixture("/Form Do", resources, forms)).unwrap();
+        let result = ingest::extract(&path, "bounded.pdf", "h", &options());
+        if depth == 3 {
+            assert_eq!(result.unwrap().nodes[0].metadata["text"], "Repeat\n");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("nesting limit"));
+        }
+    }
+    // The file fits: repeated expansion, not input size, exhausts the budget.
+    let repeated = pdf_content_fixture(
+        &"/Form Do ".repeat(100),
+        resources,
+        vec![pdf_form(
+            &format!("%{}\nBT /F1 12 Tf (Repeat) Tj ET", "padding".repeat(80)),
+            "",
+        )],
+    );
+    let mut limited = options();
+    limited.max_input_bytes = repeated.len() as u64;
+    std::fs::write(&path, repeated).unwrap();
+    assert!(ingest::extract(&path, "bounded.pdf", "h", &limited).is_err());
+}
+
+#[test]
+fn pdf_shared_page_content_stops_at_text_budget_before_later_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("shared.pdf");
+    let page = |content| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents {content} 0 R >>"
+        )
+    };
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".into(),
+        page(5),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        pdf_stream("BT /F1 12 Tf (Shared) Tj ET"),
+        page(5),
+        page(8),
+        pdf_stream("BT /Missing 12 Tf (Unreachable with small budget) Tj ET"),
+    ];
+    std::fs::write(&path, pdf_objects(&objects)).unwrap();
+    assert_eq!(
+        ingest::extract(&path, "shared.pdf", "h", &options())
+            .unwrap()
+            .nodes[0]
+            .metadata["text"],
+        "Shared\nShared\n"
+    );
+    objects[1] = "<< /Type /Pages /Kids [3 0 R 6 0 R 7 0 R] /Count 3 >>".into();
+    std::fs::write(&path, pdf_objects(&objects)).unwrap();
+    let mut small = options();
+    small.max_text_bytes = 10;
+    assert!(
+        ingest::extract(&path, "shared.pdf", "h", &small)
+            .unwrap_err()
+            .to_string()
+            .contains("text byte limit")
+    );
+    assert!(
+        !ingest::extract(&path, "shared.pdf", "h", &options())
+            .unwrap_err()
+            .to_string()
+            .contains("text byte limit")
+    );
+}
+
+#[test]
+fn pdf_graphics_transforms_restore_after_q_and_form_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("transforms.pdf");
+    let content =
+        "BT /F1 12 Tf (Alpha) Tj q 1 0 0 1 0 -20 cm (Beta) Tj Q (Gamma) Tj /Form Do (Delta) Tj ET";
+    std::fs::write(
+        &path,
+        pdf_content_fixture(
+            content,
+            "<< /Font << /F1 4 0 R >> /XObject << /Form 6 0 R >> >>",
+            vec![pdf_form("(Form) Tj", "/Matrix [1 0 0 1 0 -40]")],
+        ),
+    )
+    .unwrap();
+    let facts = ingest::extract(&path, "transforms.pdf", "h", &options()).unwrap();
+    assert_eq!(
+        facts.nodes[0].metadata["text"],
+        "Alpha\nBeta\nGamma\nForm\nDelta\n"
+    );
+}
+
+#[test]
+fn pdf_compressed_content_and_unicode_maps_obey_decoding_budget() {
+    // Independently zlib-compressed fixtures: 8192 spaces followed by page text
+    // or a CMap mapping byte 01 to U+03A9. ASCIIHex keeps the fixture printable.
+    let compressed = [
+        "789cedc1310d80401405302b6f84891c122e01055fc2c1c00013fed141d2360100000000000000feae5796bda5ada933537fde7b1c634e5dd9ea034c6e07bf>",
+        "789cedd0c16ac4201006e0fb3ec51cb7a724bba742082c5b0239745b9af6018c4eb242a3620c346f5fb5db853e42e1ff40c171464789000000000000000000000000000000e0bf2bcedd536774a0e2d55bd973a0511be579b1ab974c034fda507520a565b8adf22c67e176a9b8df96c07367464b754dc55bdc5c82df687f5276e0072a5ebc62afcd44fb8f731fd7fdeadc27cf6c0295d434a4788c073d0b77113353d1eaafb07a4e61cae1f7cd311d725a75bbdb2a5e9c90ec859998eab26ca86edb86d8a8bf7bbf15c328afc2c7cc2a6696c7d363cefd89ee52557c0ddd7b90abf7b1bdfce4dc42ba5c1bbeff8ab32ed5a7f10d15e56bd3>",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("compressed.pdf");
+    for (index, hex) in compressed.iter().enumerate() {
+        let filtered = format!(
+            "<< /Length {} /Filter [/ASCIIHexDecode /FlateDecode] >>\nstream\n{hex}\nendstream",
+            hex.len()
+        );
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            filtered.clone(),
+        ];
+        if index == 1 {
+            objects[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>".into();
+            objects[4] = pdf_stream("BT /F1 12 Tf <01> Tj ET");
+            objects.push(filtered);
+        }
+        let bytes = pdf_objects(&objects);
+        assert!(bytes.len() < 2048);
+        std::fs::write(&path, bytes).unwrap();
+        let mut bounded = options();
+        bounded.max_input_bytes = 16384;
+        let facts = ingest::extract(&path, "compressed.pdf", "h", &bounded).unwrap();
+        assert_eq!(
+            facts.nodes[0].metadata["text"],
+            if index == 0 { "Bounded\n" } else { "Ω\n" }
+        );
+        bounded.max_input_bytes = 2048;
+        assert!(ingest::extract(&path, "compressed.pdf", "h", &bounded).is_err());
+    }
+}
+
+#[test]
+fn pdf_missing_or_unsupported_fonts_fail_instead_of_dropping_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("font.pdf");
+    for resources in [
+        "<< /Font << >> >>",
+        "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Symbol >> >> >>",
+        "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >> >> >>",
+        "<< /Font << /F1 << /Type /Font /Subtype /Type0 /BaseFont /Custom /Encoding /Identity-H >> >> >>",
+        "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Custom /ToUnicode 6 0 R >> >> >>",
+        "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Custom /Encoding << /Type /Encoding /Differences [0 /UnrecognizedSyntheticGlyph] >> >> >> >>",
+    ] {
+        std::fs::write(
+            &path,
+            pdf_content_fixture(
+                "BT /F1 12 Tf (Do not drop me) Tj ET",
+                resources,
+                vec![pdf_stream("invalid cmap")],
+            ),
+        )
+        .unwrap();
+        assert!(ingest::extract(&path, "font.pdf", "h", &options()).is_err());
+    }
+    std::fs::write(
+        &path,
+        pdf_content_fixture(
+            "BT /F1 12 Tf (Supported text) Tj ET",
+            "<< /Font << /F1 4 0 R >> >>",
+            vec![],
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        ingest::extract(&path, "font.pdf", "h", &options())
+            .unwrap()
+            .nodes[0]
+            .metadata["text"],
+        "Supported text\n"
+    );
+}
+
+#[test]
+fn pdf_difference_encodings_require_a_supported_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("differences.pdf");
+    for font in ["Symbol", "ZapfDingbats", "Custom"] {
+        for differences in ["[]", "[90 /A]"] {
+            let resources = format!(
+                "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /{font} /Encoding << /Type /Encoding /Differences {differences} >> >> >> >>"
+            );
+            std::fs::write(
+                &path,
+                pdf_content_fixture("BT /F1 12 Tf (AB) Tj ET", &resources, vec![]),
+            )
+            .unwrap();
+            assert!(ingest::extract(&path, "differences.pdf", "h", &options()).is_err());
+        }
+    }
+    for (font, base, expected) in [
+        ("Helvetica", "", Some("AZ\n")),
+        ("Symbol", "/BaseEncoding /WinAnsiEncoding", Some("AZ\n")),
+        ("Helvetica", "/BaseEncoding 42", None),
+        ("Helvetica", "/BaseEncoding /UnknownEncoding", None),
+    ] {
+        let resources = format!(
+            "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /{font} /Encoding << /Type /Encoding {base} /Differences [66 /Z] >> >> >> >>"
+        );
+        std::fs::write(
+            &path,
+            pdf_content_fixture("BT /F1 12 Tf (AB) Tj ET", &resources, vec![]),
+        )
+        .unwrap();
+        let result = ingest::extract(&path, "differences.pdf", "h", &options());
+        if let Some(text) = expected {
+            assert_eq!(result.unwrap().nodes[0].metadata["text"], text);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn pdf_malformed_and_deep_nesting_are_bounded() {
+    const CHILD: &str = "GRAF_PDF_NESTING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested.pdf");
+        std::fs::write(&path, b"%PDF-1.4\ntruncated").unwrap();
+        assert!(ingest::extract(&path, "nested.pdf", "h", &options()).is_err());
+        for depth in [1, 10_000] {
+            let stream = format!(
+                "BT /F1 12 Tf {}(Nested text){} TJ ET",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            );
+            let objects = vec![
+                "<< /Type /Catalog /Pages 2 0 R >>".into(),
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+                pdf_stream(&stream),
+            ];
+            std::fs::write(&path, pdf_objects(&objects)).unwrap();
+            let result = ingest::extract(&path, "nested.pdf", "h", &options());
+            if depth == 1 {
+                assert_eq!(
+                    result.unwrap().nodes[0].metadata["text"]
+                        .as_str()
+                        .unwrap()
+                        .trim(),
+                    "Nested text"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "malformed content must not publish empty facts"
+                );
+            }
+        }
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pdf_malformed_and_deep_nesting_are_bounded",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "PDF regression subprocess failed: {status}"
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("PDF regression subprocess exceeded ten seconds");
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn mock(response: Value) -> (String, thread::JoinHandle<Value>) {
@@ -1731,7 +2170,7 @@ fn markdown_wikilinks_publish_bounded_suffix_aliases_and_ordered_candidates() {
     assert!(
         ingest::config_fingerprint(&options())
             .unwrap()
-            .starts_with("ingest-v5:")
+            .starts_with("ingest-v6:")
     );
 }
 

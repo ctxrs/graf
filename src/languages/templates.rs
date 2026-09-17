@@ -1089,7 +1089,12 @@ impl<'a> Template<'a> {
                     let mut attrs = vec![];
                     for attr in tag.attributes() {
                         match attr.ok().and_then(|a| {
-                            a.decode_and_unescape_value(reader.decoder()).ok().map(|v| {
+                            a.decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .ok()
+                            .map(|v| {
                                 (
                                     String::from_utf8_lossy(a.key.as_ref()).into_owned(),
                                     v.into_owned(),

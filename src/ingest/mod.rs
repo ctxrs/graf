@@ -2,6 +2,7 @@
 mod convert;
 pub(crate) use convert::run as run_command;
 mod documents;
+mod pdf;
 mod remote;
 mod semantic;
 pub use remote::{CaptureMetadata, apply_capture_metadata, extract_url};
@@ -171,7 +172,7 @@ pub fn config_fingerprint(options: &IngestOptions) -> Result<String> {
     }
     let mut bytes = serde_json::to_vec(&settings)?;
     bytes.extend_from_slice(semantic::INSTRUCTIONS.as_bytes());
-    Ok(format!("ingest-v5:{}", blake3::hash(&bytes).to_hex()))
+    Ok(format!("ingest-v6:{}", blake3::hash(&bytes).to_hex()))
 }
 
 pub fn content_fingerprint(content: &[u8], options: &IngestOptions) -> Result<String> {
@@ -297,10 +298,8 @@ pub fn extract(
     }
     match ext.as_str() {
         "pdf" => {
-            let text = pdf_extract::extract_text_from_mem(&bytes).context(
-                "cannot extract PDF text; configure a PDF/OCR converter for scanned documents",
-            )?;
-            converted(relative, &text, hash, options, "pdf-extract")
+            let text = pdf::extract(&bytes, options)?;
+            converted(relative, &text, hash, options, "lopdf")
         }
         "docx" | "xlsx" => {
             let content = convert::office(&bytes, &ext, options.max_text_bytes)?;
