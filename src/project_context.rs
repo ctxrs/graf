@@ -26,6 +26,7 @@ struct GoPackage {
     import_path: Option<String>,
     fingerprint: String,
     production: bool,
+    type_counts: BTreeMap<String, usize>,
 }
 
 impl ProjectContext {
@@ -34,8 +35,9 @@ impl ProjectContext {
         paths: &[String],
         modules: &BTreeMap<String, String>,
     ) -> Result<Self> {
+        let mut inventory = Inventory::new(root, paths);
         let mut result = Self {
-            swift: SwiftContext::discover(paths, modules)?,
+            swift: SwiftContext::discover(&inventory, modules)?,
             ..Self::default()
         };
         let ordered: BTreeSet<_> = paths.iter().cloned().collect();
@@ -70,9 +72,34 @@ impl ProjectContext {
             let Some(package) = package else {
                 continue;
             };
+            // Reuse this AST read to establish package-level owner uniqueness.
+            // Do not descend into functions: their local types are different owners.
+            let mut type_counts = BTreeMap::new();
+            let mut cursor = tree.root_node().walk();
+            for declaration in tree
+                .root_node()
+                .named_children(&mut cursor)
+                .filter(|n| n.kind() == "type_declaration")
+            {
+                let mut cursor = declaration.walk();
+                for ty in declaration
+                    .named_children(&mut cursor)
+                    .filter(|n| matches!(n.kind(), "type_spec" | "type_alias"))
+                {
+                    if let Some(name) = ty
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    {
+                        *type_counts.entry(name.to_owned()).or_insert(0usize) += 1;
+                    }
+                }
+            }
             let identity = (directory.to_owned(), package.clone());
             if let Some(existing) = result.go.get_mut(&identity) {
                 existing.production |= !path.ends_with("_test.go");
+                for (name, count) in type_counts {
+                    *existing.type_counts.entry(name).or_default() += count;
+                }
                 continue;
             }
             let mut cursor = Path::new(if directory == "." { "" } else { directory });
@@ -135,10 +162,10 @@ impl ProjectContext {
                     import_path,
                     production: !path.ends_with("_test.go"),
                     fingerprint: hash.finalize().to_hex().to_string(),
+                    type_counts,
                 },
             );
         }
-        let mut inventory = Inventory::new(root, paths);
         result.javascript = JavascriptContext::discover(&mut inventory)?;
         result.rust = RustContext::discover(&mut inventory)?;
         result.templates = TemplateContext::discover(&mut inventory)?;
@@ -192,6 +219,7 @@ impl ProjectContext {
             };
             let hash = blake3::hash(&bytes).to_hex().to_string();
             self.templates.validate_source(path, &hash)?;
+            self.swift.validate_source(path, &hash)?;
             self.compiled_source_hashes.insert(path.clone(), hash);
             let Ok(source) = std::str::from_utf8(&bytes) else {
                 continue;
@@ -231,6 +259,7 @@ impl ProjectContext {
             "source changed during compiled context discovery; retry indexing: {path}"
         );
         self.templates.validate_source(path, content_hash)?;
+        self.swift.validate_source(path, content_hash)?;
         self.extended.validate_source(path, content_hash)?;
         Ok(())
     }
@@ -273,7 +302,7 @@ impl ProjectContext {
         if !path.ends_with(".go") {
             return String::new();
         }
-        // A changed module mapping can change a reference in any Go source.
+        // Module mapping and owner ambiguity can change references in unchanged files.
         let mut hash = blake3::Hasher::new();
         for ((directory, name), package) in &self.go {
             hash.update(directory.as_bytes());
@@ -281,6 +310,11 @@ impl ProjectContext {
             hash.update(name.as_bytes());
             hash.update(&[u8::from(package.production)]);
             hash.update(package.fingerprint.as_bytes());
+            for (name, count) in &package.type_counts {
+                hash.update(name.as_bytes());
+                hash.update(&[0]);
+                hash.update(&(*count as u64).to_le_bytes());
+            }
         }
         hash.finalize().to_hex().to_string()
     }
@@ -398,10 +432,28 @@ impl ProjectContext {
             }
         }
         let directory = facts.path.rsplit_once('/').map_or(".", |(p, _)| p);
-        if let Some(package) = self
-            .go
-            .get(&(directory.to_owned(), package_name.clone()))
-            .filter(|p| p.owner == facts.path && p.production)
+        let package = self.go.get(&(directory.to_owned(), package_name.clone()));
+        let prefix = format!("go:{directory}:{package_name}:");
+        for node in &mut facts.nodes {
+            if let Some(aliases) = node
+                .metadata
+                .get_mut("binding_aliases")
+                .and_then(Value::as_array_mut)
+            {
+                aliases.retain(|alias| {
+                    let Some((owner, _)) = alias
+                        .as_str()
+                        .and_then(|key| key.strip_prefix(&prefix))
+                        .and_then(|key| key.split_once("#declared."))
+                    else {
+                        return true;
+                    };
+                    // A unique member spelling cannot disambiguate its owning type.
+                    package.and_then(|p| p.type_counts.get(owner)) == Some(&1)
+                });
+            }
+        }
+        if let Some(package) = package.filter(|p| p.owner == facts.path && p.production)
             && let Some(import_path) = &package.import_path
         {
             facts.nodes.push(Node {
@@ -603,10 +655,16 @@ impl<'a> Inventory<'a> {
 struct SwiftContext {
     owners: BTreeMap<String, String>,
     imports: Vec<(String, String)>,
+    target_imports: BTreeMap<String, Vec<(String, String)>>,
+    source_hashes: BTreeMap<String, String>,
     fingerprint: String,
 }
 impl SwiftContext {
-    fn discover(paths: &[String], modules: &BTreeMap<String, String>) -> Result<Self> {
+    fn discover(inventory: &Inventory<'_>, modules: &BTreeMap<String, String>) -> Result<Self> {
+        if modules.is_empty() {
+            return Self::discover_packages(inventory);
+        }
+        // A configured map is the complete override, including its ambiguity barriers.
         let mut result = Self::default();
         let mut roots = BTreeMap::<String, Option<(String, String)>>::new();
         let mut inputs = vec!["swift-configured-context-1".to_owned()];
@@ -634,7 +692,11 @@ impl SwiftContext {
                 .or_insert(Some((name.clone(), id)));
         }
         result.imports = roots.values().flatten().cloned().collect();
-        let files: BTreeSet<_> = paths.iter().filter(|p| p.ends_with(".swift")).collect();
+        let files: BTreeSet<_> = inventory
+            .files
+            .iter()
+            .filter(|p| p.ends_with(".swift"))
+            .collect();
         for path in files {
             inputs.push(path.clone());
             if let Some((_, Some((_, module)))) = roots
@@ -648,10 +710,422 @@ impl SwiftContext {
         result.fingerprint = digest(inputs.iter().map(String::as_str));
         Ok(result)
     }
+    fn discover_packages(inventory: &Inventory<'_>) -> Result<Self> {
+        let mut result = Self::default();
+        let mut packages = BTreeMap::<String, Option<Vec<SwiftTarget>>>::new();
+        let mut evidence = vec!["swift-literal-packages-1".to_owned()];
+        for path in &inventory.files {
+            if !path.ends_with(".swift") {
+                continue;
+            }
+            evidence.push(path.clone());
+            let name = path.rsplit('/').next().unwrap();
+            if name != "Package.swift" && !name.starts_with("Package@swift-") {
+                continue;
+            }
+            // Version-specific manifests are barriers: choosing one requires a toolchain.
+            let package = directory(path).to_owned();
+            let metadata = std::fs::symlink_metadata(inventory.root.join(path))?;
+            let targets = if metadata.len() > crate::parser::MAX_SOURCE_BYTES as u64 {
+                result
+                    .source_hashes
+                    .insert(path.clone(), "oversized:4MiB".into());
+                None
+            } else if let Some(bytes) =
+                inventory.read_bytes(path, crate::parser::MAX_SOURCE_BYTES as u64)?
+            {
+                result
+                    .source_hashes
+                    .insert(path.clone(), blake3::hash(&bytes).to_hex().to_string());
+                if name == "Package.swift" {
+                    std::str::from_utf8(&bytes)
+                        .ok()
+                        .and_then(|source| swift_package(source, &package))
+                } else {
+                    None
+                }
+            } else {
+                // Discovery already inventoried this file; silently losing it would change ownership.
+                anyhow::bail!(
+                    "Swift manifest disappeared during discovery; retry indexing: {path}"
+                );
+            };
+            packages
+                .entry(package)
+                .and_modify(|p| *p = None)
+                .or_insert(targets);
+        }
+        for (path, hash) in &result.source_hashes {
+            evidence.extend([path.clone(), hash.clone()]);
+        }
+        for (package, targets) in &packages {
+            let Some(targets) = targets else { continue };
+            let id = |name: &str| format!("swiftpm-{}", digest([package.as_str(), name]));
+            for target in targets {
+                result.target_imports.insert(
+                    id(&target.name),
+                    target
+                        .dependencies
+                        .iter()
+                        .filter(|name| targets.iter().any(|t| &t.name == *name && !t.test))
+                        .map(|name| (name.clone(), id(name)))
+                        .collect(),
+                );
+            }
+        }
+        for path in inventory.files.iter().filter(|p| p.ends_with(".swift")) {
+            let Some((_, Some(targets))) = packages
+                .iter()
+                .filter(|(dir, _)| within(path, dir))
+                .max_by_key(|(dir, _)| dir.len())
+            else {
+                continue;
+            };
+            let matches: Vec<_> = targets.iter().filter(|t| t.contains(path)).collect();
+            if let [target] = matches.as_slice() {
+                result.owners.insert(path.clone(), target.id.clone());
+            }
+        }
+        result.fingerprint = digest(evidence.iter().map(String::as_str));
+        Ok(result)
+    }
+    fn validate_source(&self, path: &str, hash: &str) -> Result<()> {
+        ensure!(
+            self.source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == hash),
+            "source changed during Swift manifest discovery; retry indexing: {path}"
+        );
+        Ok(())
+    }
     fn apply(&self, facts: &mut FileFacts) {
         if let Some(module) = self.owners.get(&facts.path) {
-            crate::languages::compiled::apply_swift_context(facts, module, &self.imports);
+            let imports = self.target_imports.get(module).unwrap_or(&self.imports);
+            crate::languages::compiled::apply_swift_context(facts, module, imports);
         }
+    }
+}
+
+struct SwiftTarget {
+    name: String,
+    id: String,
+    root: String,
+    sources: Option<Vec<String>>,
+    exclude: Vec<String>,
+    dependencies: Vec<String>,
+    test: bool,
+}
+impl SwiftTarget {
+    fn contains(&self, path: &str) -> bool {
+        let name = path.rsplit('/').next().unwrap();
+        within(path, &self.root)
+            && name != "Package.swift"
+            && !name.starts_with("Package@swift-")
+            && !path.split('/').any(|part| part.starts_with('.'))
+            && self
+                .sources
+                .as_ref()
+                .is_none_or(|sources| sources.iter().any(|s| path == s || within(path, s)))
+            && !self.exclude.iter().any(|s| path == s || within(path, s))
+    }
+}
+
+// This is a closed literal subset of PackageDescription, not a Swift evaluator.
+// Every membership-affecting argument is consumed; unknown syntax refuses the package.
+fn swift_package(source: &str, package: &str) -> Option<Vec<SwiftTarget>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_swift::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let items = swift_children(tree.root_node());
+    let [import, declaration] = items.as_slice() else {
+        return None;
+    };
+    if import.kind() != "import_declaration"
+        || swift_tokens(*import, source)? != "importPackageDescription"
+        || declaration.kind() != "property_declaration"
+    {
+        return None;
+    }
+    let children = swift_children(*declaration);
+    let [binding, pattern, value] = children.as_slice() else {
+        return None;
+    };
+    if binding.kind() != "value_binding_pattern"
+        || swift_tokens(*binding, source)? != "let"
+        || pattern.kind() != "pattern"
+        || swift_tokens(*pattern, source)? != "package"
+    {
+        return None;
+    }
+    let (callee, args) = swift_call(*value, source)?;
+    if callee != "Package" {
+        return None;
+    }
+    let mut args = swift_labels(args)?;
+    swift_string(args.remove("name")?, source)?;
+    let targets = swift_array(args.remove("targets")?)?;
+    for (key, value) in args {
+        if !matches!(
+            key.as_str(),
+            "products"
+                | "dependencies"
+                | "platforms"
+                | "defaultLocalization"
+                | "swiftLanguageVersions"
+                | "swiftLanguageModes"
+                | "cLanguageStandard"
+                | "cxxLanguageStandard"
+        ) || !swift_literal(value, source, 0)
+        {
+            return None;
+        }
+    }
+    let mut result = vec![];
+    for target in targets {
+        let (kind, args) = swift_call(target, source)?;
+        if !matches!(
+            kind.as_str(),
+            ".target" | ".executableTarget" | ".testTarget"
+        ) {
+            return None;
+        }
+        let mut args = swift_labels(args)?;
+        let name = swift_string(args.remove("name")?, source)?.to_owned();
+        if !swift_identifier(&name) {
+            return None;
+        }
+        let test = kind == ".testTarget";
+        let root = match args.remove("path") {
+            Some(value) => swift_path(package, swift_string(value, source)?)?,
+            None => join(
+                package,
+                &format!("{}/{name}", if test { "Tests" } else { "Sources" }),
+            )?,
+        };
+        let sources = match args.remove("sources") {
+            Some(value) => Some(swift_paths(value, source, &root)?),
+            None => None,
+        };
+        let exclude = match args.remove("exclude") {
+            Some(value) => swift_paths(value, source, &root)?,
+            None => vec![],
+        };
+        let mut dependencies = vec![];
+        if let Some(value) = args.remove("dependencies") {
+            for dependency in swift_array(value)? {
+                if let Some(name) = swift_string(dependency, source) {
+                    dependencies.push(name.to_owned());
+                } else {
+                    let (kind, args) = swift_call(dependency, source)?;
+                    let mut args = swift_labels(args)?;
+                    let name = swift_string(args.remove("name")?, source)?.to_owned();
+                    match kind.as_str() {
+                        ".target" | ".byName" => dependencies.push(name),
+                        ".product" => {
+                            swift_string(args.remove("package")?, source)?;
+                        }
+                        _ => return None,
+                    }
+                    // Conditions and module aliases are deliberately unsupported.
+                    if !args.is_empty() {
+                        return None;
+                    }
+                }
+            }
+        }
+        if !args.is_empty() {
+            return None;
+        }
+        // Duplicate names and overlapping target roots are ambiguous even if an
+        // explicit source list happens to make today's indexed subset disjoint.
+        if result.iter().any(|t: &SwiftTarget| {
+            t.name == name || t.root == root || within(&root, &t.root) || within(&t.root, &root)
+        }) {
+            return None;
+        }
+        result.push(SwiftTarget {
+            id: format!("swiftpm-{}", digest([package, name.as_str()])),
+            name,
+            root,
+            sources,
+            exclude,
+            dependencies,
+            test,
+        });
+    }
+    Some(result)
+}
+
+fn swift_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+fn swift_path(base: &str, relative: &str) -> Option<String> {
+    if relative.contains(['\\', ':'])
+        || relative.starts_with('/')
+        || relative.split('/').any(|p| p == "..")
+    {
+        return None;
+    }
+    join(base, relative)
+}
+fn swift_paths(node: tree_sitter::Node<'_>, source: &str, root: &str) -> Option<Vec<String>> {
+    swift_array(node)?
+        .into_iter()
+        .map(|n| swift_path(root, swift_string(n, source)?))
+        .collect()
+}
+fn swift_children(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "comment" | "multiline_comment"))
+        .collect()
+}
+fn swift_tokens(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    // Compare grammatical spellings without interpreting comments as source text.
+    let mut pending = vec![node];
+    let mut text = String::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "comment" | "multiline_comment") {
+            continue;
+        }
+        if node.child_count() == 0 {
+            text.push_str(node.utf8_text(source.as_bytes()).ok()?);
+        } else {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            pending.extend(children.into_iter().rev());
+        }
+    }
+    Some(text)
+}
+fn swift_string<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "line_string_literal"
+        || swift_children(node)
+            .iter()
+            .any(|n| n.kind() != "line_str_text")
+    {
+        return None;
+    }
+    node.utf8_text(source.as_bytes())
+        .ok()?
+        .strip_prefix('"')?
+        .strip_suffix('"')
+}
+fn swift_array(node: tree_sitter::Node<'_>) -> Option<Vec<tree_sitter::Node<'_>>> {
+    if node.kind() != "array_literal" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    // Field iteration includes unnamed expressions such as nil, which must not disappear.
+    let elements: Vec<_> = node
+        .children_by_field_name("element", &mut cursor)
+        .collect();
+    swift_children(node)
+        .iter()
+        .all(|n| elements.contains(n))
+        .then_some(elements)
+}
+type SwiftArguments<'a> = Vec<(Option<String>, tree_sitter::Node<'a>)>;
+fn swift_call<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &str,
+) -> Option<(String, SwiftArguments<'a>)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let children = swift_children(node);
+    let [callee, suffix] = children.as_slice() else {
+        return None;
+    };
+    if suffix.kind() != "call_suffix" {
+        return None;
+    }
+    let children = swift_children(*suffix);
+    let [arguments] = children.as_slice() else {
+        return None;
+    };
+    if arguments.kind() != "value_arguments" {
+        return None;
+    }
+    let mut result = vec![];
+    for argument in swift_children(*arguments) {
+        if argument.kind() != "value_argument" {
+            return None;
+        }
+        let value = argument.child_by_field_name("value")?;
+        let name = match argument.child_by_field_name("name") {
+            Some(node) => Some(swift_tokens(node, source)?),
+            None => None,
+        };
+        if argument
+            .child_by_field_name("reference_specifier")
+            .is_some()
+            || swift_children(argument)
+                .iter()
+                .any(|n| *n != value && Some(*n) != argument.child_by_field_name("name"))
+        {
+            return None;
+        }
+        result.push((name, value));
+    }
+    Some((swift_tokens(*callee, source)?, result))
+}
+fn swift_labels<'a>(args: SwiftArguments<'a>) -> Option<BTreeMap<String, tree_sitter::Node<'a>>> {
+    let mut result = BTreeMap::new();
+    for (name, value) in args {
+        if result.insert(name?, value).is_some() {
+            return None;
+        }
+    }
+    Some(result)
+}
+fn swift_literal(node: tree_sitter::Node<'_>, source: &str, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match node.kind() {
+        "line_string_literal" => swift_string(node, source).is_some(),
+        "integer_literal" | "boolean_literal" | "nil" => true,
+        "array_literal" => swift_array(node).is_some_and(|items| {
+            items
+                .into_iter()
+                .all(|n| swift_literal(n, source, depth + 1))
+        }),
+        "prefix_expression" => swift_tokens(node, source)
+            .and_then(|s| s.strip_prefix('.').map(swift_identifier))
+            .unwrap_or(false),
+        "call_expression" => swift_call(node, source).is_some_and(|(name, args)| {
+            matches!(
+                name.as_str(),
+                ".library"
+                    | ".executable"
+                    | ".package"
+                    | ".exact"
+                    | ".upToNextMajor"
+                    | ".upToNextMinor"
+                    | ".branch"
+                    | ".revision"
+                    | ".macOS"
+                    | ".iOS"
+                    | ".tvOS"
+                    | ".watchOS"
+                    | ".visionOS"
+                    | ".macCatalyst"
+                    | ".driverKit"
+            ) && args
+                .into_iter()
+                .all(|(_, n)| swift_literal(n, source, depth + 1))
+        }),
+        _ => false,
     }
 }
 
@@ -1072,7 +1546,7 @@ impl JavascriptContext {
                 }
             }
         }
-        result.fingerprint = inventory.fingerprint("javascript-context-4");
+        result.fingerprint = inventory.fingerprint("javascript-context-5");
         result.exports(inventory)?;
         Ok(result)
     }
@@ -1332,6 +1806,49 @@ impl JavascriptContext {
         }
         self.file(importer, &target)
     }
+    fn declared_dependency(&self, importer: &str, specifier: &str) -> Option<String> {
+        if specifier.starts_with(['.', '/', '#']) || specifier.contains([':', '\\']) {
+            return None;
+        }
+        let mut parts = specifier.split('/');
+        let first = parts.next()?;
+        let name = if first.starts_with('@') {
+            format!("{first}/{}", parts.next()?)
+        } else {
+            first.to_owned()
+        };
+        if name.is_empty()
+            || specifier
+                .split('/')
+                .any(|p| p.is_empty() || matches!(p, "." | ".."))
+        {
+            return None;
+        }
+        let (directory, package) = self
+            .packages
+            .iter()
+            .filter(|(d, _)| within(importer, d))
+            .max_by_key(|(d, _)| d.len())?;
+        let declared = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ]
+        .iter()
+        .any(|group| {
+            package
+                .get(group)
+                .and_then(|v| v.get(&name))
+                .is_some_and(Value::is_string)
+        });
+        declared.then(|| {
+            format!(
+                "npm:dependency:{}:{name}",
+                join(directory, "package.json").unwrap()
+            )
+        })
+    }
     fn resolve(&self, importer: &str, specifier: &str, require: bool) -> Option<String> {
         if specifier.starts_with('.') {
             return self.file(importer, &join(directory(importer), specifier)?);
@@ -1490,6 +2007,10 @@ impl JavascriptContext {
                         reference.reason.starts_with("CommonJS"),
                     ) {
                         keys.push(format!("javascript:file-module:{module}"));
+                    } else if let Some(dependency) =
+                        self.declared_dependency(&facts.path, specifier)
+                    {
+                        keys.push(dependency);
                     } else {
                         keys.push(key.clone());
                     }
@@ -1585,6 +2106,7 @@ struct RustContext {
     owners: BTreeMap<String, String>,
     modules: BTreeMap<String, Vec<RustModule>>,
     forwarding: BTreeMap<String, Vec<String>>,
+    generic_owners: BTreeMap<(String, String), u64>,
     fingerprint: String,
 }
 struct RustCrate {
@@ -1813,7 +2335,7 @@ impl RustContext {
                     node.binding_key = Some(key.into());
                 }
             }
-            self.apply(&mut facts);
+            self.apply_paths(&mut facts);
             for node in facts.nodes {
                 let keys: Vec<_> = node
                     .binding_key
@@ -1873,12 +2395,27 @@ impl RustContext {
                 }
             }
         }
+        for (key, ids) in &origins {
+            if ids.len() == 1 {
+                let node = &definitions[ids.first().unwrap()];
+                if matches!(node.kind.as_str(), "struct" | "enum" | "union")
+                    && node.metadata["conditional"] != true
+                    && let Some(arity) = node.metadata["generic_type_arity"].as_u64()
+                    && let Some(package) = self.owners.get(&node.file)
+                {
+                    self.generic_owners
+                        .insert((package.clone(), key.clone()), arity);
+                }
+            }
+        }
         for (alias, targets) in &origins {
             if targets.len() != 1 {
                 continue;
             }
             let id = targets.first().unwrap();
-            if definitions[id].metadata["public"] == true {
+            if definitions[id].metadata["public"] == true
+                && self.generic_impl_known(&definitions[id])
+            {
                 self.forwarding
                     .entry(id.clone())
                     .or_default()
@@ -1890,6 +2427,9 @@ impl RustContext {
         for method in definitions.values().filter(|n| {
             matches!(n.kind.as_str(), "method" | "constant") && n.metadata["public"] == true
         }) {
+            if !self.generic_impl_known(method) {
+                continue;
+            }
             let Some(ty) = method.metadata["impl_type"].as_str() else {
                 continue;
             };
@@ -2061,7 +2601,51 @@ impl RustContext {
             self.crates[package].library
         )
     }
+    fn generic_impl_known(&self, node: &Node) -> bool {
+        let Some(arity) = node.metadata["generic_impl_arity"].as_u64() else {
+            return true;
+        };
+        if node.metadata["conditional"] == true {
+            return false;
+        }
+        let Some(ty) = node.metadata["generic_impl_type"].as_str() else {
+            return false;
+        };
+        self.owners.get(&node.file).is_some_and(|package| {
+            self.modules
+                .get(&node.file)
+                .is_some_and(|modules| modules.iter().any(|m| &m.package == package))
+                && self.generic_owners.get(&(package.clone(), ty.into())) == Some(&arity)
+        })
+    }
     fn apply(&self, facts: &mut FileFacts) {
+        self.apply_paths(facts);
+        let mut blocked = BTreeMap::new();
+        for node in &mut facts.nodes {
+            if !self.generic_impl_known(node) {
+                node.binding_key = None;
+                node.metadata
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("binding_aliases");
+                if let Some(ty) = node.metadata["generic_impl_type"].as_str() {
+                    blocked.insert(node.id.clone(), format!("{ty}::"));
+                }
+            }
+        }
+        // Keep ordinary function/type references in an unsupported impl; only
+        // receiver calls that depended on its missing owner proof are removed.
+        for reference in &mut facts.references {
+            if reference.relation == "calls"
+                && let Some(prefix) = blocked.get(&reference.source)
+            {
+                reference
+                    .candidate_keys
+                    .retain(|key| !key.starts_with(prefix));
+            }
+        }
+    }
+    fn apply_paths(&self, facts: &mut FileFacts) {
         let Some(owner) = self.owners.get(&facts.path) else {
             return;
         };
@@ -2224,6 +2808,65 @@ fn merge_aliases(node: &mut Node, mut aliases: Vec<String>) {
 #[cfg(test)]
 mod source_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn swiftpm_literal_ast_comments_and_raw_snapshot_validation() {
+        let source = r#"// swift-tools-version: 6.0
+import PackageDescription
+let /* binding */ package = Package(
+    name: "Example", platforms: [.macOS(.v13)],
+    products: [.library(name: "Core", targets: ["Core"])],
+    dependencies: [.package(url: "https://example.invalid/library", from: "1.0.0")],
+    targets: [/* .target(name: "Fake") */ .target(/* argument */ name: "Core"),]
+)
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let targets =
+            swift_package(source, "").unwrap_or_else(|| panic!("{}", tree.root_node().to_sexp()));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].root, "Sources/Core");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Package.swift"), source).unwrap();
+        let paths = vec!["Package.swift".into()];
+        let inventory = Inventory::new(root.path(), &paths);
+        let swift = SwiftContext::discover(&inventory, &BTreeMap::new()).unwrap();
+        let changed = format!("{source}// only a comment changed\n");
+        let hash = |s: &str| blake3::hash(s.as_bytes()).to_hex().to_string();
+        swift
+            .validate_source("Package.swift", &hash(source))
+            .unwrap();
+        assert!(
+            swift
+                .validate_source("Package.swift", &hash(&changed))
+                .is_err()
+        );
+        std::fs::write(root.path().join("Package.swift"), &changed).unwrap();
+        let mut context = ProjectContext {
+            swift,
+            ..Default::default()
+        };
+        assert!(
+            context
+                .compiled_inventory(&inventory)
+                .unwrap_err()
+                .to_string()
+                .contains("Swift manifest")
+        );
+        let refreshed = SwiftContext::discover(&inventory, &BTreeMap::new()).unwrap();
+        assert_ne!(context.swift.fingerprint, refreshed.fingerprint);
+        // Uninventoried manifests are never probed, even though one exists on disk.
+        let inventory = Inventory::new(root.path(), &[]);
+        assert!(
+            SwiftContext::discover(&inventory, &BTreeMap::new())
+                .unwrap()
+                .source_hashes
+                .is_empty()
+        );
+    }
 
     #[test]
     fn compiled_and_template_proofs_reject_changed_source_snapshots() {

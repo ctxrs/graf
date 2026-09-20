@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Shared runtime reservations. Cloning options shares this budget through Arc.
@@ -22,8 +22,70 @@ pub struct SemanticBudget {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SemanticUsage {
+    /// Reserved generations: one per HTTP/generic adapter attempt; native
+    /// Claude reserves every permitted turn before starting the invocation.
     pub calls: usize,
+    /// Sum of per-generation maximum output allowances, never billed usage.
     pub reserved_output_tokens: u64,
+}
+
+/// Provider-reported counters for one attempted request. Missing counters remain
+/// unknown; these are not reservations or a claim about the provider's invoice.
+/// Input/output retain the provider's native definitions. Cache and reasoning
+/// counters may be subsets: never sum these fields to infer a token total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub provider: Provider,
+    pub requested_model: String,
+    pub reported_model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+impl ProviderUsage {
+    fn unknown(s: &SemanticOptions) -> Self {
+        Self {
+            provider: s.provider,
+            requested_model: s.model.clone(),
+            reported_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+        }
+    }
+}
+
+/// Optional run-local receipt collection, shared by cloned options. One receipt
+/// per reserved operation, including failures; a multi-turn native invocation
+/// still returns one aggregate receipt. Cache hits produce no receipts.
+/// This is deliberately separate from the budget and is never cached/hashed.
+#[derive(Debug, Default)]
+pub struct SemanticUsageRecorder(Mutex<Vec<ProviderUsage>>);
+
+impl SemanticUsageRecorder {
+    pub fn snapshot(&self) -> Result<Vec<ProviderUsage>> {
+        self.0
+            .lock()
+            .map(|v| v.clone())
+            .map_err(|_| anyhow::anyhow!("semantic usage lock poisoned"))
+    }
+
+    fn record(&self, usage: ProviderUsage) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("semantic usage lock poisoned"))?
+            .push(usage);
+        Ok(())
+    }
 }
 
 impl SemanticBudget {
@@ -42,14 +104,14 @@ impl SemanticBudget {
             .map_err(|_| anyhow::anyhow!("semantic budget lock poisoned"))
     }
 
-    fn reserve_call(&self, output_tokens: u32) -> Result<()> {
+    fn reserve_calls(&self, call_count: usize, output_tokens: u32) -> Result<()> {
         let mut usage = self
             .usage
             .lock()
             .map_err(|_| anyhow::anyhow!("semantic budget lock poisoned"))?;
         let calls = usage
             .calls
-            .checked_add(1)
+            .checked_add(call_count)
             .context("semantic call counter overflow")?;
         let tokens = usage
             .reserved_output_tokens
@@ -105,7 +167,8 @@ pub struct SemanticOptions {
     pub max_retries: u32,
     pub retry_delay_ms: u64,
     pub deduplicate: bool,
-    /// Bisect only explicitly truncated text generations, sharing the original budget.
+    /// Bisect truncated, known context-overflow or timed-out text requests.
+    /// All recovery shares the original call, output and wall-clock limits.
     pub max_split_depth: u32,
     pub temperature: Option<f64>,
     /// Provider-native thinking control; unsupported combinations fail validation.
@@ -113,6 +176,8 @@ pub struct SemanticOptions {
     pub extra_body: BTreeMap<String, Value>,
     #[serde(skip)]
     pub runtime_budget: Option<Arc<SemanticBudget>>,
+    #[serde(skip)]
+    pub runtime_usage: Option<Arc<SemanticUsageRecorder>>,
 }
 impl Default for SemanticOptions {
     fn default() -> Self {
@@ -139,6 +204,7 @@ impl Default for SemanticOptions {
             thinking: None,
             extra_body: BTreeMap::new(),
             runtime_budget: None,
+            runtime_usage: None,
         }
     }
 }
@@ -456,7 +522,7 @@ fn apply_controls(body: &mut Value, s: &SemanticOptions) {
     );
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Graph {
     nodes: Vec<Entity>,
@@ -464,7 +530,7 @@ struct Graph {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hyperedges: Vec<Group>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Group {
     id: String,
@@ -473,7 +539,7 @@ struct Group {
     confidence: f64,
     evidence: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Entity {
     id: String,
@@ -481,7 +547,7 @@ struct Entity {
     kind: String,
     evidence: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Relation {
     source: String,
@@ -637,8 +703,12 @@ fn enrich_source(
     let settings_hash = blake3::hash(&settings).to_hex().to_string();
     // Collect and validate every response before touching even the in-memory facts.
     let mut complete = Vec::new();
-    let mut remaining_calls = s.max_calls;
-    let mut remaining_output = s.max_total_output_tokens;
+    let mut budget = RequestBudget {
+        calls: s.max_calls,
+        output: s.max_total_output_tokens,
+        deadline: Instant::now() + Duration::from_secs(s.timeout_secs * s.max_calls as u64),
+        claude_schema: None,
+    };
     let mut pending: std::collections::VecDeque<_> = chunks
         .into_iter()
         .map(|(offset, text)| (offset, text, 0u32))
@@ -680,12 +750,18 @@ fn enrich_source(
                 Some(serde_json::from_value::<Graph>(value).context("malformed semantic cache")?)
             }
         } else {
-            match request(s, chunk, image, &mut remaining_calls, &mut remaining_output) {
+            match request(s, chunk, image, &mut budget) {
                 Ok(response) => Some(serde_json::from_str::<Graph>(&response).context(
                     "malformed/incomplete semantic graph JSON; previous graph retained",
                 )?),
                 Err(error)
-                    if error.is::<Truncated>() && image.is_none() && depth < s.max_split_depth =>
+                    if (error.is::<Truncated>()
+                        || matches!(
+                            error.downcast_ref::<Recovery>(),
+                            Some(Recovery::ContextOverflow | Recovery::Timeout)
+                        ))
+                        && image.is_none()
+                        && depth < s.max_split_depth =>
                 {
                     let target = chunk.len() / 2;
                     let midpoint = chunk
@@ -825,12 +901,86 @@ fn enrich_source(
     Ok(())
 }
 
+struct RequestBudget {
+    calls: usize,
+    output: u32,
+    // Preserve the pre-recovery upper bound: max_calls * per-attempt timeout.
+    // Backoff and capability discovery consume this same document deadline.
+    deadline: Instant,
+    claude_schema: Option<bool>,
+}
+
+#[derive(Debug)]
+enum Recovery {
+    ContextOverflow,
+    Timeout,
+    Hollow,
+    Transient,
+}
+impl std::fmt::Display for Recovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ContextOverflow => "semantic provider context limit exceeded",
+            Self::Timeout => "semantic provider timed out",
+            Self::Hollow => "semantic provider returned empty content",
+            Self::Transient => "semantic provider temporarily unavailable",
+        })
+    }
+}
+impl std::error::Error for Recovery {}
+
 fn request(
     s: &SemanticOptions,
     text: &str,
     image: Option<(&str, &str)>,
-    remaining_calls: &mut usize,
-    remaining_output: &mut u32,
+    budget: &mut RequestBudget,
+) -> Result<String> {
+    for attempt in 0..=s.max_retries {
+        let before = budget.calls;
+        let mut usage = ProviderUsage::unknown(s);
+        let result = request_once(s, text, image, budget, &mut usage).and_then(|text| {
+            if text.trim().is_empty() {
+                Err(Recovery::Hollow.into())
+            } else {
+                Ok(text)
+            }
+        });
+        if budget.calls < before
+            && let Some(recorder) = &s.runtime_usage
+        {
+            recorder.record(usage)?;
+        }
+        match result {
+            Err(error)
+                if attempt < s.max_retries
+                    && matches!(
+                        error.downcast_ref::<Recovery>(),
+                        Some(Recovery::Hollow | Recovery::Transient)
+                    ) =>
+            {
+                ensure!(
+                    budget.calls > 0 && budget.output >= s.max_output_tokens,
+                    "semantic retry exceeds remaining call/token budget"
+                );
+                let delay = Duration::from_millis(s.retry_delay_ms);
+                ensure!(
+                    budget.deadline.saturating_duration_since(Instant::now()) > delay,
+                    "semantic recovery deadline exhausted"
+                );
+                std::thread::sleep(delay);
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+fn request_once(
+    s: &SemanticOptions,
+    text: &str,
+    image: Option<(&str, &str)>,
+    budget: &mut RequestBudget,
+    usage: &mut ProviderUsage,
 ) -> Result<String> {
     let instructions = if image.is_some() {
         INSTRUCTIONS.replace("Evidence must be a nonempty verbatim substring of the document.", "Evidence must describe a specific visible region of the image; do not claim text verification.")
@@ -839,14 +989,7 @@ fn request(
     };
     let prompt = text.to_owned();
     if matches!(s.provider, Provider::Bedrock | Provider::ClaudeCli) {
-        return cli_family(
-            s,
-            &instructions,
-            &prompt,
-            image,
-            remaining_calls,
-            remaining_output,
-        );
+        return cli_family(s, &instructions, &prompt, image, budget, usage);
     }
     if s.provider == Provider::Cli {
         let mut payload = json!({"model":s.model,"instructions":instructions,"input":text,"max_output_tokens":s.max_output_tokens,"image":image.map(|(mime,data)|json!({"mime_type":mime,"base64":data}))});
@@ -858,14 +1001,19 @@ fn request(
             .iter()
             .map(|a| a.replace("{model}", &s.model))
             .collect();
-        reserve_call(s, remaining_calls, remaining_output)?;
-        return super::convert::run(
-            &adapter,
-            None,
-            Some(&payload),
-            s.timeout_secs,
-            s.max_response_bytes,
-        );
+        reserve_calls(s, budget, 1)?;
+        return String::from_utf8(
+            super::convert::run_bytes_until(
+                &adapter,
+                None,
+                Some(&payload),
+                attempt_deadline(s, budget),
+                s.max_response_bytes,
+                &[],
+            )
+            .map_err(command_error)?,
+        )
+        .context("CLI provider output is not UTF-8");
     }
     let messages =
         json!([{"role":"system","content":instructions},{"role":"user","content":prompt}]);
@@ -908,7 +1056,7 @@ fn request(
     }
     apply_controls(&mut body, s);
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(s.timeout_secs))
+        .timeout(attempt_deadline(s, budget).saturating_duration_since(Instant::now()))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut endpoint = s.endpoint.clone();
@@ -941,45 +1089,46 @@ fn request(
         };
     }
     // Do not put URLs, response bodies, or credentials into diagnostics.
-    let mut attempt = 0;
-    let response = loop {
-        let attempt_request = request
-            .try_clone()
-            .context("cannot clone provider request")?;
-        reserve_call(s, remaining_calls, remaining_output)?;
-        let response = attempt_request
-            .send()
-            .map_err(|_| anyhow::anyhow!("semantic provider request failed"))?;
-        if (response.status().as_u16() == 429 || response.status().is_server_error())
-            && attempt < s.max_retries
-        {
-            attempt += 1;
-            drop(response);
-            ensure!(
-                *remaining_calls > 0 && *remaining_output >= s.max_output_tokens,
-                "semantic retry exceeds remaining call/token budget"
-            );
-            std::thread::sleep(Duration::from_millis(s.retry_delay_ms));
-            continue;
+    reserve_calls(s, budget, 1)?;
+    let response = request.send().map_err(|error| {
+        if error.is_timeout() {
+            anyhow::Error::new(Recovery::Timeout)
+        } else {
+            anyhow::anyhow!("semantic provider request failed")
         }
-        break response;
-    };
-    ensure!(
-        response.status().is_success(),
-        "semantic provider returned HTTP {}",
-        response.status()
-    );
+    })?;
+    let status = response.status();
     let mut bytes = Vec::new();
     response
         .take(s.max_response_bytes as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("semantic provider response read failed"))?;
+        .map_err(|error| {
+            if io_timeout(&error) {
+                anyhow::Error::new(Recovery::Timeout)
+            } else {
+                anyhow::anyhow!("semantic provider response read failed")
+            }
+        })?;
     ensure!(
         bytes.len() <= s.max_response_bytes,
         "semantic provider response exceeds byte limit"
     );
-    let response: Value =
-        serde_json::from_slice(&bytes).context("invalid semantic provider JSON response")?;
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    if let Ok(value) = &parsed {
+        read_usage(usage, value);
+    }
+    if status.as_u16() == 429 || status.is_server_error() {
+        return Err(Recovery::Transient.into());
+    }
+    if !status.is_success() {
+        if matches!(status.as_u16(), 400 | 413 | 422)
+            && parsed.as_ref().is_ok_and(known_context_overflow)
+        {
+            return Err(Recovery::ContextOverflow.into());
+        }
+        anyhow::bail!("semantic provider returned HTTP {status}");
+    }
+    let response = parsed.context("invalid semantic provider JSON response")?;
     let content = match s.provider {
         Provider::OpenAi | Provider::Azure => {
             if response["choices"][0]["finish_reason"] == "length" {
@@ -1039,20 +1188,139 @@ fn request(
         }
         Provider::Cli | Provider::Bedrock | Provider::ClaudeCli => unreachable!(),
     };
-    content.context("semantic provider returned no text")
+    content.ok_or_else(|| Recovery::Hollow.into())
 }
 
-fn reserve_call(s: &SemanticOptions, calls: &mut usize, output: &mut u32) -> Result<()> {
+fn attempt_deadline(s: &SemanticOptions, budget: &RequestBudget) -> Instant {
+    budget
+        .deadline
+        .min(Instant::now() + Duration::from_secs(s.timeout_secs))
+}
+
+fn command_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<super::convert::CommandTimeout>() {
+        Recovery::Timeout.into()
+    } else {
+        error
+    }
+}
+
+fn io_timeout(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return true;
+    }
+    let mut source = error
+        .get_ref()
+        .map(|e| e as &(dyn std::error::Error + 'static));
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn known_context_overflow(value: &Value) -> bool {
+    // Explicit protocol codes only. Never classify arbitrary provider prose,
+    // authentication errors, malformed graphs or user content as size failures.
+    [
+        value.pointer("/error/code"),
+        value.pointer("/error/type"),
+        value.get("error_code"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .any(|code| {
+        matches!(
+            code,
+            "context_length_exceeded" | "prompt_too_long" | "context_window_exceeded"
+        )
+    })
+}
+
+fn reserve_calls(s: &SemanticOptions, budget: &mut RequestBudget, calls: usize) -> Result<()> {
+    let output = u32::try_from(calls)?
+        .checked_mul(s.max_output_tokens)
+        .context("semantic output reservation overflow")?;
     ensure!(
-        *calls > 0 && *output >= s.max_output_tokens,
+        Instant::now() < budget.deadline,
+        "semantic recovery deadline exhausted"
+    );
+    ensure!(
+        calls > 0 && budget.calls >= calls && budget.output >= output,
         "semantic call/token budget exhausted"
     );
-    if let Some(budget) = &s.runtime_budget {
-        budget.reserve_call(s.max_output_tokens)?;
+    // Check local dimensions first; shared calls and tokens commit under one
+    // lock. Nothing below can fail, so rejection leaves both budgets untouched.
+    if let Some(shared) = &s.runtime_budget {
+        shared.reserve_calls(calls, output)?;
     }
-    *calls -= 1;
-    *output -= s.max_output_tokens;
+    budget.calls -= calls;
+    budget.output -= output;
     Ok(())
+}
+
+fn read_usage(receipt: &mut ProviderUsage, value: &Value) {
+    let usage = &value["usage"];
+    receipt.reported_model = value["model"]
+        .as_str()
+        .or_else(|| value["modelVersion"].as_str())
+        .filter(|v| v.len() <= 256)
+        .map(str::to_owned);
+    match receipt.provider {
+        Provider::OpenAi | Provider::Azure => {
+            receipt.input_tokens = usage["prompt_tokens"].as_u64();
+            receipt.output_tokens = usage["completion_tokens"].as_u64();
+            receipt.total_tokens = usage["total_tokens"].as_u64();
+            receipt.cache_read_input_tokens =
+                usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+            receipt.reasoning_tokens =
+                usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
+        }
+        Provider::Anthropic | Provider::ClaudeCli => {
+            receipt.input_tokens = usage["input_tokens"].as_u64();
+            receipt.output_tokens = usage["output_tokens"].as_u64();
+            receipt.cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64();
+            receipt.cache_creation_input_tokens = usage["cache_creation_input_tokens"].as_u64();
+            if receipt.provider == Provider::ClaudeCli {
+                receipt.cost_usd = value["total_cost_usd"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0);
+                if let Some(models) = value["modelUsage"].as_object().filter(|v| !v.is_empty()) {
+                    receipt.reported_model = if models.len() == 1 {
+                        models.keys().next().filter(|v| v.len() <= 256).cloned()
+                    } else {
+                        None // Aggregate usage cannot be assigned to one of several models.
+                    };
+                }
+            }
+        }
+        Provider::Gemini => {
+            let usage = &value["usageMetadata"];
+            receipt.input_tokens = usage["promptTokenCount"].as_u64();
+            receipt.output_tokens = usage["candidatesTokenCount"].as_u64();
+            receipt.total_tokens = usage["totalTokenCount"].as_u64();
+            receipt.cache_read_input_tokens = usage["cachedContentTokenCount"].as_u64();
+            receipt.reasoning_tokens = usage["thoughtsTokenCount"].as_u64();
+        }
+        Provider::Ollama => {
+            receipt.input_tokens = value["prompt_eval_count"].as_u64();
+            receipt.output_tokens = value["eval_count"].as_u64();
+        }
+        Provider::Bedrock => {
+            receipt.input_tokens = usage["inputTokens"].as_u64();
+            receipt.output_tokens = usage["outputTokens"].as_u64();
+            receipt.total_tokens = usage["totalTokens"].as_u64();
+            receipt.cache_read_input_tokens = usage["cacheReadInputTokens"].as_u64();
+            receipt.cache_creation_input_tokens = usage["cacheWriteInputTokens"].as_u64();
+        }
+        Provider::Cli => {} // The generic adapter's contract is bare graph JSON.
+    }
 }
 
 fn deduplicate(facts: &mut FileFacts, start: usize) {
@@ -1101,8 +1369,8 @@ fn cli_family(
     instructions: &str,
     prompt: &str,
     image: Option<(&str, &str)>,
-    remaining_calls: &mut usize,
-    remaining_output: &mut u32,
+    budget: &mut RequestBudget,
+    usage: &mut ProviderUsage,
 ) -> Result<String> {
     let mut adapter = s.command.clone().unwrap_or_else(|| {
         if s.provider == Provider::Bedrock {
@@ -1116,6 +1384,13 @@ fn cli_family(
         .iter()
         .map(|a| a.replace("{model}", &s.model))
         .collect();
+    let turns = if s.provider == Provider::ClaudeCli && image.is_some() {
+        3
+    } else {
+        1
+    };
+    // Keep the snapshot alive until the subprocess (and its process group) exits.
+    let mut image_file = None;
     let payload = if s.provider == Provider::Bedrock {
         let mut content = vec![json!({"text":prompt})];
         if let Some((mime, data)) = image {
@@ -1125,11 +1400,81 @@ fn cli_family(
         apply_controls(&mut payload, s);
         serde_json::to_vec(&payload)?
     } else {
-        ensure!(
-            image.is_none(),
-            "Claude CLI pixel transport requires a configured generic CLI adapter or local OCR; use an HTTP vision provider for direct pixels"
+        let mut prompt = format!(
+            "{instructions}\n\nNow extract the graph. Return only the specified JSON object.\n\n{prompt}"
         );
-        format!("{instructions}\n\n{prompt}").into_bytes()
+        if let Some((mime, data)) = image {
+            // Native vision requires the restricted recipe. Arbitrary adapters
+            // retain their explicit generic CLI route; do not silently widen tools.
+            let native: Vec<_> = CommandAdapter::claude_cli()
+                .args
+                .iter()
+                .map(|a| a.replace("{model}", &s.model))
+                .collect();
+            ensure!(
+                !adapter.output_file && adapter.args.ends_with(&native),
+                "Claude CLI vision requires the native restricted command recipe"
+            );
+            let max_turns = adapter
+                .args
+                .iter()
+                .rposition(|a| a == "--max-turns")
+                .context("Claude CLI turn limit missing")?;
+            adapter.args[max_turns + 1] = turns.to_string();
+            let suffix = match mime {
+                "image/png" => ".png",
+                "image/jpeg" => ".jpg",
+                "image/gif" => ".gif",
+                "image/webp" => ".webp",
+                _ => anyhow::bail!("unsupported Claude CLI image type"),
+            };
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+            ensure!(
+                bytes.len() <= s.max_image_bytes,
+                "image exceeds semantic image byte limit"
+            );
+            let directory = super::convert::private_tempdir()?;
+            let mut file = tempfile::Builder::new()
+                .prefix("graf-image-")
+                .suffix(suffix)
+                .tempfile_in(directory.path())?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            let path = file.path().canonicalize()?;
+            let path = path
+                .to_str()
+                .context("Claude CLI image path must be UTF-8")?
+                .replace('\\', "/");
+            // Read rules use // for absolute paths. Reject glob/rule delimiters
+            // from an unusual temp directory instead of widening the allowlist.
+            ensure!(
+                !path.contains(['*', '?', '[', ']', '(', ')', ','])
+                    && !path.chars().any(char::is_control),
+                "temporary image path cannot be expressed as an exact Read rule"
+            );
+            let tools = adapter
+                .args
+                .iter()
+                .rposition(|a| a == "--tools")
+                .context("Claude CLI tools missing")?;
+            adapter.args[tools + 1] = "Read".into();
+            adapter.args.extend([
+                "--add-dir".into(),
+                directory
+                    .path()
+                    .canonicalize()?
+                    .to_str()
+                    .context("Claude CLI image directory must be UTF-8")?
+                    .into(),
+                "--allowedTools".into(),
+                format!("Read(//{})", path.trim_start_matches('/')),
+                "--permission-mode".into(),
+                "dontAsk".into(),
+            ]);
+            prompt.push_str(&format!("\nUse Read to view the image at this exact JSON-quoted path: {}. Extract only visible evidence.", serde_json::to_string(&path)?));
+            image_file = Some((file, directory));
+        }
+        prompt.into_bytes()
     };
     let env = if s.provider == Provider::ClaudeCli {
         vec![(
@@ -1139,16 +1484,63 @@ fn cli_family(
     } else {
         vec![]
     };
-    reserve_call(s, remaining_calls, remaining_output)?;
-    let bytes = super::convert::run_bytes_env(
+    // Reserve the entire native turn allowance before any subprocess, including
+    // capability discovery. No partial reservation or refund of unused turns.
+    reserve_calls(s, budget, turns)?;
+    if s.provider == Provider::ClaudeCli {
+        let schema = if let Some(supported) = budget.claude_schema {
+            supported
+        } else {
+            let supported = claude_schema_supported(
+                &adapter,
+                attempt_deadline(s, budget),
+                s.max_response_bytes,
+            );
+            budget.claude_schema = Some(supported);
+            supported
+        };
+        if schema {
+            adapter.args.extend([
+                "--json-schema".into(),
+                serde_json::to_string(&schemars::schema_for!(Graph))?,
+            ]);
+        }
+    }
+    let (bytes, success) = super::convert::run_provider_until(
         &adapter,
         None,
         Some(&payload),
-        s.timeout_secs,
+        attempt_deadline(s, budget),
         s.max_response_bytes,
         &env,
-    )?;
+    )
+    .map_err(command_error)?;
+    drop(image_file);
+    ensure!(
+        success || !bytes.iter().all(u8::is_ascii_whitespace),
+        "CLI provider exited unsuccessfully without a JSON response (output omitted to protect credentials)"
+    );
     let value: Value = serde_json::from_slice(&bytes).context("invalid CLI provider response")?;
+    let value = if s.provider == Provider::ClaudeCli {
+        if let Some(events) = value.as_array() {
+            events
+                .iter()
+                .rev()
+                .find(|e| e["type"] == "result")
+                .context("Claude CLI has no result event")?
+        } else {
+            &value
+        }
+    } else {
+        &value
+    };
+    read_usage(usage, value);
+    if !success || value["is_error"] == true {
+        if known_context_overflow(value) {
+            return Err(Recovery::ContextOverflow.into());
+        }
+        anyhow::bail!("CLI provider response incomplete/failed");
+    }
     if s.provider == Provider::Bedrock {
         if value["stopReason"] == "max_tokens" {
             return Err(Truncated.into());
@@ -1160,17 +1552,8 @@ fn cli_family(
         return value["output"]["message"]["content"]
             .as_array()
             .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
-            .context("Bedrock response has no text");
+            .ok_or_else(|| Recovery::Hollow.into());
     }
-    let value = if let Some(events) = value.as_array() {
-        events
-            .iter()
-            .rev()
-            .find(|e| e["type"] == "result")
-            .context("Claude CLI has no result event")?
-    } else {
-        &value
-    };
     if value["stop_reason"] == "max_tokens" {
         return Err(Truncated.into());
     }
@@ -1180,12 +1563,39 @@ fn cli_family(
     );
     ensure!(
         value["stop_reason"].is_null() || value["stop_reason"] == "end_turn",
-        "Claude CLI response truncated"
+        "Claude CLI response incomplete/refused"
     );
+    if let Some(structured) = value.get("structured_output").filter(|v| !v.is_null()) {
+        ensure!(
+            structured.is_object(),
+            "Claude CLI structured output must be an object"
+        );
+        return Ok(serde_json::to_string(structured)?);
+    }
     value["result"]
         .as_str()
         .map(str::to_owned)
-        .context("Claude CLI result has no text")
+        .ok_or_else(|| Recovery::Hollow.into())
+}
+
+fn claude_schema_supported(adapter: &CommandAdapter, deadline: Instant, limit: usize) -> bool {
+    // Probe the executable/wrapper prefix, not an inference invocation. Cache
+    // per document so another configured executable cannot inherit the result.
+    let Some(print) = adapter
+        .args
+        .iter()
+        .position(|arg| matches!(arg.as_str(), "--print" | "-p"))
+    else {
+        return false;
+    };
+    let mut probe = adapter.clone();
+    probe.args.truncate(print);
+    probe.args.push("--help".into());
+    probe.output_file = false;
+    super::convert::run_bytes_until(&probe, None, None, deadline, limit, &[])
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|help| help.split_whitespace().any(|word| word == "--json-schema"))
 }
 
 #[derive(Debug)]
@@ -1314,4 +1724,123 @@ pub fn remove_semantic_cache_entry(dir: &Path, key: &str) -> Result<bool> {
     }
     std::fs::remove_file(path)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn expired_recovery_deadline_never_reserves_or_starts_a_call() {
+        let shared = Arc::new(SemanticBudget::new(Some(3), None));
+        let recorder = Arc::new(SemanticUsageRecorder::default());
+        let s = SemanticOptions {
+            provider: Provider::Cli,
+            command: Some(CommandAdapter {
+                program: "must-not-be-started".into(),
+                ..Default::default()
+            }),
+            runtime_budget: Some(shared.clone()),
+            runtime_usage: Some(recorder.clone()),
+            ..Default::default()
+        };
+        let mut budget = RequestBudget {
+            calls: 3,
+            output: 8192,
+            deadline: Instant::now(),
+            claude_schema: None,
+        };
+        let error = request(&s, "Alpha", None, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert_eq!(shared.usage().unwrap().calls, 0);
+        assert!(recorder.snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeout_recovery_uses_error_types_not_messages() {
+        let typed = command_error(super::super::convert::CommandTimeout.into());
+        assert!(matches!(
+            typed.downcast_ref::<Recovery>(),
+            Some(Recovery::Timeout)
+        ));
+        let prose = command_error(anyhow::anyhow!("converter/provider timed out"));
+        assert!(!prose.is::<Recovery>());
+        assert!(io_timeout(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!io_timeout(&std::io::Error::other("timed out")));
+    }
+    #[test]
+    fn aggregate_cli_usage_does_not_claim_a_single_model_or_sum_cache_counts() {
+        let s = SemanticOptions {
+            provider: Provider::ClaudeCli,
+            ..Default::default()
+        };
+        let mut receipt = ProviderUsage::unknown(&s);
+        read_usage(
+            &mut receipt,
+            &json!({
+                "model":"first-model",
+                "modelUsage":{"first-model":{},"second-model":{}},
+                "usage":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":7},
+                "total_cost_usd":-1
+            }),
+        );
+        assert!(receipt.reported_model.is_none());
+        assert_eq!(receipt.input_tokens, Some(0));
+        assert_eq!(receipt.cache_read_input_tokens, Some(7));
+        assert_eq!(receipt.total_tokens, None);
+        assert_eq!(receipt.cost_usd, None);
+    }
+
+    #[test]
+    fn multi_turn_reservations_are_atomic_across_file_and_shared_limits() {
+        for (file_calls, file_output, shared_calls, shared_output) in [
+            (2, 6144, 3, 6144),
+            (3, 4096, 3, 6144),
+            (3, 6144, 2, 6144),
+            (3, 6144, 3, 4096),
+        ] {
+            let shared = Arc::new(SemanticBudget::new(Some(shared_calls), Some(shared_output)));
+            let s = SemanticOptions {
+                runtime_budget: Some(shared.clone()),
+                ..Default::default()
+            };
+            let mut budget = RequestBudget {
+                calls: file_calls,
+                output: file_output,
+                deadline: Instant::now() + Duration::from_secs(60),
+                claude_schema: None,
+            };
+            assert!(reserve_calls(&s, &mut budget, 3).is_err());
+            assert_eq!((budget.calls, budget.output), (file_calls, file_output));
+            assert_eq!(shared.usage().unwrap().calls, 0);
+            assert_eq!(shared.usage().unwrap().reserved_output_tokens, 0);
+            // Nearest ordinary operation is still admitted after rejection.
+            reserve_calls(&s, &mut budget, 1).unwrap();
+            assert_eq!(
+                (budget.calls, budget.output),
+                (file_calls - 1, file_output - 2048)
+            );
+            assert_eq!(shared.usage().unwrap().calls, 1);
+            assert_eq!(shared.usage().unwrap().reserved_output_tokens, 2048);
+        }
+        let shared = Arc::new(SemanticBudget::new(Some(3), Some(6144)));
+        let s = SemanticOptions {
+            runtime_budget: Some(shared.clone()),
+            ..Default::default()
+        };
+        let mut budget = RequestBudget {
+            calls: 3,
+            output: 6144,
+            deadline: Instant::now() + Duration::from_secs(60),
+            claude_schema: None,
+        };
+        reserve_calls(&s, &mut budget, 3).unwrap();
+        assert_eq!((budget.calls, budget.output), (0, 0));
+        assert!(reserve_calls(&s, &mut budget, 1).is_err());
+        assert_eq!((budget.calls, budget.output), (0, 0));
+        assert_eq!(shared.usage().unwrap().calls, 3);
+        assert_eq!(shared.usage().unwrap().reserved_output_tokens, 6144);
+    }
 }

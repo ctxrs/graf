@@ -173,15 +173,13 @@ impl ExtractionArgs {
             options.semantic_code = false;
         }
         if let Some(name) = &self.provider {
-            let settings = if let Some(provider) = builtin(name) {
-                ensure!(
-                    provider == Provider::OpenAi || self.model.is_some(),
-                    "name a model explicitly for this provider with --model"
-                );
-                SemanticOptions {
-                    provider,
-                    ..Default::default()
-                }
+            let settings = if builtin(name).is_some() {
+                preset(
+                    name,
+                    self.model.as_deref(),
+                    self.endpoint.as_deref(),
+                    self.key_env.as_deref(),
+                )?
             } else {
                 let mut registry = read_registry(&global_registry()?)?;
                 registry.extend(read_registry(&root.join(".graf/providers.json"))?);
@@ -200,6 +198,10 @@ impl ExtractionArgs {
                 settings.model = model.clone();
             }
             if let Some(endpoint) = &self.endpoint {
+                // Changing destinations does not authorize forwarding a saved key.
+                if endpoint != &settings.endpoint && self.key_env.is_none() {
+                    settings.key_env = None;
+                }
                 settings.endpoint = endpoint.clone();
             }
             if let Some(key) = &self.key_env {
@@ -279,6 +281,16 @@ pub struct ProviderArgs {
 #[derive(Debug, Subcommand)]
 pub enum ProviderCommand {
     List,
+    /// Inspect environment-name presence and executable paths; never contacts providers or runs commands.
+    Detect,
+    /// Print a validated SemanticOptions JSON preset without saving or enabling it.
+    Template(ProviderPresetArgs),
+    /// Save a new named preset; does not enable extraction or replace an existing name.
+    Setup {
+        name: String,
+        #[command(flatten)]
+        settings: ProviderPresetArgs,
+    },
     Show {
         name: String,
     },
@@ -290,6 +302,32 @@ pub enum ProviderCommand {
     Remove {
         name: String,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderPresetArgs {
+    /// open_ai (or openai), anthropic, gemini, ollama, azure, bedrock, or claude_cli.
+    pub preset: String,
+    /// Required except for OpenAI, which defaults to gpt-6-astra even with a custom endpoint.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Full HTTP request URL; required for Azure. Overrides never infer a key environment name.
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// API key environment variable name, never its value. Explicitly set for custom endpoints.
+    #[arg(long)]
+    pub key_env: Option<String>,
+}
+
+impl ProviderPresetArgs {
+    fn options(&self) -> Result<SemanticOptions> {
+        preset(
+            &self.preset,
+            self.model.as_deref(),
+            self.endpoint.as_deref(),
+            self.key_env.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Args)]
@@ -339,6 +377,172 @@ const BUILTINS: [&str; 8] = [
     "bedrock",
     "claude_cli",
 ];
+const PRESETS: [&str; 7] = [
+    "open_ai",
+    "anthropic",
+    "gemini",
+    "ollama",
+    "azure",
+    "bedrock",
+    "claude_cli",
+];
+
+fn preset(
+    name: &str,
+    model: Option<&str>,
+    endpoint: Option<&str>,
+    key_env: Option<&str>,
+) -> Result<SemanticOptions> {
+    let provider = builtin(name).context("unknown preset; use provider list")?;
+    let (route, key, command) = match provider {
+        Provider::OpenAi => (
+            "https://api.openai.com/v1/chat/completions",
+            Some("OPENAI_API_KEY"),
+            None,
+        ),
+        Provider::Anthropic => (
+            "https://api.anthropic.com/v1/messages",
+            Some("ANTHROPIC_API_KEY"),
+            None,
+        ),
+        Provider::Gemini => (
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            Some("GEMINI_API_KEY"),
+            None,
+        ),
+        Provider::Ollama => ("http://localhost:11434/api/chat", None, None),
+        Provider::Azure => ("", None, None),
+        Provider::Bedrock => ("", None, Some(CommandAdapter::bedrock())),
+        Provider::ClaudeCli => ("", None, Some(CommandAdapter::claude_cli())),
+        Provider::Cli => {
+            bail!("generic CLI adapters require explicit JSON; use provider add NAME FILE")
+        }
+    };
+    ensure!(
+        command.is_none() || (endpoint.is_none() && key_env.is_none()),
+        "CLI presets use the command's authentication; --endpoint and --key-env are HTTP-only"
+    );
+    ensure!(
+        provider != Provider::Azure || endpoint.is_some(),
+        "Azure requires --endpoint with the full deployment request URL and --key-env for API-key authentication"
+    );
+    let model = model
+        .or_else(|| (provider == Provider::OpenAi).then_some("gpt-6-astra"))
+        .context("name a model explicitly for this preset with --model")?;
+    let settings = SemanticOptions {
+        provider,
+        model: model.into(),
+        endpoint: endpoint.unwrap_or(route).into(),
+        // An endpoint override may be a local server or a different account.
+        // Only an explicit key name may accompany that override.
+        key_env: key_env
+            .or_else(|| endpoint.is_none().then_some(key).flatten())
+            .map(str::to_owned),
+        command,
+        ..Default::default()
+    };
+    validate_provider(&settings)?;
+    Ok(settings)
+}
+
+fn validate_provider(settings: &SemanticOptions) -> Result<()> {
+    ingest::config_fingerprint(&ingest::IngestOptions {
+        semantic: Some(settings.clone()),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
+// Resolve only files on PATH. Never invoke a discovered executable (even --help).
+fn installed_command(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidates = if cfg!(windows) && Path::new(program).extension().is_none() {
+            vec![
+                directory.join(format!("{program}.exe")),
+                directory.join(format!("{program}.cmd")),
+                directory.join(program),
+            ]
+        } else {
+            vec![directory.join(program)]
+        };
+        for candidate in candidates {
+            let Ok(metadata) = candidate.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            // Keep executable shims/symlinks intact; some dispatch by their name.
+            if let Ok(path) = std::path::absolute(candidate) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn detect_providers() -> serde_json::Value {
+    let providers: Vec<_> = PRESETS
+        .iter()
+        .map(|name| {
+            let (names, command): (&[&str], Option<String>) = match *name {
+                "open_ai" => (&["OPENAI_API_KEY"], None),
+                "anthropic" => (&["ANTHROPIC_API_KEY"], None),
+                "gemini" => (&["GEMINI_API_KEY", "GOOGLE_API_KEY"], None),
+                "ollama" => (&["OLLAMA_HOST", "OLLAMA_API_KEY"], Some("ollama".into())),
+                "azure" => (&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"], None),
+                "bedrock" => (
+                    &[
+                        "AWS_PROFILE",
+                        "AWS_REGION",
+                        "AWS_DEFAULT_REGION",
+                        "AWS_ACCESS_KEY_ID",
+                        "AWS_SECRET_ACCESS_KEY",
+                        "AWS_SESSION_TOKEN",
+                    ],
+                    Some(CommandAdapter::bedrock().program),
+                ),
+                "claude_cli" => (&[], Some(CommandAdapter::claude_cli().program)),
+                _ => unreachable!(),
+            };
+            let environment: BTreeMap<_, _> = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name).is_some()))
+                .collect();
+            let command = command
+                .map(|name| serde_json::json!({"path":installed_command(&name),"name":name}));
+            serde_json::json!({"preset":name,"environment":environment,"command":command,
+            "model_required":*name != "open_ai","endpoint_required":*name == "azure"})
+        })
+        .collect();
+    serde_json::json!({"providers":providers,
+        "note":"Presence only, including empty variables; authentication, CLI versions and service availability are not checked. Nothing is selected or saved. Use provider template PRESET or provider setup NAME PRESET; extraction requires --provider. Alternate keys and endpoints require explicit flags."})
+}
+
+fn validate_provider_name(name: &str) -> Result<()> {
+    ensure!(
+        builtin(name).is_none(),
+        "built-in providers cannot be replaced"
+    );
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)),
+        "invalid provider name"
+    );
+    Ok(())
+}
+
 fn builtin(name: &str) -> Option<Provider> {
     match name {
         "open_ai" | "openai" => Some(Provider::OpenAi),
@@ -379,6 +583,14 @@ fn read_registry(path: &Path) -> Result<BTreeMap<String, SemanticOptions>> {
     serde_json::from_slice(&bounded(path)?).context("invalid provider registry")
 }
 pub fn provider(args: &ProviderArgs) -> Result<serde_json::Value> {
+    // Discovery and templates need neither a registry nor a home directory.
+    match &args.command {
+        ProviderCommand::Detect => return Ok(detect_providers()),
+        ProviderCommand::Template(settings) => {
+            return Ok(serde_json::to_value(settings.options()?)?);
+        }
+        _ => {}
+    }
     let path = match &args.project {
         Some(root) => root.join(".graf/providers.json"),
         None => global_registry()?,
@@ -387,7 +599,7 @@ pub fn provider(args: &ProviderArgs) -> Result<serde_json::Value> {
     match &args.command {
         ProviderCommand::List => {
             return Ok(
-                serde_json::json!({"builtins":BUILTINS,"custom":registry.keys().collect::<Vec<_>>()}),
+                serde_json::json!({"builtins":BUILTINS,"presets":PRESETS,"custom":registry.keys().collect::<Vec<_>>()}),
             );
         }
         ProviderCommand::Show { name } => {
@@ -400,24 +612,26 @@ pub fn provider(args: &ProviderArgs) -> Result<serde_json::Value> {
                 .map_err(Into::into);
         }
         ProviderCommand::Add { name, file } => {
-            ensure!(
-                builtin(name).is_none(),
-                "built-in providers cannot be replaced"
-            );
-            ensure!(
-                !name.is_empty()
-                    && name.len() <= 64
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)),
-                "invalid provider name"
-            );
+            validate_provider_name(name)?;
             let settings: SemanticOptions = serde_json::from_slice(&bounded(file)?)
                 .context("invalid provider configuration")?;
-            ingest::config_fingerprint(&ingest::IngestOptions {
-                semantic: Some(settings.clone()),
-                ..Default::default()
-            })?;
+            validate_provider(&settings)?;
+            registry.insert(name.clone(), settings);
+        }
+        ProviderCommand::Setup { name, settings } => {
+            validate_provider_name(name)?;
+            ensure!(
+                !registry.contains_key(name),
+                "provider already exists; use a new name or explicitly remove it before setup"
+            );
+            let mut settings = settings.options()?;
+            if let Some(command) = &mut settings.command {
+                let path = installed_command(&command.program).context("preset executable not found on PATH; install it first or use provider template for a portable JSON recipe")?;
+                command.program = path
+                    .to_str()
+                    .context("executable path must be UTF-8")?
+                    .into();
+            }
             registry.insert(name.clone(), settings);
         }
         ProviderCommand::Remove { name } => {
@@ -426,6 +640,7 @@ pub fn provider(args: &ProviderArgs) -> Result<serde_json::Value> {
             }
             ensure!(registry.remove(name).is_some(), "provider not found");
         }
+        ProviderCommand::Detect | ProviderCommand::Template(_) => unreachable!(),
     }
     let parent = path.parent().context("registry has no parent")?;
     std::fs::create_dir_all(parent)?;

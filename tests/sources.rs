@@ -363,17 +363,20 @@ fn renaming_a_managed_source_does_not_authorize_semantic_loss() {
     let bytes = fs::read(&cache).unwrap();
     let before = Store::open_read_only(&db).unwrap().snapshot().unwrap();
     fs::write(fixture.path().join("count"), "0").unwrap();
-    assert!(
-        sources::add_and_index(
-            root.path(),
-            &db,
-            source,
-            Some("smaller.md"),
-            &options,
-            &capture
-        )
-        .is_err()
-    );
+    let error = sources::add_and_index(
+        root.path(),
+        &db,
+        source,
+        Some("smaller.md"),
+        &options,
+        &capture,
+    )
+    .unwrap_err();
+    let receipt = error.downcast_ref::<index::FailedSemanticUsage>().unwrap();
+    assert_eq!(receipt.semantic_usage.unwrap().calls, 1);
+    assert_eq!(receipt.provider_usage.len(), 1);
+    assert!(receipt.provider_usage[0].output_tokens.is_none());
+    assert!(!receipt.usage_unavailable);
     assert_eq!(fs::read(&cache).unwrap(), bytes);
     assert_eq!(
         Store::open_read_only(&db)
@@ -501,17 +504,20 @@ fn corpus_budget_is_shared_by_capture_and_local_files_and_cache_hits_are_free() 
     options.max_semantic_calls = Some(1);
     options.ingest.semantic.as_mut().unwrap().cache_dir = Some(fixture.path().join("cache"));
     let capture = Default::default();
-    assert!(
-        sources::add_and_index(
-            root.path(),
-            &db,
-            source.to_str().unwrap(),
-            None,
-            &options,
-            &capture
-        )
-        .is_err()
-    );
+    let error = sources::add_and_index(
+        root.path(),
+        &db,
+        source.to_str().unwrap(),
+        None,
+        &options,
+        &capture,
+    )
+    .unwrap_err();
+    let receipt = error.downcast_ref::<index::FailedSemanticUsage>().unwrap();
+    assert_eq!(receipt.semantic_usage.unwrap().calls, 1);
+    assert_eq!(receipt.provider_usage.len(), 1);
+    assert!(receipt.provider_usage[0].output_tokens.is_none());
+    assert!(!receipt.usage_unavailable);
     assert_eq!(
         fs::read_to_string(fixture.path().join("calls"))
             .unwrap()
@@ -540,17 +546,105 @@ fn corpus_budget_is_shared_by_capture_and_local_files_and_cache_hits_are_free() 
     let usage = report.semantic_usage.unwrap();
     assert_eq!(usage.calls, 1); // Captured source is now a validated cache hit.
     assert_eq!(usage.reserved_output_tokens, 2048);
+    let actual = report.provider_usage.unwrap();
+    assert_eq!(actual.len(), 1);
+    // A generic CLI response has no provider usage envelope. Unknown is not
+    // zero and must not be confused with the 2048-token reservation above.
+    assert!(actual[0].input_tokens.is_none());
+    assert!(actual[0].output_tokens.is_none());
     options.max_semantic_calls = Some(0);
     options.max_semantic_output_tokens = Some(0);
     options.force = true;
     let report = index::run_with_options(root.path(), &db, &options).unwrap();
     assert_eq!(report.semantic_usage.unwrap().calls, 0);
+    assert!(report.provider_usage.unwrap().is_empty());
     assert_eq!(
         fs::read_to_string(fixture.path().join("calls"))
             .unwrap()
             .lines()
             .count(),
         2
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_native_provider_usage_survives_index_capture_and_cli_errors() {
+    use graf::ingest::{CommandAdapter, Provider, SemanticOptions};
+    let root = tempdir().unwrap();
+    let fixture = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::write(root.path().join("doc.md"), "Alpha Beta").unwrap();
+    index::run(root.path(), &db).unwrap();
+    let original =
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap();
+    let script = fixture.path().join("provider.py");
+    fs::write(
+        &script,
+        r#"import json, sys
+if sys.argv[-1] == '--help':
+    print('--print --output-format --json-schema')
+    sys.exit(0)
+sys.stdin.read()
+print(json.dumps({'is_error':True,'subtype':'error_during_execution',
+  'result':'SYNTHETIC_PROVIDER_PRIVATE_OUTPUT',
+  'usage':{'input_tokens':11,'output_tokens':7},'total_cost_usd':0.125}))
+sys.exit(1)
+"#,
+    )
+    .unwrap();
+    let mut command = CommandAdapter::claude_cli();
+    command.program = "python3".into();
+    command.args.insert(0, script.to_str().unwrap().into());
+    let options = index::IndexOptions {
+        ingest: IngestOptions {
+            semantic: Some(SemanticOptions {
+                provider: Provider::ClaudeCli,
+                command: Some(command),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let source = fixture.path().join("capture.md");
+    fs::write(&source, "Alpha Beta").unwrap();
+    let errors = [
+        index::run_with_options(root.path(), &db, &options).unwrap_err(),
+        sources::add_and_index(
+            root.path(),
+            &db,
+            source.to_str().unwrap(),
+            None,
+            &options,
+            &Default::default(),
+        )
+        .unwrap_err(),
+    ];
+    for error in errors {
+        let usage = error.downcast_ref::<index::FailedSemanticUsage>().unwrap();
+        assert_eq!(usage.semantic_usage.unwrap().calls, 1);
+        assert_eq!(usage.provider_usage.len(), 1);
+        assert_eq!(usage.provider_usage[0].output_tokens, Some(7));
+        assert_eq!(usage.provider_usage[0].cost_usd, Some(0.125));
+        assert!(!usage.usage_unavailable);
+        assert!(!format!("{error:#}").contains("SYNTHETIC_PROVIDER_PRIVATE_OUTPUT"));
+    }
+    let config = fixture.path().join("config.json");
+    fs::write(&config, serde_json::to_vec(&options).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_graf"))
+        .current_dir(root.path())
+        .args(["index", ".", "--json", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains(r#"\"cost_usd\":0.125"#), "{error}");
+    assert!(!error.contains("SYNTHETIC_PROVIDER_PRIVATE_OUTPUT"));
+    assert_eq!(
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+        original
     );
 }
 

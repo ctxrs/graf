@@ -1,6 +1,6 @@
 [package]
 name = "graf-cli"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Persistent local graphs for source code and documents"
@@ -20,6 +20,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+network_partitions = { git = "https://github.com/microsoft/graspologic-native", rev = "773181488b4e5b81925e302b972b294fd51f61a4", default-features = false }
+rand = "0.10"
 base64 = "0.22"
 axum = "0.8"
 futures-util = { version = "0.3", features = ["sink"] }

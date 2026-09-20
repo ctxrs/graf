@@ -86,6 +86,10 @@ pub struct IndexReport {
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_usage: Option<crate::ingest::SemanticUsage>,
+    /// Provider-reported usage per attempted call; absent counters are unknown.
+    /// These are distinct from the maximum-token reservations above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage: Option<Vec<crate::ingest::ProviderUsage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timings: Option<IndexTimings>,
 }

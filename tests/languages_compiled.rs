@@ -2189,3 +2189,424 @@ fn inherited_declaration_navigation_updates_when_signature_or_access_proof_chang
         );
     }
 }
+
+#[test]
+fn swift_existential_receiver_navigates_only_to_protocol_requirement() {
+    let source = r#"protocol Channel { func send() -> Int }
+struct First: Channel { func send() -> Int { 1 } }
+struct Second: Channel { func send() -> Int { 2 } }
+func invoke(_ value: any Channel) -> Int { value.send() }
+func ordinary(_ value: Channel) -> Int { value.send() }
+func shadow(_ value: any Channel) { let value = unknown; value.send() }
+func changed(_ input: any Channel, _ other: any Channel) { var value: any Channel = input; value = other; value.send() }
+func unknown(_ value: Any) { value.send() }
+func staticUse() { Channel.send() }
+"#;
+    let file = facts("Channel.swift", source);
+    let contract = node(&file, "Channel");
+    let target = file
+        .nodes
+        .iter()
+        .find(|n| {
+            n.label == "send"
+                && file.edges.iter().any(|e| {
+                    e.relation == "contains" && e.source == contract.id && e.target == n.id
+                })
+        })
+        .unwrap();
+    assert!(target.binding_key.is_none());
+    let target = target.id.clone();
+    let positives: Vec<_> = ["invoke", "ordinary"]
+        .iter()
+        .map(|name| node(&file, name).id.clone())
+        .collect();
+    let negatives: Vec<_> = ["shadow", "changed", "unknown", "staticUse"]
+        .iter()
+        .map(|name| node(&file, name).id.clone())
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native(
+            "fixture",
+            compiled_context(vec![file]),
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    for source in positives {
+        let edges: Vec<_> = snapshot
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == source && matches!(e.relation.as_str(), "calls" | "declared_member")
+            })
+            .collect();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].relation, "declared_member");
+        assert_eq!(edges[0].target, target);
+    }
+    assert!(
+        !snapshot.edges.iter().any(|e| negatives.contains(&e.source)
+            && matches!(e.relation.as_str(), "calls" | "declared_member")),
+        "{:?}",
+        snapshot.edges
+    );
+    let replacement = facts(
+        "Channel.swift",
+        "protocol Channel { func receive() }\nfunc invoke(_ value: any Channel) { value.send() }\n",
+    );
+    store
+        .apply_native(
+            "fixture",
+            compiled_context(vec![replacement]),
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.nodes.iter().any(|n| n.id == target));
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|e| matches!(e.relation.as_str(), "calls" | "declared_member"))
+    );
+}
+
+#[test]
+fn swift_existential_ambiguous_or_inaccessible_members_stay_unresolved() {
+    for source in [
+        "protocol Channel { func send(); func send(_ x: Int) }\nfunc invoke(_ value: any Channel) { value.send() }\n",
+        "protocol Channel { private func send() }\nfunc invoke(_ value: any Channel) { value.send() }\n",
+        "protocol Channel { func send() }\nprotocol Other { func send() }\nfunc invoke(_ value: any Channel & Other) { value.send() }\n",
+        "protocol Channel { func send() }\nfunc invoke(_ value: (any Channel)?) { value.send() }\n",
+    ] {
+        let file = facts("Channel.swift", source);
+        let caller = node(&file, "invoke").id.clone();
+        let snapshot = compiled_snapshot(compiled_context(vec![file]));
+        assert!(
+            !snapshot.edges.iter().any(|e| e.source == caller
+                && matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{source}: {:?}",
+            snapshot.edges
+        );
+    }
+}
+
+#[test]
+fn kotlin_cross_file_object_and_companion_calls_select_exact_members() {
+    for declaration in [
+        "object Beacon {\n fun emit() {}\n}\n",
+        "class Beacon {\n companion object {\n  fun emit() {}\n }\n}\n",
+        "class Beacon {\n companion object Factory {\n  fun emit() {}\n }\n}\n",
+    ] {
+        let provider = format!("package signals\n{declaration}");
+        for same_file in [false, true] {
+            let caller = "fun inspect() { Beacon.emit() }\n";
+            let files = if same_file {
+                vec![facts("Beacon.kt", &format!("{provider}{caller}"))]
+            } else {
+                vec![
+                    facts("Beacon.kt", &provider),
+                    facts(
+                        "Use.kt",
+                        &format!("package app\nimport signals.Beacon\n{caller}"),
+                    ),
+                    facts(
+                        "Other.kt",
+                        "package other\nobject Beacon {\n fun emit() {}\n}\n",
+                    ),
+                ]
+            };
+            let target = node(&files[0], "emit").id.clone();
+            assert_eq!(node(&files[0], "emit").metadata["static"], true);
+            let caller_file = if same_file { 0 } else { 1 };
+            let source = node(&files[caller_file], "inspect").id.clone();
+            let snapshot = compiled_snapshot(compiled_context(files));
+            let actual: Vec<_> = snapshot
+                .edges
+                .iter()
+                .filter(|e| e.source == source && e.relation == "calls")
+                .map(|e| (e.target.as_str(), e.confidence.as_str()))
+                .collect();
+            assert_eq!(
+                actual,
+                [(target.as_str(), "statically_resolved")],
+                "{declaration}, same_file={same_file}"
+            );
+        }
+    }
+}
+
+#[test]
+fn kotlin_cross_file_member_calls_reject_duplicate_private_and_dynamic_receivers() {
+    for (provider, extra, caller) in [
+        // A duplicate without the member must still poison the receiver identity.
+        (
+            "object Beacon {\n fun emit() {}\n}\n",
+            "package signals\nobject Beacon {}\n",
+            "fun inspect() { Beacon.emit() }\n",
+        ),
+        (
+            "object Beacon {\n private fun emit() {}\n}\n",
+            "",
+            "fun inspect() { Beacon.emit() }\n",
+        ),
+        (
+            "private object Beacon {\n fun emit() {}\n}\n",
+            "",
+            "fun inspect() { Beacon.emit() }\n",
+        ),
+        (
+            "class Beacon {\n companion object {\n  private fun emit() {}\n }\n}\n",
+            "",
+            "fun inspect() { Beacon.emit() }\n",
+        ),
+        (
+            "object Beacon {\n fun emit() {}\n}\n",
+            "",
+            "fun inspect(Beacon: Any) { Beacon.emit() }\n",
+        ),
+        (
+            "object Beacon {\n fun emit() {}\n}\n",
+            "",
+            "fun inspect(value: Any) { value.emit() }\n",
+        ),
+        (
+            "open class Beacon {\n open fun emit() {}\n}\n",
+            "",
+            "fun inspect(value: Beacon) { value.emit() }\n",
+        ),
+    ] {
+        let files = vec![
+            facts("Beacon.kt", &format!("package signals\n{provider}")),
+            facts("Extra.kt", extra),
+            facts(
+                "Use.kt",
+                &format!("package app\nimport signals.Beacon\n{caller}"),
+            ),
+        ];
+        let source = node(&files[2], "inspect").id.clone();
+        let snapshot = compiled_snapshot(compiled_context(files));
+        assert!(
+            !snapshot
+                .edges
+                .iter()
+                .any(|e| e.source == source && e.relation == "calls"),
+            "{provider} / {extra} / {caller}: {:?}",
+            snapshot.edges
+        );
+    }
+    let files = vec![
+        facts(
+            "One.kt",
+            "package first\nobject Beacon {\n fun emit() {}\n}\n",
+        ),
+        facts(
+            "Two.kt",
+            "package second\nobject Beacon {\n fun emit() {}\n}\n",
+        ),
+        facts("Use.kt", "package app\nfun inspect() { Beacon.emit() }\n"),
+    ];
+    let source = node(&files[2], "inspect").id.clone();
+    let snapshot = compiled_snapshot(compiled_context(files));
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|e| e.source == source && e.relation == "calls")
+    );
+}
+
+#[test]
+fn cpp_qualified_only_definitions_resolve_without_a_member_declaration() {
+    for (header, declared) in [
+        ("struct Beacon {};\n", false),
+        ("struct Beacon {\n SIGNAL_BODY()\n};\n", false),
+        ("struct Beacon { static void emit(); };\n", true),
+    ] {
+        // Opaque macro syntax may produce diagnostics; the separate, explicit
+        // definition still provides an exact identity without preprocessing.
+        let files = vec![
+            parse("beacon.hpp", header, "hash").unwrap().unwrap(),
+            facts(
+                "beacon.cpp",
+                "#include \"beacon.hpp\"\nvoid Beacon::emit() {}\n",
+            ),
+            facts(
+                "use.cpp",
+                "#include \"beacon.hpp\"\nvoid inspect() { Beacon::emit(); }\n",
+            ),
+        ];
+        let target = if declared {
+            node(&files[0], "emit").id.clone()
+        } else {
+            node(&files[1], "Beacon.emit").id.clone()
+        };
+        assert_eq!(
+            key(node(&files[1], "Beacon.emit")),
+            "cpp:symbol:Beacon.emit"
+        );
+        let source = node(&files[2], "inspect").id.clone();
+        let snapshot = compiled_snapshot(compiled_context(files));
+        let actual: Vec<_> = snapshot
+            .edges
+            .iter()
+            .filter(|e| e.source == source && e.relation == "calls")
+            .map(|e| (e.target.as_str(), e.confidence.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [(target.as_str(), "statically_resolved")],
+            "{header}"
+        );
+    }
+}
+
+#[test]
+fn cpp_qualified_calls_reject_duplicate_private_and_dynamic_definitions() {
+    for (header, duplicate, caller) in [
+        ("struct Beacon {};\n", true, "Beacon::emit();"),
+        (
+            "class Beacon { static void emit(); };\n",
+            false,
+            "Beacon::emit();",
+        ),
+        (
+            "struct Beacon { virtual void emit(); };\n",
+            false,
+            "Beacon::emit();",
+        ),
+        ("struct Beacon {};\n", false, "unknown.emit();"),
+    ] {
+        let body = "#include \"beacon.hpp\"\nvoid Beacon::emit() {}\n";
+        let mut files = vec![
+            facts("beacon.hpp", header),
+            facts("beacon.cpp", body),
+            facts(
+                "use.cpp",
+                &format!("#include \"beacon.hpp\"\nvoid inspect() {{ {caller} }}\n"),
+            ),
+        ];
+        let source = node(&files[2], "inspect").id.clone();
+        if duplicate {
+            files.push(facts("duplicate.cpp", body));
+        }
+        let snapshot = compiled_snapshot(compiled_context(files));
+        assert!(
+            !snapshot
+                .edges
+                .iter()
+                .any(|e| e.source == source && e.relation == "calls"),
+            "{header}, duplicate={duplicate}, {caller}: {:?}",
+            snapshot.edges
+        );
+    }
+}
+
+#[test]
+fn compiled_cross_file_members_survive_incremental_caller_changes_and_provider_restoration() {
+    use graf::index::{IndexOptions, run_with_options};
+    for (provider_path, provider, caller_path, caller, target_label) in [
+        (
+            "Beacon.kt",
+            "package signals\nobject Beacon {\n fun emit() {}\n}\n",
+            "Use.kt",
+            "package app\nimport signals.Beacon\nfun inspect() { Beacon.emit() }\n",
+            "emit",
+        ),
+        (
+            "Beacon.kt",
+            "package signals\nclass Beacon {\n companion object {\n  fun emit() {}\n }\n}\n",
+            "Use.kt",
+            "package app\nimport signals.Beacon\nfun inspect() { Beacon.emit() }\n",
+            "emit",
+        ),
+        (
+            "beacon.cpp",
+            "#include \"beacon.hpp\"\nvoid Beacon::emit() {}\n",
+            "use.cpp",
+            "#include \"beacon.hpp\"\nvoid inspect() { Beacon::emit(); }\n",
+            "Beacon.emit",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("src");
+        std::fs::create_dir(&root).unwrap();
+        let db = directory.path().join("graph.db");
+        std::fs::write(root.join(provider_path), provider).unwrap();
+        std::fs::write(root.join(caller_path), caller).unwrap();
+        if provider_path.ends_with(".cpp") {
+            std::fs::write(root.join("beacon.hpp"), "struct Beacon {};\n").unwrap();
+        }
+        let options = IndexOptions {
+            code_only: true,
+            ..Default::default()
+        };
+        run_with_options(&root, &db, &options).unwrap();
+        let initial = Store::open(&db).unwrap().snapshot().unwrap();
+        let source = initial
+            .nodes
+            .iter()
+            .find(|n| n.file == caller_path && n.label == "inspect")
+            .unwrap()
+            .id
+            .clone();
+        let target = initial
+            .nodes
+            .iter()
+            .find(|n| n.file == provider_path && n.label == target_label)
+            .unwrap()
+            .id
+            .clone();
+        let assert_calls = |snapshot: &graf::model::GraphSnapshot, present: bool| {
+            let actual: Vec<_> = snapshot
+                .edges
+                .iter()
+                .filter(|e| e.source == source && e.relation == "calls")
+                .map(|e| (e.target.as_str(), e.confidence.as_str()))
+                .collect();
+            let expected = if present {
+                vec![(target.as_str(), "statically_resolved")]
+            } else {
+                vec![]
+            };
+            assert_eq!(actual, expected, "{provider_path}: {:?}", snapshot.edges);
+        };
+        assert_calls(&initial, true);
+        std::fs::write(
+            root.join(caller_path),
+            format!("{caller}// caller-only edit\n"),
+        )
+        .unwrap();
+        let report = run_with_options(&root, &db, &options).unwrap();
+        assert!(
+            report.unchanged_files >= 1,
+            "provider must be reused: {report:?}"
+        );
+        assert_calls(&Store::open(&db).unwrap().snapshot().unwrap(), true);
+
+        let duplicate = if provider_path.ends_with(".cpp") {
+            "duplicate.cpp"
+        } else {
+            "Duplicate.kt"
+        };
+        std::fs::write(root.join(duplicate), provider).unwrap();
+        run_with_options(&root, &db, &options).unwrap();
+        assert_calls(&Store::open(&db).unwrap().snapshot().unwrap(), false);
+        std::fs::remove_file(root.join(duplicate)).unwrap();
+        run_with_options(&root, &db, &options).unwrap();
+        assert_calls(&Store::open(&db).unwrap().snapshot().unwrap(), true);
+
+        std::fs::remove_file(root.join(provider_path)).unwrap();
+        run_with_options(&root, &db, &options).unwrap();
+        let removed = Store::open(&db).unwrap().snapshot().unwrap();
+        assert!(!removed.nodes.iter().any(|n| n.id == target));
+        assert_calls(&removed, false);
+        std::fs::write(root.join(provider_path), provider).unwrap();
+        run_with_options(&root, &db, &options).unwrap();
+        assert_calls(&Store::open(&db).unwrap().snapshot().unwrap(), true);
+    }
+}

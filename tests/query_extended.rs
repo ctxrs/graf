@@ -123,6 +123,175 @@ fn endpoint_convenience_preserves_exact_priority_literal_punctuation_and_scope()
 }
 
 #[test]
+fn resolved_neighbors_use_compatibility_tiers_and_literal_relation_shorthand() {
+    let nodes = vec![
+        node("root", "ﬂow()", "a.rs"),
+        node("later", "FlowHistory", "a.rs"),
+        node("other", "Receiver", "b.rs"),
+    ];
+    let mut edges = vec![
+        edge("1", "root", "later", "calls"),
+        edge("2", "root", "other", "calls_async"),
+        edge("3", "other", "root", "references"),
+        edge("4", "root", "other", "route_%"),
+    ];
+    for _ in 0..2 {
+        let (_dir, graph) = store(nodes.clone(), edges.clone());
+        for (relation, expected) in [
+            ("calls", "1"),
+            ("ＣＡＬＬＳ", "1"),
+            ("async", "2"),
+            ("erenc", "3"),
+            ("_%", "4"),
+        ] {
+            let result = graph
+                .neighbors_resolved(
+                    "FLOW",
+                    &SearchOptions {
+                        graph: QueryOptions {
+                            depth: 1,
+                            relation: Some(relation.into()),
+                            ..QueryOptions::default()
+                        },
+                        ..SearchOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.seeds, ["root"]);
+            assert_eq!(result.graph.edges.len(), 1, "{relation}");
+            assert_eq!(result.graph.edges[0].id, expected, "{relation}");
+        }
+        let mut options = SearchOptions {
+            graph: QueryOptions {
+                depth: 1,
+                relation: Some("call".into()),
+                ..QueryOptions::default()
+            },
+            ..SearchOptions::default()
+        };
+        let error = graph
+            .neighbors_resolved("flow", &options)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ambiguous relation") && error.ends_with("calls, calls_async"),
+            "{error}"
+        );
+        options.graph.relation = Some("not-present".into());
+        assert!(
+            graph
+                .neighbors_resolved("flow", &options)
+                .unwrap()
+                .graph
+                .edges
+                .is_empty()
+        );
+        options.graph.relation = Some(" ".into());
+        assert_eq!(
+            graph
+                .neighbors_resolved("flow", &options)
+                .unwrap()
+                .graph
+                .edges
+                .len(),
+            4
+        );
+        options.graph.relation = Some(" ".repeat(1025));
+        assert!(graph.neighbors_resolved("flow", &options).is_err());
+        // Strict APIs still reject convenience spelling.
+        assert!(
+            graph
+                .neighbors_extended("flow", &SearchOptions::default())
+                .is_err()
+        );
+        edges.reverse();
+    }
+}
+
+#[test]
+fn compatibility_endpoints_keep_exact_spelling_and_report_folded_ties() {
+    let (_dir, graph) = store(
+        vec![
+            node("ligature", "ﬂow", "a.rs"),
+            node("plain", "flow", "a.rs"),
+            node("width", "Ｗｉｄｅ", "b.rs"),
+        ],
+        vec![],
+    );
+    for (text, expected) in [("ﬂow", "ligature"), ("flow", "plain"), ("wide", "width")] {
+        assert_eq!(
+            graph
+                .resolve_endpoint(text, &SearchOptions::default())
+                .unwrap()
+                .id,
+            expected
+        );
+    }
+    let error = graph
+        .resolve_endpoint("FLOW", &SearchOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("ambiguous") && error.contains("ligature, plain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn relation_shorthand_seeks_distinct_names_at_large_hubs_and_includes_unresolved() {
+    let edges = (0..5_100)
+        .map(|i| edge(&format!("e{i:04}"), "root", "other", "calls"))
+        .collect();
+    let (_dir, graph) = store(
+        vec![node("root", "Root", "a.rs"), node("other", "Other", "a.rs")],
+        edges,
+    );
+    let options = SearchOptions {
+        graph: QueryOptions {
+            depth: 0,
+            relation: Some("call".into()),
+            ..QueryOptions::default()
+        },
+        ..SearchOptions::default()
+    };
+    // Resolution must seek names, not exhaust its budget on identical edges.
+    assert_eq!(
+        graph.neighbors_resolved("root", &options).unwrap().seeds,
+        ["root"]
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut native = Store::create(&dir.path().join("native.db")).unwrap();
+    native
+        .apply_native(
+            "repo",
+            vec![FileFacts {
+                path: "a.rs".into(),
+                hash: "same".into(),
+                module: "a".into(),
+                nodes: vec![node("root", "Root", "a.rs")],
+                edges: vec![],
+                references: vec![Reference {
+                    id: "pending".into(),
+                    source: "root".into(),
+                    label: "Missing".into(),
+                    relation: "calls".into(),
+                    file: "a.rs".into(),
+                    line: 2,
+                    candidate_keys: vec![],
+                    reason: "no target".into(),
+                }],
+                diagnostics: vec![],
+            }],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let result = native.neighbors_resolved("root", &options).unwrap();
+    assert_eq!(result.graph.unresolved.len(), 1);
+    assert_eq!(result.graph.unresolved[0].relation, "calls");
+}
+
+#[test]
 fn normalized_endpoints_accept_composed_decomposed_and_accentless_spelling() {
     for label in ["Révision", "Re\u{301}vision"] {
         let mut qualified = node("qualified", "Separate", "review.rs");
@@ -365,16 +534,16 @@ fn normalized_endpoint_prefix_substring_and_punctuation_remain_literal() {
 }
 
 #[test]
-fn normalized_endpoint_incomplete_scan_refuses_uniqueness_and_scope_recovers() {
+fn normalized_endpoint_catalog_finds_late_rivals_and_keeps_scope_priority() {
     let mut nodes = vec![node("a-first", "Révision", "small.rs")];
-    nodes.extend((0..5_000).map(|i| {
+    nodes.extend((0..25_000).map(|i| {
         node(
             &format!("n{i:04}"),
             if i == 0 { "BoundaryCafé" } else { "Unrelated" },
             "large.rs",
         )
     }));
-    // A canonical rival lies beyond the scan limit; a sampled winner is wrong.
+    // A canonical rival lies beyond the traversal limit; a sampled winner is wrong.
     nodes.push(node("z-last", "Re\u{301}vision", "other.rs"));
     let (_dir, store) = store(nodes, vec![]);
     let options = SearchOptions::default();
@@ -382,9 +551,12 @@ fn normalized_endpoint_incomplete_scan_refuses_uniqueness_and_scope_recovers() {
         .resolve_endpoint("Revision", &options)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("budget"), "{error}");
+    assert!(
+        error.contains("ambiguous") && error.contains("a-first, z-last"),
+        "{error}"
+    );
     assert!(!error.contains("no symbol"));
-    // Exactly 5,000 candidates can be fully inspected, including a unique hit.
+    // Convenience lookup examines the catalog without loading full graph records.
     assert_eq!(
         store
             .resolve_endpoint("large.rs::BoundaryCafe", &options)
@@ -415,7 +587,40 @@ fn normalized_endpoint_incomplete_scan_refuses_uniqueness_and_scope_recovers() {
             .id,
         "a-first"
     );
-    assert_eq!(store.stats().unwrap().nodes, 5_002);
+    assert_eq!(store.stats().unwrap().nodes, 25_002);
+}
+
+#[test]
+fn late_endpoint_prefix_and_substring_support_neighbors_path_and_impact() {
+    let mut nodes: Vec<_> = (0..25_000)
+        .map(|i| node(&format!("n{i:05}"), "Unrelated", "large.rs"))
+        .collect();
+    nodes.push(node("z-source", "CrémeCaller", "late.rs"));
+    nodes.push(node("z-target", "UsefulDestination", "late.rs"));
+    let (_dir, store) = store(nodes, vec![edge("call", "z-source", "z-target", "calls")]);
+    let options = SearchOptions::default();
+    assert_eq!(
+        store.resolve_endpoint("cremecall", &options).unwrap().id,
+        "z-source"
+    );
+    assert_eq!(
+        store.resolve_endpoint("Destination", &options).unwrap().id,
+        "z-target"
+    );
+    let neighbors = store.neighbors_resolved("cremecall", &options).unwrap();
+    assert_eq!(neighbors.seeds, ["z-source"]);
+    assert_eq!(neighbors.graph.edges[0].id, "call");
+    let path = store
+        .path_extended("cremecall", "Destination", &options)
+        .unwrap();
+    assert!(path.found);
+    assert_eq!(path.result.graph.edges[0].id, "call");
+    let impact = store
+        .impact_extended("Destination", &ImpactOptions::default())
+        .unwrap();
+    assert_eq!(impact.seeds, ["z-target"]);
+    assert_eq!(impact.graph.edges[0].id, "call");
+    assert_eq!(store.stats().unwrap().generation, 1);
 }
 
 #[test]
@@ -1216,6 +1421,131 @@ fn token_budget_keeps_complete_records_primary_seed_and_truthful_paths() {
 }
 
 #[test]
+fn ranked_search_finds_late_multiterm_winner_independent_of_insertion_order() {
+    let mut nodes: Vec<_> = (0..256)
+        .flat_map(|i| {
+            [
+                node(&format!("a{i:03}"), &format!("OrchidNoise{i:03}"), "a.rs"),
+                node(&format!("b{i:03}"), &format!("CobaltNoise{i:03}"), "b.rs"),
+            ]
+        })
+        .collect();
+    nodes.push(node("z-winner", "Orchid Cobalt Coordinator", "winner.rs"));
+    let options = SearchOptions {
+        graph: QueryOptions {
+            depth: 0,
+            ..QueryOptions::default()
+        },
+        ..SearchOptions::default()
+    };
+    let mut expected = None;
+    for _ in 0..3 {
+        let (_dir, graph) = store(nodes.clone(), vec![]);
+        let result = graph.query_extended("Orchid Cobalt", &options).unwrap();
+        assert_eq!(result.seeds[0], "z-winner");
+        assert!(!result.graph.truncated);
+        if let Some(expected) = &expected {
+            assert_eq!(&result.seeds, expected);
+        } else {
+            expected = Some(result.seeds);
+        }
+        nodes.reverse();
+        nodes.rotate_left(71);
+    }
+}
+
+#[test]
+fn ranked_search_late_exact_and_prose_hits_beat_early_prefix_and_file_hits() {
+    let mut nodes: Vec<_> = (0..128)
+        .map(|i| {
+            node(
+                &format!("a{i:03}"),
+                &format!("WaypointNoise{i:03}"),
+                "glassword.rs",
+            )
+        })
+        .collect();
+    nodes.push(node("z-exact", "Waypoint()", "exact.rs"));
+    let mut prose = node("z-prose", "Decision", "notes.md");
+    prose.metadata = json!({"rationale":"glassword tradeoff"});
+    nodes.push(prose);
+    let options = SearchOptions {
+        graph: QueryOptions {
+            depth: 0,
+            ..QueryOptions::default()
+        },
+        ..SearchOptions::default()
+    };
+    for _ in 0..2 {
+        let (_dir, graph) = store(nodes.clone(), vec![]);
+        for (query, winner) in [("who uses Waypoint", "z-exact"), ("glassword", "z-prose")] {
+            assert_eq!(
+                graph.query_extended(query, &options).unwrap().seeds[0],
+                winner
+            );
+        }
+        nodes.reverse();
+    }
+}
+
+#[test]
+fn ranked_search_budget_is_independent_of_traversal_size_and_keeps_late_hits() {
+    let mut nodes: Vec<_> = (0..4_999)
+        .map(|i| {
+            node(
+                &format!("n{i:04}"),
+                &format!("SaffronNoise{i:04}"),
+                "large.rs",
+            )
+        })
+        .collect();
+    nodes.push(node("z-winner", "Saffron()", "large.rs"));
+    nodes.push(node("other", "SaffronRival", "other.rs"));
+    let (_dir, graph) = store(nodes, vec![]);
+    let options = SearchOptions {
+        graph: QueryOptions {
+            depth: 0,
+            limit: 1,
+            ..QueryOptions::default()
+        },
+        ..SearchOptions::default()
+    };
+    assert_eq!(
+        graph.query_extended("Saffron", &options).unwrap().seeds,
+        ["z-winner"]
+    );
+    let scoped = SearchOptions {
+        files: vec!["large.rs".into()],
+        ..options.clone()
+    };
+    assert_eq!(
+        graph.query_extended("Saffron", &scoped).unwrap().seeds,
+        ["z-winner"]
+    );
+    assert_eq!(
+        graph.query_extended("z-winner", &options).unwrap().seeds,
+        ["z-winner"]
+    );
+    assert_eq!(graph.stats().unwrap().nodes, 5_001);
+}
+
+#[test]
+fn ranked_search_byte_budget_is_explicit_and_does_not_poison_next_read() {
+    let mut huge = node("huge", "SmallLabel", "file.rs");
+    huge.metadata = json!({"summary": format!("memoryword {}", "x".repeat(8 * 1024 * 1024))});
+    let (_dir, graph) = store(vec![huge], vec![]);
+    let error = graph
+        .query_extended("memoryword", &SearchOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("candidate enumeration exceeded its byte budget"),
+        "{error}"
+    );
+    assert_eq!(graph.stats().unwrap().nodes, 1);
+}
+
+#[test]
 fn ranked_search_uses_content_terms_diversity_prose_and_unicode() {
     let mut rationale = node("r", "Decision", "notes.md");
     rationale.metadata = json!({"rationale":"latency tradeoff", "private_field":"sensitiveword"});
@@ -1270,6 +1600,26 @@ fn ranked_search_uses_content_terms_diversity_prose_and_unicode() {
 }
 
 #[test]
+fn search_compatibility_forms_are_indexed_without_changing_stored_labels() {
+    let nodes = vec![
+        node("ligature", "ﬂux processor", "a.rs"),
+        node("compound", "ＷｉｄｅＰｒｏｃｅｓｓｏｒ", "c.rs"),
+    ];
+    let (_dir, graph) = store(nodes, vec![]);
+    for (query, id, label) in [
+        ("flux", "ligature", "ﬂux processor"),
+        ("ＦＬＵＸ", "ligature", "ﬂux processor"),
+        ("WideProcessor", "compound", "ＷｉｄｅＰｒｏｃｅｓｓｏｒ"),
+    ] {
+        let result = graph
+            .query_extended(query, &SearchOptions::default())
+            .unwrap();
+        assert_eq!(result.seeds, [id], "{query}");
+        assert_eq!(result.graph.nodes[0].label, label);
+    }
+}
+
+#[test]
 fn fts_preserves_korean_and_greek_spelling_for_imported_and_native_prefixes() {
     let nodes = vec![
         node("ko", "한국어 문서", "notes.txt"),
@@ -1314,7 +1664,7 @@ fn fts_preserves_korean_and_greek_spelling_for_imported_and_native_prefixes() {
 }
 
 #[test]
-fn candidate_and_work_caps_are_explicit_and_filters_do_not_expand_their_scope() {
+fn complete_candidate_ranking_and_traversal_work_caps_are_independent() {
     let mut nodes: Vec<_> = (0..80)
         .map(|i| node(&format!("n{i}"), &format!("Shared{i}"), "file.rs"))
         .collect();
@@ -1339,12 +1689,8 @@ fn candidate_and_work_caps_are_explicit_and_filters_do_not_expand_their_scope() 
             },
         )
         .unwrap();
-    assert!(
-        result
-            .truncation_reasons
-            .iter()
-            .any(|s| s == "candidate_limit")
-    );
+    assert!(!result.graph.truncated);
+    assert_eq!(ids(&result.graph), ["n0", "n1", "n2"]);
     let result = store
         .neighbors_extended(
             "root",

@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand, ValueEnum};
 use graf::{
     analysis::{self, AnalysisOptions},
@@ -17,7 +17,7 @@ use graf::{
     store::Store,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -45,6 +45,39 @@ pub enum Command {
     Merge(MergeArgs),
     /// Explicitly manage a stored cross-project aggregate.
     Global(GlobalArgs),
+    /// Explicitly save a local answer and its outcome; never captures queries automatically.
+    SaveResult(MemorySaveArgs),
+    /// Summarize explicitly saved outcomes into local lessons without model calls.
+    Reflect(MemoryReflectArgs),
+    /// Read GitHub pull requests and optionally map their files to the stored graph.
+    Prs(PrsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrsArgs {
+    #[command(flatten)]
+    pub input: graf::prs::PrsArgs,
+    /// Use this Graf snapshot for changed-file impact instead of a database.
+    #[arg(long)]
+    pub snapshot: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct MemorySaveArgs {
+    #[command(flatten)]
+    pub input: graf::memory::SaveResultArgs,
+    /// Validate cited nodes against this Graf snapshot instead of a database.
+    #[arg(long)]
+    pub snapshot: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct MemoryReflectArgs {
+    #[command(flatten)]
+    pub input: graf::memory::ReflectArgs,
+    /// Validate citations and group lessons using this Graf snapshot.
+    #[arg(long)]
+    pub snapshot: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -58,6 +91,15 @@ pub struct SourceArgs {
 
 #[derive(Debug, Args)]
 pub struct AnalysisArgs {
+    /// Community detection backend. Leiden uses a deterministic seeded native implementation.
+    #[arg(long, value_enum, default_value = "louvain")]
+    pub community_algorithm: analysis::CommunityAlgorithm,
+    /// Reproducible Leiden random seed.
+    #[arg(long, default_value_t = 42)]
+    pub community_seed: u64,
+    /// Maximum local Leiden sweeps per level; does not guarantee convergence.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+    pub community_local_max_passes: u32,
     /// Community resolution; larger values favor smaller groups.
     #[arg(long, default_value_t = 1.0, value_parser = positive_float)]
     pub resolution: f64,
@@ -108,6 +150,9 @@ fn percentile(text: &str) -> Result<f64, String> {
 impl AnalysisArgs {
     fn options(&self) -> AnalysisOptions {
         AnalysisOptions {
+            community_algorithm: self.community_algorithm,
+            community_seed: self.community_seed,
+            community_local_max_passes: self.community_local_max_passes,
             resolution: self.resolution,
             max_community_size: self.max_community_size.map(|v| v as usize),
             min_cohesion: self.min_cohesion,
@@ -120,6 +165,10 @@ impl AnalysisArgs {
 
 #[derive(Debug, Args)]
 pub struct ViewArgs {
+    /// Include explicit saved observations in HTML, Markdown, or vault reports.
+    /// Reads this directory and checks cited local source files without changing the graph.
+    #[arg(long)]
+    pub memory_dir: Option<PathBuf>,
     /// Accept a smaller JSON graph export; the previous output is backed up first.
     #[arg(long)]
     pub allow_shrink: bool,
@@ -436,16 +485,34 @@ fn print(value: &impl Serialize, compact: bool) -> Result<()> {
 }
 
 fn local_database(db: Option<&Path>) -> Result<PathBuf> {
+    optional_local_database(db)?
+        .context("no .graf/index.db found; run graf index or pass --db or --snapshot")
+}
+
+fn optional_local_database(db: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(db) = db {
-        return Ok(db.to_owned());
+        return Ok(Some(db.to_owned()));
     }
     for dir in std::env::current_dir()?.ancestors() {
         let path = dir.join(".graf/index.db");
         if path.try_exists()? {
-            return Ok(path);
+            return Ok(Some(path));
         }
     }
-    bail!("no .graf/index.db found; run graf index or pass --db or --snapshot")
+    Ok(None)
+}
+
+fn optional_graph(snapshot: Option<&Path>, db: Option<&Path>) -> Result<Option<GraphSnapshot>> {
+    ensure!(
+        snapshot.is_none() || db.is_none(),
+        "--snapshot conflicts with --db"
+    );
+    if let Some(path) = snapshot {
+        return load_source(path, SourceKind::Snapshot).map(Some);
+    }
+    optional_local_database(db)?
+        .map(|path| load_source(&path, SourceKind::Database))
+        .transpose()
 }
 
 fn regular(path: &Path) -> Result<()> {
@@ -681,7 +748,26 @@ fn export_graph(
         !view.allow_shrink || graph_json,
         "--allow-shrink applies only to JSON graph exports"
     );
-    let options = view.options(&source.analysis)?;
+    let mut options = view.options(&source.analysis)?;
+    if let Some(memory_dir) = &view.memory_dir {
+        ensure!(
+            matches!(
+                format,
+                Format::Html | Format::Markdown | Format::Wiki | Format::Obsidian
+            ),
+            "--memory-dir is supported by HTML, Markdown, wiki, and Obsidian reports"
+        );
+        options.learning = Some(graf::memory::learning_overlay(
+            &graf::memory::ReflectArgs {
+                memory_dir: memory_dir.clone(),
+                out: PathBuf::new(),
+                half_life_days: 30.0,
+                min_corroboration: 2,
+                if_stale: false,
+            },
+            Some(&graph),
+        )?);
+    }
     let context = report
         .map(|check| report_context(&graph, &path, source.snapshot.is_some(), check))
         .transpose()?
@@ -1123,6 +1209,9 @@ fn diagnose(args: &DiagnoseArgs, db: Option<&Path>, json_output: bool) -> Result
     let source = SourceArgs {
         snapshot: args.snapshot.clone(),
         analysis: AnalysisArgs {
+            community_algorithm: analysis::CommunityAlgorithm::Louvain,
+            community_seed: 42,
+            community_local_max_passes: 100,
             resolution: 1.0,
             max_community_size: None,
             min_cohesion: None,
@@ -1187,6 +1276,7 @@ fn diagnose(args: &DiagnoseArgs, db: Option<&Path>, json_output: bool) -> Result
     print(
         &json!({
             "generation":graph.generation,"node_count":graph.nodes.len(),"edge_count":graph.edges.len(),
+            "unresolved_reference_count":graph.metadata.get("graf_unresolved_references").and_then(Value::as_array).map(Vec::len),
             "directed_edges":graph.edges.iter().filter(|e| e.directed).count(),
             "undirected_edges":graph.edges.iter().filter(|e| !e.directed).count(),
             "self_loop_edges":graph.edges.iter().filter(|e| e.source==e.target).count(),
@@ -1200,7 +1290,7 @@ fn diagnose(args: &DiagnoseArgs, db: Option<&Path>, json_output: bool) -> Result
             "undirected_same_endpoint_collapse_loss":graph.edges.len()-pairs.len(),
             "collapse_risk_groups":risks.len(),"examples":examples,"examples_truncated":examples.len()<risks.len(),
             "methodology":{
-                "scope":"Validated stored graph; malformed or dangling input records are rejected during loading. No graph changes are made.",
+                "scope":"Validated stored graph; malformed or dangling input records are rejected during loading. Unresolved references, including external imports, are stored separately and are not dangling edges. Their count is null when no authoritative reference inventory is present. No graph changes are made.",
                 "parallel":"Same directed source/target, or same unordered undirected endpoints, with direction kinds kept separate.",
                 "collapse":"Hypothetical losses retaining one edge per ordered or unordered endpoint pair, ignoring relation and direction kind. No collapse is performed.",
                 "duplicates":"Equal stored edge facts excluding ID; undirected endpoint order is normalized.",
@@ -1397,6 +1487,30 @@ fn label(args: &LabelArgs, db: Option<&Path>, json_output: bool) -> Result<()> {
 /// --db argument; this module resolves local/default-global paths as appropriate.
 pub fn run(args: &Command, db: Option<&Path>, json_output: bool) -> Result<()> {
     match args {
+        Command::SaveResult(args) => {
+            let graph = optional_graph(args.snapshot.as_deref(), db)?;
+            let path = graf::memory::save_result(&args.input, graph.as_ref())?;
+            print(&json!({"saved":path}), json_output)
+        }
+        Command::Reflect(args) => {
+            let graph = optional_graph(args.snapshot.as_deref(), db)?;
+            let result = graf::memory::reflect(&args.input, graph.as_ref())?;
+            print(&serde_json::to_value(result)?, json_output)
+        }
+        Command::Prs(args) => {
+            let graph = optional_graph(args.snapshot.as_deref(), db)?;
+            let report = graf::prs::run(&args.input, graph.as_ref())?;
+            if json_output {
+                print(&report, true)
+            } else {
+                writeln!(
+                    std::io::stdout().lock(),
+                    "{}",
+                    crate::human(&graf::prs::format_text(&report))
+                )?;
+                Ok(())
+            }
+        }
         Command::Benchmark(args) => benchmark(args, db, json_output),
         Command::Diagnose(args) => diagnose(args, db, json_output),
         Command::Label(args) => label(args, db, json_output),

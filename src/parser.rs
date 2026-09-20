@@ -41,6 +41,10 @@ enum Binding {
         prefix: String,
         start: usize,
     },
+    Receiver {
+        class: usize,
+        method: usize,
+    },
     Unknown,
 }
 
@@ -85,6 +89,7 @@ struct Extractor<'a> {
     builtin_methods: Vec<(usize, String, String)>,
     stars: Vec<(String, usize, u32)>,
     all: Value,
+    receiver_writes: BTreeMap<usize, BTreeSet<String>>,
 }
 
 /// Extract static Python facts without executing source or guessing dynamic targets.
@@ -97,6 +102,10 @@ struct Extractor<'a> {
 /// `__class__` stay unresolved. Module stars defer definition keys and aliases
 /// until `PythonContext::apply` can verify the binding against the inventory.
 /// Member candidates are lookup requests, not inferred runtime receiver types.
+/// Implicit method receivers provide class-qualified declaration navigation;
+/// recorded writes, dynamic lookup hooks, and conflicting visible overrides
+/// suppress that evidence. External subclasses and runtime monkey patches are
+/// not modeled. Descriptors with arbitrary decorators remain opaque.
 /// Validation covers Tree-sitter syntax and duplicate parameters, not all Python
 /// compiler constraints.
 pub fn parse_python(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
@@ -219,6 +228,7 @@ pub fn parse_python_with_source_root(
         builtin_methods: vec![],
         stars: vec![],
         all: static_python_all(root, source),
+        receiver_writes: BTreeMap::new(),
         scopes: vec![Scope {
             parent: None,
             kind: ScopeKind::Module,
@@ -652,6 +662,18 @@ impl Extractor<'_> {
         match node.kind() {
             "identifier" => self.bind(scope, self.text(node).into(), Binding::Unknown),
             "attribute" => {
+                if let Some(parts) = self.dotted(node)
+                    && let Some((class, _)) = self.receiver(scope, &identifier(&parts[0]))
+                {
+                    self.receiver_writes.entry(class).or_default().insert(
+                        if parts[1] == "__dict__" {
+                            "*".into()
+                        } else {
+                            identifier(&parts[1])
+                        },
+                    );
+                    return;
+                }
                 if let Some(object) = node.child_by_field_name("object") {
                     self.target(object, scope);
                 }
@@ -818,7 +840,7 @@ impl Extractor<'_> {
             "call" => {
                 let parts = node
                     .child_by_field_name("function")
-                    .and_then(|n| self.dotted(n))
+                    .and_then(|n| self.call_parts(n))
                     .unwrap_or_default();
                 let function = parts.first().map(|name| identifier(name));
                 if parts.len() == 1
@@ -828,6 +850,21 @@ impl Extractor<'_> {
                     if function.as_deref() == Some("globals") {
                         self.scopes[0].uncertain = true;
                     }
+                }
+                if parts.len() == 1
+                    && matches!(function.as_deref(), Some("setattr" | "delattr"))
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                    && let Some(receiver) = arguments.named_child(0)
+                    && receiver.kind() == "identifier"
+                    && let Some((class, _)) = self.receiver(scope, &identifier(self.text(receiver)))
+                {
+                    // A computed name can replace any member. Even a shadowed
+                    // setter is not evidence that the receiver stays unchanged.
+                    let name = arguments.named_child(1).and_then(|n| self.string_text(n));
+                    self.receiver_writes.entry(class).or_default().insert(
+                        name.filter(|n| !n.contains('\\'))
+                            .unwrap_or_else(|| "*".into()),
+                    );
                 }
                 self.calls.push(PendingCall {
                     scope,
@@ -948,6 +985,33 @@ impl Extractor<'_> {
         }
         if let Some(parameters) = node.child_by_field_name("parameters") {
             self.parameters(parameters, child);
+            if !class
+                && !conditional
+                && self.scopes[scope].kind == ScopeKind::Class
+                && !self
+                    .builtin_methods
+                    .iter()
+                    .any(|(_, name, owner)| owner == &id && name == "staticmethod")
+                && let Some(first) = parameters.named_child(0)
+                && matches!(
+                    first.kind(),
+                    "identifier"
+                        | "typed_parameter"
+                        | "default_parameter"
+                        | "typed_default_parameter"
+                )
+                && let Some(name) = parameter_names(first).first()
+                && name.kind() == "identifier"
+            {
+                let name = identifier(self.text(*name));
+                self.scopes[child].bindings.insert(
+                    name,
+                    Binding::Receiver {
+                        class: scope,
+                        method: child,
+                    },
+                );
+            }
         }
         let body = node.child_by_field_name("body").unwrap();
         self.docstring(body, child);
@@ -1168,6 +1232,79 @@ impl Extractor<'_> {
         dotted_text(node, self.source)
     }
 
+    fn call_parts(&self, node: Syntax<'_>) -> Option<Vec<String>> {
+        if node.kind() == "attribute"
+            && let Some(object) = node.child_by_field_name("object")
+            && object.kind() == "call"
+            && object
+                .child_by_field_name("function")
+                .is_some_and(|n| n.kind() == "identifier" && self.text(n) == "super")
+            && object
+                .child_by_field_name("arguments")
+                .is_some_and(|n| n.named_child_count() == 0)
+        {
+            return Some(vec![
+                "super()".into(),
+                self.text(node.child_by_field_name("attribute")?).into(),
+            ]);
+        }
+        self.dotted(node)
+    }
+
+    fn receiver(&self, scope: usize, name: &str) -> Option<(usize, usize)> {
+        let mut current = Some(scope);
+        while let Some(index) = current {
+            let scope = &self.scopes[index];
+            if scope.kind != ScopeKind::Class {
+                if scope.uncertain {
+                    return None;
+                }
+                if let Some(binding) = scope.bindings.get(name) {
+                    return match binding {
+                        Binding::Receiver { class, method } => Some((*class, *method)),
+                        _ => None,
+                    };
+                }
+            }
+            current = scope.parent;
+        }
+        None
+    }
+
+    fn receiver_key(
+        &self,
+        class: usize,
+        method: usize,
+        member: &str,
+        super_call: bool,
+    ) -> Option<String> {
+        // The enclosing method must still be a verified descriptor. Rebinding
+        // the method or a decorator builtin invalidates its implicit receiver.
+        self.facts
+            .nodes
+            .iter()
+            .find(|n| n.id == self.scopes[method].owner)?
+            .binding_key
+            .as_ref()?;
+        let class = self
+            .facts
+            .nodes
+            .iter()
+            .find(|n| n.id == self.scopes[class].owner)?
+            .binding_key
+            .as_deref()?;
+        Some(format!(
+            "{}:{}.{}",
+            if super_call {
+                "python-super"
+            } else {
+                "python-receiver"
+            },
+            class.strip_prefix("python:")?,
+            member
+        ))
+    }
+
     fn call_key(&self, call: &PendingCall) -> Option<String> {
         let parts: Vec<_> = call.parts.iter().map(|part| identifier(part)).collect();
         let name = parts.first()?;
@@ -1175,6 +1312,29 @@ impl Extractor<'_> {
             && (name == "__class__" || parts.iter().any(|part| private_name(part)))
         {
             return None;
+        }
+        if name == "super()" && parts.len() == 2 {
+            // Zero-argument super uses the *current* frame's first argument;
+            // closures and anonymous scopes do not inherit that frame.
+            let scope = &self.scopes[call.scope];
+            if scope.uncertain || !self.stars.is_empty() {
+                return None;
+            }
+            let (class, method) = scope.bindings.values().find_map(|b| match b {
+                Binding::Receiver { class, method } => Some((*class, *method)),
+                _ => None,
+            })?;
+            let mut current = Some(call.scope);
+            while let Some(index) = current {
+                let scope = &self.scopes[index];
+                if scope.kind != ScopeKind::Class
+                    && (scope.uncertain || scope.bindings.contains_key("super"))
+                {
+                    return None;
+                }
+                current = scope.parent;
+            }
+            return self.receiver_key(class, method, &parts[1], true);
         }
         let mut index = Some(call.scope);
         let mut deferred = false;
@@ -1187,6 +1347,9 @@ impl Extractor<'_> {
                 }
                 if let Some(binding) = scope.bindings.get(name) {
                     return match binding {
+                        Binding::Receiver { class, method } if parts.len() == 2 => {
+                            self.receiver_key(*class, *method, &parts[1], false)
+                        }
                         Binding::Definition { key, start, .. } | Binding::Symbol { key, start }
                             if parts.len() == 1 && (deferred || *start <= call.start) =>
                         {
@@ -1476,16 +1639,40 @@ impl Extractor<'_> {
         }
         for call in &self.calls {
             let key = self.call_key(call);
+            let reference_id = format!(
+                "call:{}:{}-{}",
+                self.scopes[call.scope].owner, call.start, call.end
+            );
+            if key.as_ref().is_some_and(|k| {
+                k.starts_with("python-receiver:") || k.starts_with("python-super:")
+            }) {
+                let node = self
+                    .facts
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.id == self.scopes[call.scope].owner)
+                    .unwrap();
+                if node.metadata.is_null() {
+                    node.metadata = json!({});
+                }
+                if node.metadata.get("python_references").is_none() {
+                    node.metadata["python_references"] = json!([]);
+                }
+                node.metadata["python_references"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "reference_id": reference_id, "context": "receiver_declaration",
+                        "line": call.line, "text": &self.source[call.start..call.end],
+                    }));
+            }
             let reason = if key.is_some() {
                 "static target is unavailable or ambiguous"
             } else {
                 "dynamic, shadowed, or uncertain Python binding"
             };
             self.facts.references.push(Reference {
-                id: format!(
-                    "call:{}:{}-{}",
-                    self.scopes[call.scope].owner, call.start, call.end
-                ),
+                id: reference_id,
                 source: self.scopes[call.scope].owner.clone(),
                 label: if call.parts.is_empty() {
                     "<dynamic call>".into()
@@ -1499,7 +1686,12 @@ impl Extractor<'_> {
                 reason: reason.into(),
             });
         }
-        for scope in self.scopes.iter().filter(|s| s.kind == ScopeKind::Class) {
+        for (class, scope) in self
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == ScopeKind::Class)
+        {
             let bases: Vec<_> = self
                 .evidence
                 .iter()
@@ -1538,6 +1730,12 @@ impl Extractor<'_> {
                 node.metadata["python_bases"] = json!(bases);
                 node.metadata["python_members"] = json!(members);
                 node.metadata["python_class_uncertain"] = json!(scope.uncertain);
+                node.metadata["python_receiver_writes"] = json!(
+                    self.receiver_writes
+                        .get(&class)
+                        .cloned()
+                        .unwrap_or_default()
+                );
             }
         }
         self.exports();
@@ -1607,7 +1805,9 @@ fn python_definition_key(node: &Node) -> Option<&str> {
 pub struct PythonContext {
     modules: BTreeMap<String, Vec<PythonModule>>,
     bindings: BTreeSet<String>,
+    methods: BTreeSet<String>,
     classes: BTreeMap<String, Vec<PythonClass>>,
+    children: BTreeMap<String, BTreeSet<String>>,
     fingerprint: String,
 }
 
@@ -1626,6 +1826,7 @@ struct PythonClass {
     bases: Vec<Option<String>>,
     members: BTreeMap<String, Option<String>>,
     uncertain: bool,
+    receiver_writes: BTreeSet<String>,
 }
 
 impl PythonContext {
@@ -1662,6 +1863,10 @@ impl PythonContext {
                             uncertain: python_definition_key(node).is_none()
                                 || node.metadata["python_literal_bases"] != true
                                 || node.metadata["python_class_uncertain"] == true,
+                            receiver_writes: serde_json::from_value(
+                                node.metadata["python_receiver_writes"].clone(),
+                            )
+                            .unwrap_or_default(),
                         });
                 }
                 bindings.extend(python_definition_key(node).map(str::to_owned));
@@ -1669,6 +1874,16 @@ impl PythonContext {
                     node.metadata.get("binding_aliases"),
                     node.metadata["python_pending_binding"].get("aliases"),
                 ] {
+                    if node.kind == "method" {
+                        context.methods.extend(
+                            aliases
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                    }
                     bindings.extend(
                         aliases
                             .and_then(Value::as_array)
@@ -1717,11 +1932,28 @@ impl PythonContext {
                 });
             context.bindings.extend(bindings);
         }
+        // Keep even invalid descendant hierarchies: a conflicting C3 order
+        // must not certify calls on an ancestor's implicit receiver.
+        for (child, variants) in &context.classes {
+            for info in variants {
+                for base in info.bases.iter().flatten() {
+                    if let Some((base, _)) = context.resolve(base, &mut BTreeSet::new())
+                        && context.classes.contains_key(&base)
+                    {
+                        context
+                            .children
+                            .entry(base)
+                            .or_default()
+                            .insert(child.clone());
+                    }
+                }
+            }
+        }
         // Stamp binding context, not reference usage or source locations.
         // Ordinary terminal definitions/body edits keep per-file parsing; Store
         // already rebinds references when those defining keys change.
         let mut hash = blake3::Hasher::new();
-        hash.update(b"python-import-context-5");
+        hash.update(b"python-import-context-6");
         for (module, files) in &context.modules {
             if files.len() == 1 && files[0].exports.is_empty() && files[0].stars.is_empty() {
                 continue;
@@ -1817,6 +2049,24 @@ impl PythonContext {
                 let input = json!([key, resolved]).to_string();
                 hash.update(&(input.len() as u64).to_le_bytes());
                 hash.update(input.as_bytes());
+            }
+            if let Some((class, member)) = key
+                .strip_prefix("python-member:")
+                .and_then(|k| k.rsplit_once('.'))
+            {
+                let class = format!("python:{class}");
+                if context.classes.contains_key(&class) {
+                    let receiver = context.receiver_target(&class, member, false);
+                    let super_target = context.receiver_target(&class, member, true);
+                    // Only exceptions to ordinary member lookup and available
+                    // super routes affect consumers. Never hash receiver sites,
+                    // method bodies, byte offsets, or ordinary root definitions.
+                    if receiver != resolved || super_target.is_some() {
+                        let input = json!(["receiver", key, receiver, super_target]).to_string();
+                        hash.update(&(input.len() as u64).to_le_bytes());
+                        hash.update(input.as_bytes());
+                    }
+                }
             }
         }
         context.fingerprint = hash.finalize().to_hex().to_string();
@@ -1920,6 +2170,19 @@ impl PythonContext {
     fn resolve(&self, key: &str, seen: &mut BTreeSet<String>) -> Option<(String, bool)> {
         if seen.len() >= 64 || !seen.insert(key.to_owned()) {
             return None;
+        }
+        if let Some(rest) = key
+            .strip_prefix("python-receiver:")
+            .or_else(|| key.strip_prefix("python-super:"))
+        {
+            let (class, member) = rest.rsplit_once('.')?;
+            return self
+                .receiver_target(
+                    &format!("python:{class}"),
+                    member,
+                    key.starts_with("python-super:"),
+                )
+                .map(|target| (target, true));
         }
         if let Some(local) = key.strip_prefix("python-local:") {
             let (module, local) = local.split_once(':')?;
@@ -2047,6 +2310,78 @@ impl PythonContext {
             return self.resolve(&target, seen).map(|(key, _)| (key, true));
         }
         Some((key.into(), false))
+    }
+
+    fn receiver_target(&self, class: &str, member: &str, super_call: bool) -> Option<String> {
+        let mut cache = BTreeMap::new();
+        let mro = self.mro(class, &mut BTreeSet::new(), &mut cache)?;
+        let target = self.receiver_in_mro(&mro, class, member, super_call)?;
+        let mut pending: Vec<_> = self.children.get(class).into_iter().flatten().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(child) = pending.pop() {
+            if !seen.insert(child) {
+                continue;
+            }
+            let mro = self.mro(child, &mut BTreeSet::new(), &mut cache)?;
+            if self
+                .receiver_in_mro(&mro, class, member, super_call)
+                .as_ref()
+                != Some(&target)
+            {
+                return None;
+            }
+            pending.extend(self.children.get(child).into_iter().flatten());
+        }
+        Some(target)
+    }
+
+    fn receiver_in_mro(
+        &self,
+        mro: &[String],
+        class: &str,
+        member: &str,
+        super_call: bool,
+    ) -> Option<String> {
+        for ancestor in mro {
+            for info in self.classes.get(ancestor).into_iter().flatten() {
+                if info.receiver_writes.contains("__class__")
+                    || info.receiver_writes.contains("*")
+                    || (!super_call
+                        && (info.receiver_writes.contains(member)
+                            || info.members.contains_key("__getattribute__")
+                            || info.members.contains_key("__getattr__")))
+                {
+                    return None;
+                }
+            }
+        }
+        let start = if super_call {
+            mro.iter().position(|key| key == class)? + 1
+        } else {
+            0
+        };
+        for ancestor in &mro[start..] {
+            if ancestor == "python-builtin:object" {
+                continue;
+            }
+            let info = self.classes.get(ancestor)?.first()?;
+            if let Some(target) = info.members.get(member) {
+                let alias = format!(
+                    "python-member:{}",
+                    target.as_ref()?.strip_prefix("python:")?
+                );
+                return self.methods.contains(&alias).then_some(alias);
+            }
+        }
+        // A missing ordinary member keeps a terminal key so Store can bind an
+        // added declaration without reparsing all unrelated Python files. An
+        // existing alias cannot establish a member absent from this MRO.
+        let key = format!(
+            "python-member:{}.{}",
+            class.strip_prefix("python:").unwrap(),
+            member
+        );
+        (!super_call && !self.bindings.contains(&key)).then_some(key)
     }
 
     fn unshadowed_binding(&self, module: &str, name: &str) -> bool {

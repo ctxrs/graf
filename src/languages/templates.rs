@@ -1566,6 +1566,226 @@ impl<'a> Template<'a> {
     }
 }
 
+/// Index literal script bodies only in source-ordered regions identified as markup.
+/// All masks retain UTF-8 byte offsets, including CRLF and non-ASCII host text.
+pub(super) fn append_inline_javascript(
+    host: &mut FileFacts,
+    source: &str,
+    regions: &[Range<usize>],
+) -> Result<()> {
+    if regions.is_empty() {
+        return Ok(());
+    }
+    let visible = mask_ranges(source, regions);
+    let mut classic = Vec::new();
+    let mut modules = Vec::new();
+    let mut pos = 0;
+    while let Some(offset) = visible[pos..].find('<') {
+        pos += offset;
+        if visible[pos..].starts_with("<!--") {
+            pos = visible[pos + 4..]
+                .find("-->")
+                .map_or(visible.len(), |end| pos + 4 + end + 3);
+            continue;
+        }
+        let Some(tag) = tag_at(&visible, pos) else {
+            // Do not look inside a malformed opening tag's quoted attributes.
+            if visible
+                .as_bytes()
+                .get(pos + 1)
+                .is_some_and(u8::is_ascii_alphabetic)
+            {
+                break;
+            }
+            pos += 1;
+            continue;
+        };
+        pos = tag.range.end;
+        let name = tag.name.to_ascii_lowercase();
+        if name == "plaintext" {
+            break;
+        }
+        if !matches!(
+            name.as_str(),
+            "script"
+                | "style"
+                | "textarea"
+                | "title"
+                | "xmp"
+                | "iframe"
+                | "noembed"
+                | "noframes"
+                | "noscript"
+        ) {
+            continue;
+        }
+        let Some((end, after)) = find_close_tag(&visible, pos, &format!("</{name}")) else {
+            if name == "script" {
+                diagnostic(
+                    host,
+                    Some(
+                        source[..tag.range.start]
+                            .bytes()
+                            .filter(|b| *b == b'\n')
+                            .count() as u32
+                            + 1,
+                    ),
+                    "Unclosed inline script block; JavaScript omitted",
+                );
+            }
+            break;
+        };
+        let body = pos..end;
+        pos = after;
+        if name != "script"
+            || !regions
+                .get(
+                    regions
+                        .partition_point(|r| r.start <= tag.range.start)
+                        .saturating_sub(1),
+                )
+                .is_some_and(|r| r.start <= tag.range.start && after <= r.end)
+            || tag.attrs.iter().any(|a| a.name.eq_ignore_ascii_case("src"))
+        {
+            continue;
+        }
+        // Reject unknown or conflicting script language declarations, including data blocks.
+        if tag.attrs.iter().any(|a| {
+            let value = a.value.trim().to_ascii_lowercase();
+            match a.name.to_ascii_lowercase().as_str() {
+                "type" => !matches!(
+                    value.as_str(),
+                    "" | "module"
+                        | "text/javascript"
+                        | "application/javascript"
+                        | "text/ecmascript"
+                        | "application/ecmascript"
+                ),
+                "lang" | "language" => {
+                    !matches!(value.as_str(), "" | "js" | "javascript" | "ecmascript")
+                }
+                _ => false,
+            }
+        }) {
+            continue;
+        }
+        if tag.attrs.iter().any(|a| {
+            a.name.eq_ignore_ascii_case("type") && a.value.trim().eq_ignore_ascii_case("module")
+        }) {
+            if modules.len() == 128 {
+                diagnostic(
+                    host,
+                    None,
+                    "Inline module script limit reached; remaining scripts omitted",
+                );
+                break;
+            }
+            modules.push(body);
+        } else {
+            classic.push(body);
+        }
+    }
+    // Classic blocks share file scope; each module script has its own scope.
+    let groups = std::iter::once(classic).chain(modules.into_iter().map(|r| vec![r]));
+    for (group, ranges) in groups.enumerate() {
+        if ranges.is_empty() {
+            continue;
+        }
+        let masked = mask_ranges(source, &ranges);
+        if ranges.len() > 1 {
+            // Masking must not join two incomplete scripts into a fabricated declaration/call.
+            let Some(syntax) = tree(tree_sitter_javascript::LANGUAGE.into(), &masked, host)? else {
+                continue;
+            };
+            if children(syntax.root_node()).into_iter().any(|n| {
+                !n.is_extra()
+                    && !ranges
+                        .get(
+                            ranges
+                                .partition_point(|r| r.start <= n.start_byte())
+                                .saturating_sub(1),
+                        )
+                        .is_some_and(|r| r.start <= n.start_byte() && n.end_byte() <= r.end)
+            }) {
+                diagnostic(
+                    host,
+                    None,
+                    "JavaScript syntax crosses script block boundaries; classic scripts omitted",
+                );
+                continue;
+            }
+        }
+        let mut js = super::javascript::parse(&host.path, &masked, &host.hash)?;
+        host.diagnostics.append(&mut js.diagnostics);
+        if js.nodes.is_empty() {
+            continue;
+        }
+        let root = js.nodes.remove(0).id;
+        let owner = &host.nodes[0].id;
+        // Keep native language/byte-based IDs. Namespace every local binding and alias
+        // so page.php cannot export into page.js, another PHP suffix, or a sibling module.
+        let keys: HashMap<_, _> = js
+            .nodes
+            .iter()
+            .flat_map(|n| {
+                n.binding_key.iter().map(String::as_str).chain(
+                    n.metadata["binding_aliases"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str),
+                )
+            })
+            .map(|key| {
+                (
+                    key.to_owned(),
+                    format!(
+                        "javascript:embedded:{}:{}:{group}:{key}",
+                        host.path.len(),
+                        host.path
+                    ),
+                )
+            })
+            .collect();
+        for n in &mut js.nodes {
+            n.binding_key = n.binding_key.as_ref().map(|key| keys[key].clone());
+            if let Some(aliases) = n
+                .metadata
+                .get_mut("binding_aliases")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for alias in aliases {
+                    if let Some(key) = alias.as_str().and_then(|key| keys.get(key)) {
+                        *alias = json!(key);
+                    }
+                }
+            }
+        }
+        for edge in &mut js.edges {
+            if edge.source == root {
+                edge.source = owner.clone();
+            }
+            if edge.target == root {
+                edge.target = owner.clone();
+            }
+        }
+        for reference in &mut js.references {
+            if reference.source == root {
+                reference.source = owner.clone();
+            }
+            for key in &mut reference.candidate_keys {
+                if let Some(mapped) = keys.get(key) {
+                    *key = mapped.clone();
+                }
+            }
+        }
+        host.nodes.extend(js.nodes);
+        host.edges.extend(js.edges);
+        host.references.extend(js.references);
+    }
+    Ok(())
+}
+
 fn blank(bytes: &mut [u8], range: Range<usize>) {
     for b in &mut bytes[range] {
         if !matches!(*b, b'\n' | b'\r') {

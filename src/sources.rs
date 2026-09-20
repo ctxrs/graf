@@ -20,9 +20,20 @@ pub fn add_and_index(
     options: &index::IndexOptions,
     capture: &ingest::CaptureMetadata,
 ) -> Result<(SourceRecord, IndexReport)> {
-    let capture_started = std::time::Instant::now();
     let prepared = index::prepare_semantic_budget(options);
-    let options = &prepared;
+    add_and_index_prepared(root, db, source, name, &prepared, capture)
+        .map_err(|error| index::retain_semantic_usage(error, &prepared))
+}
+
+fn add_and_index_prepared(
+    root: &Path,
+    db: &Path,
+    source: &str,
+    name: Option<&str>,
+    options: &index::IndexOptions,
+    capture: &ingest::CaptureMetadata,
+) -> Result<(SourceRecord, IndexReport)> {
+    let capture_started = std::time::Instant::now();
     let reserved = usize::from(options.ingest.semantic.is_some());
     ensure!(
         options.max_semantic_files <= 100_000,

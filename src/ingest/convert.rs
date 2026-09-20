@@ -117,9 +117,18 @@ impl CommandAdapter {
     }
 
     /// Claude Code print-only inference, with tool use and session persistence disabled.
+    /// One text generation; native vision explicitly raises the turn limit and
+    /// reserves every permitted turn before adding its per-file Read allowlist.
+    /// Arbitrary custom executables remain responsible for honoring requested
+    /// limits: Graf cannot bound model work hidden inside a user adapter.
     pub fn claude_cli() -> Self {
         Self {
-            program: "claude".into(),
+            program: if cfg!(windows) {
+                "claude.cmd"
+            } else {
+                "claude"
+            }
+            .into(),
             args: vec![
                 "--print".into(),
                 "--model".into(),
@@ -129,6 +138,8 @@ impl CommandAdapter {
                 "--tools".into(),
                 String::new(),
                 "--no-session-persistence".into(),
+                "--max-turns".into(),
+                "1".into(),
                 "--setting-sources".into(),
                 String::new(),
                 "--strict-mcp-config".into(),
@@ -138,6 +149,19 @@ impl CommandAdapter {
             output_file: false,
         }
     }
+}
+
+/// TempDir defaults to 0777 masked by umask on Unix. Provider inputs need an
+/// owner-only directory from creation, including before request files exist.
+pub(super) fn private_tempdir() -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("graf-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(builder.tempdir()?)
 }
 
 /// No shell, bounded wall-clock and output, no inherited terminal/stdin. Temp
@@ -189,11 +213,38 @@ pub(super) fn run_bytes_until(
     limit: usize,
     env: &[(&str, String)],
 ) -> Result<Vec<u8>> {
+    let (bytes, success) = run_provider_until(adapter, input, stdin, deadline, limit, env)?;
+    ensure!(
+        success,
+        "converter/provider exited unsuccessfully (output omitted to protect credentials)"
+    );
+    Ok(bytes)
+}
+
+#[derive(Debug)]
+pub(super) struct CommandTimeout;
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("converter/provider timed out")
+    }
+}
+impl std::error::Error for CommandTimeout {}
+
+/// Native provider protocols can report typed errors and usage on nonzero exit.
+/// Never expose stdout/stderr in an error; ordinary converters still reject it.
+pub(super) fn run_provider_until(
+    adapter: &CommandAdapter,
+    input: Option<&Path>,
+    stdin: Option<&[u8]>,
+    deadline: Instant,
+    limit: usize,
+    env: &[(&str, String)],
+) -> Result<(Vec<u8>, bool)> {
     ensure!(
         !adapter.program.is_empty(),
         "converter executable must be configured"
     );
-    let temp = tempfile::tempdir()?;
+    let temp = private_tempdir()?;
     let input = input.map(Path::canonicalize).transpose()?;
     let stem = input
         .as_ref()
@@ -239,13 +290,17 @@ pub(super) fn run_bytes_until(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    ensure!(Instant::now() < deadline, "converter/provider timed out");
+    if Instant::now() >= deadline {
+        return Err(CommandTimeout.into());
+    }
     let mut child = command
         .spawn()
         .context("cannot start configured converter/provider executable")?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<bool> {
         loop {
-            ensure!(Instant::now() < deadline, "converter/provider timed out");
+            if Instant::now() >= deadline {
+                return Err(CommandTimeout.into());
+            }
             ensure!(
                 stdout.metadata()?.len() <= limit as u64
                     && stderr.metadata()?.len() <= limit as u64,
@@ -260,15 +315,10 @@ pub(super) fn run_bytes_until(
             #[cfg(test)]
             tests::after_output_sample(&mut child);
             if let Some(status) = child.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "converter/provider exited unsuccessfully (output omitted to protect credentials)"
-                );
-                break;
+                break Ok(status.success());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Ok(())
     })();
     // Terminate the process group even after successful parent exit; detached
     // descendants cannot continue writing the result while it is consumed.
@@ -280,14 +330,19 @@ pub(super) fn run_bytes_until(
         let _ = child.kill();
     }
     let _ = child.wait();
-    result?;
+    let success = result?;
     // The child can write after the last polling sample and exit before
     // try_wait. Recheck both captures even when a declared file is the result.
     ensure!(
         stdout.metadata()?.len() <= limit as u64 && stderr.metadata()?.len() <= limit as u64,
         "converter/provider output exceeds byte limit"
     );
-    ensure!(Instant::now() < deadline, "converter/provider timed out");
+    if Instant::now() >= deadline {
+        return Err(CommandTimeout.into());
+    }
+    if !success && adapter.output_file {
+        return Ok((Vec::new(), false));
+    }
     let mut bytes = Vec::new();
     if adapter.output_file {
         bytes = super::read_bounded(&output, limit as u64)
@@ -301,7 +356,7 @@ pub(super) fn run_bytes_until(
         bytes.len() <= limit,
         "converter/provider output exceeds byte limit"
     );
-    Ok(bytes)
+    Ok((bytes, success))
 }
 
 fn xml_text(bytes: &[u8], limit: usize) -> Result<String> {

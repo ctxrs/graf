@@ -38,6 +38,9 @@ pub struct SetupArgs {
     /// Install graph guidance and CLI usage (the default when no component is selected).
     #[arg(long)]
     pub skill: bool,
+    /// Opt in to fail-open source read/search guidance (Claude, CodeBuddy, Gemini projects).
+    #[arg(long)]
+    pub tool_hooks: bool,
 }
 
 #[derive(Debug, Args)]
@@ -76,7 +79,7 @@ pub struct SetupReport {
 
 const LIMIT: u64 = 8 * 1024 * 1024;
 const BEGIN: &str = "<!-- graf:begin -->";
-const GUIDANCE_VERSION: u32 = 1;
+const GUIDANCE_VERSION: u32 = 2;
 const HOSTS: &[&str] = &[
     "agents",
     "claude",
@@ -109,7 +112,8 @@ the local SQLite snapshot. With MCP enabled, use the Graf tools for the same
 reads. Use exact returned IDs for ambiguous names, `--json` for structured
 results, and `--db PATH` to select a database. Check `truncated`, diagnostics,
 and unresolved references. Read source files whenever useful to verify results.
-Queries never rebuild, scan source freshness, fetch URLs, or call providers.
+Default graph reads do not check source freshness. Graph reads never rebuild,
+fetch URLs or call providers; explicit memory annotations check cited local files.
 
 ## Create and refresh
 
@@ -158,7 +162,7 @@ parallel/mixed edges and collapse risks without changing topology.
 `graf label --output labels.json` saves deterministic membership-based labels;
 `graf report --labels labels.json` applies only labels whose members still match.
 `graf report --check-freshness` explicitly scans native source fingerprints;
-without it, coverage describes stored inputs and freshness is not checked.
+without it, coverage describes stored inputs rather than checkout freshness.
 `graf benchmark --query SYMBOL --iterations 20` times local bounded SQL reads;
 timings are machine/cache dependent and do not compare other graph tools.
 
@@ -168,6 +172,29 @@ without opening registered sources. Missing sources abort rebuilds and retain
 the previous aggregate. `graf merge --project NAME=PATH --snapshot NAME=FILE
 --output NEW_DB` combines named inputs without collapsing source identities.
 Analysis, labels, and exports never refresh the original graph implicitly.
+
+Save reviewed useful answers explicitly with `graf save-result --question TEXT
+--answer-file FILE --outcome useful --nodes ID`, using exact returned node IDs.
+`graf reflect --if-stale` writes local lessons; ordinary queries never save answers
+automatically. Add `--memory-dir graf-out/memory` to `graf show SYMBOL` or
+`graf report --output report.md` to read observations and check cited sources
+without changing graph data, ranking or lessons; the report still writes its
+requested output. Inspect stale, unverified and omitted observations.
+
+`graf provider detect --json` inspects local configuration without contacting
+providers or verifying authentication. Preview `graf provider template PRESET
+--json`; explicitly register `graf provider --project . setup NAME PRESET`.
+Registration does not enable extraction; `index --provider NAME` does. Only when
+GitHub inspection is requested, use `graf prs --repo OWNER/REPO` or
+`graf prs NUMBER --repo OWNER/REPO`. These contact GitHub through authenticated
+`gh`; they do not post comments/reviews, merge or change worktrees.
+
+Optional project guidance hooks use `graf install --platform claude --project .
+--tool-hooks` (also `codebuddy`). For Gemini with MCP, select `--mcp --tool-hooks`
+together. Hooks never deny source access. Uninstall with the same platform,
+project and component selection; add `--skill` explicitly if wanted. If Gemini
+MCP or hooks are already installed separately, uninstall that selection before
+installing both together.
 
 ## Guidance updates
 
@@ -669,6 +696,76 @@ fn mcp_bytes(
     Ok(out)
 }
 
+fn tool_hook_bytes(old: &[u8], host: &str, scope: &Path) -> Result<Vec<u8>> {
+    // One fixed executable on PATH; quote only the pinned project argument.
+    let project = if cfg!(windows) {
+        let value = scope.to_str().context("project path must be UTF-8")?;
+        ensure!(
+            !value.contains(['"', '%', '!', '$', '`', '\n', '\r', '\0']),
+            "project path cannot be quoted safely for this host shell"
+        );
+        format!("\"{value}\"")
+    } else {
+        quote(scope)?
+    };
+    let command = format!("graf hook-guard --platform {host} --project {project}");
+    let (event, matcher, timeout) = if host == "gemini" {
+        ("BeforeTool", "read_file|list_directory", 10_000)
+    } else {
+        ("PreToolUse", "Read|Glob|Grep|Bash", 10)
+    };
+    let entry =
+        json!({"matcher":matcher,"hooks":[{"type":"command","command":command,"timeout":timeout}]});
+    let (fields, root_start) = object_fields(old, host)?;
+    let (position, comma, member) = if let Some(range) = fields.get("hooks") {
+        let (events, start) = object_fields(&old[range.clone()], host)?;
+        if let Some(array) = events.get(event) {
+            let offset = range.start + array.start;
+            let bytes = &old[offset..range.start + array.end];
+            // The complete configuration was already parsed with host-specific
+            // strictness; inspect this array without rewriting its existing bytes.
+            let parsed = jsonc_parser::parse_to_ast(
+                std::str::from_utf8(bytes)?,
+                &Default::default(),
+                &Default::default(),
+            )?;
+            let array = parsed
+                .value
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .context("tool hook event must be an array")?;
+            ensure!(
+                !String::from_utf8_lossy(bytes).contains("graf hook-guard"),
+                "unowned Graf tool hook already exists"
+            );
+            (
+                offset + array.range.start + 1,
+                !array.elements.is_empty(),
+                entry.to_string(),
+            )
+        } else {
+            (
+                range.start + start,
+                !events.is_empty(),
+                format!("{}: [{entry}]", serde_json::to_string(event)?),
+            )
+        }
+    } else {
+        (
+            root_start,
+            !fields.is_empty(),
+            format!(
+                "\"hooks\": {{{}: [{entry}]}}",
+                serde_json::to_string(event)?
+            ),
+        )
+    };
+    let mut out = old[..position].to_vec();
+    out.extend_from_slice(format!("\n  {member}{}\n", if comma { "," } else { "" }).as_bytes());
+    out.extend_from_slice(&old[position..]);
+    Ok(out)
+}
+
 fn receipt_path(scope: &Path, host: &str, component: &str) -> PathBuf {
     scope
         .join(".graf/setup")
@@ -750,6 +847,159 @@ fn load(path: &Path, scope: &Path, allowed: &[PathBuf]) -> Result<Option<Receipt
         );
     }
     Ok(Some(receipt))
+}
+
+// Claude's global MCP file also contains native first-run/account preferences.
+// This exception is intentionally limited to uninstalling its unchanged MCP
+// member. Install, guidance, hooks, and every other host retain exact receipts.
+fn claude_mcp_cleanup(receipt: &mut Receipt) -> Result<()> {
+    ensure!(
+        receipt.changes.len() == 1,
+        "unexpected Claude MCP receipt destinations"
+    );
+    let change = &mut receipt.changes[0];
+    let current = read(&change.path)?;
+    if recorded(change, &current) {
+        return Ok(());
+    }
+    let before = strict_claude_json(change.before.as_deref().unwrap_or(b"{}"))?;
+    let installed = strict_claude_json(&change.after)?;
+    let before_servers = before
+        .get("mcpServers")
+        .map(|v| v.as_object().context("invalid original MCP server map"))
+        .transpose()?;
+    ensure!(
+        before_servers.is_none_or(|s| !s.contains_key("graf")),
+        "receipt does not establish Graf MCP ownership"
+    );
+    let expected = installed
+        .get("mcpServers")
+        .and_then(|s| s.get("graf"))
+        .filter(|v| v.is_object())
+        .context("receipt lacks an owned Graf MCP entry")?;
+    let Some(bytes) = current.as_deref() else {
+        // The whole configuration was removed by its owner; do not recreate it.
+        change.before = None;
+        return Ok(());
+    };
+    let value = strict_claude_json(bytes)?;
+    let servers = value
+        .get("mcpServers")
+        .map(|v| v.as_object().context("invalid current MCP server map"))
+        .transpose()?;
+    let cleaned = if let Some(owned) = servers.and_then(|s| s.get("graf")) {
+        ensure!(
+            owned == expected,
+            "Graf MCP entry changed after installation; refusing to modify configuration"
+        );
+        let keys: &[&str] = if before_servers.is_none() && servers.is_some_and(|s| s.len() == 1) {
+            &["mcpServers"]
+        } else {
+            &["mcpServers", "graf"]
+        };
+        remove_json_property(bytes, keys)?
+    } else {
+        bytes.to_vec()
+    };
+    // Only the in-memory undo plan changes. The durable original receipt remains
+    // until atomic replacement succeeds. On interruption the next uninstall sees
+    // the already-absent owned key and completes without touching unrelated data.
+    change.after = bytes.to_vec();
+    change.before = Some(cleaned);
+    change.previous_after = None;
+    Ok(())
+}
+
+fn strict_claude_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Claude MCP JSON; configuration unchanged"))?;
+    ensure!(
+        value.is_object(),
+        "Claude MCP configuration must be an object"
+    );
+    let parsed = jsonc_parser::parse_to_ast(
+        std::str::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("invalid Claude MCP JSON encoding"))?,
+        &Default::default(),
+        &Default::default(),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid Claude MCP JSON; configuration unchanged"))?;
+    let mut pending = vec![parsed.value.as_ref().context("empty Claude MCP JSON")?];
+    while let Some(node) = pending.pop() {
+        match node {
+            jsonc_parser::ast::Value::Object(object) => {
+                let mut names = std::collections::BTreeSet::new();
+                for property in &object.properties {
+                    ensure!(
+                        names.insert(property.name.as_str()),
+                        "duplicate JSON key; configuration unchanged"
+                    );
+                    pending.push(&property.value);
+                }
+            }
+            jsonc_parser::ast::Value::Array(array) => pending.extend(&array.elements),
+            _ => {}
+        }
+    }
+    Ok(value)
+}
+
+fn remove_json_property(bytes: &[u8], keys: &[&str]) -> Result<Vec<u8>> {
+    let parsed = jsonc_parser::parse_to_ast(
+        std::str::from_utf8(bytes)?,
+        &Default::default(),
+        &Default::default(),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid Claude MCP JSON; configuration unchanged"))?;
+    let mut object = parsed
+        .value
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .context("Claude MCP configuration must be an object")?;
+    for key in &keys[..keys.len() - 1] {
+        object = object
+            .properties
+            .iter()
+            .find(|p| p.name.as_str() == *key)
+            .and_then(|p| p.value.as_object())
+            .context("MCP server map is not an object")?;
+    }
+    let index = object
+        .properties
+        .iter()
+        .position(|p| p.name.as_str() == keys[keys.len() - 1])
+        .context("owned MCP entry disappeared")?;
+    let property = &object.properties[index];
+    let comma = if let Some(next) = object.properties.get(index + 1) {
+        bytes[property.range.end..next.range.start]
+            .iter()
+            .position(|b| *b == b',')
+            .map(|i| property.range.end + i)
+    } else if index > 0 {
+        let start = object.properties[index - 1].range.end;
+        bytes[start..property.range.start]
+            .iter()
+            .position(|b| *b == b',')
+            .map(|i| start + i)
+    } else {
+        None
+    };
+    ensure!(
+        object.properties.len() == 1 || comma.is_some(),
+        "invalid MCP member separator"
+    );
+    let mut ranges: Vec<_> = std::iter::once(property.range.start..property.range.end).collect();
+    if let Some(comma) = comma {
+        ranges.push(comma..comma + 1);
+    }
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut result = bytes.to_vec();
+    for range in ranges {
+        result.drain(range);
+    }
+    // Keep all other bytes, including native host formatting and unrelated keys.
+    strict_claude_json(&result)?;
+    Ok(result)
 }
 
 fn recorded(change: &Change, current: &Option<Vec<u8>>) -> bool {
@@ -1026,7 +1276,11 @@ fn setup(args: &SetupArgs, remove: bool) -> Result<SetupReport> {
         files: vec![],
         notes: vec![],
     };
-    let skill = args.skill || !args.mcp;
+    ensure!(
+        !args.tool_hooks || (!args.global && matches!(host, "claude" | "codebuddy" | "gemini")),
+        "--tool-hooks supports project installations for claude, codebuddy and gemini only"
+    );
+    let skill = args.skill || (!args.mcp && !args.tool_hooks);
     let mut groups = Vec::new();
     if skill {
         let primary = if host == "claude" && args.config_root.is_some() {
@@ -1058,7 +1312,7 @@ fn setup(args: &SetupArgs, remove: bool) -> Result<SetupReport> {
         allowed.extend(guidance);
         groups.push(("skill", allowed));
     }
-    if args.mcp {
+    if args.mcp && !(args.tool_hooks && host == "gemini") {
         let (path, _) = mcp_path(host, args.global)?;
         let path = if host == "claude" && args.config_root.is_some() {
             // Claude retains its legacy config when present, otherwise using
@@ -1082,6 +1336,33 @@ fn setup(args: &SetupArgs, remove: bool) -> Result<SetupReport> {
             report
                 .notes
                 .push("Codex loads project MCP configuration only for trusted projects.".into());
+        }
+    }
+    if args.tool_hooks {
+        let component = if host == "gemini" && args.mcp {
+            "mcp-tool-hooks"
+        } else {
+            "tool-hooks"
+        };
+        groups.push((
+            component,
+            vec![scope.join(format!(".{host}/settings.json"))],
+        ));
+        report.notes.push("Tool hooks provide optional snapshot guidance and never deny source access. Freshness is not checked. Graf must be on the host's PATH.".into());
+    }
+    if host == "gemini" && (args.mcp || args.tool_hooks) {
+        let selected = if args.mcp && args.tool_hooks {
+            "mcp-tool-hooks"
+        } else if args.mcp {
+            "mcp"
+        } else {
+            "tool-hooks"
+        };
+        for component in ["mcp", "tool-hooks", "mcp-tool-hooks"] {
+            ensure!(
+                component == selected || !receipt_path(&scope, host, component).try_exists()?,
+                "Gemini settings are already owned by {component}; uninstall that same selection before changing components, then install --mcp --tool-hooks together if both are wanted"
+            );
         }
     }
     if skill && host == "cursor" && args.global {
@@ -1117,6 +1398,9 @@ fn setup(args: &SetupArgs, remove: bool) -> Result<SetupReport> {
     for (component, allowed) in groups {
         let path = receipt_path(&scope, host, component);
         let receipt = if let Some(mut receipt) = load(&path, &scope, &allowed)? {
+            if remove && args.global && host == "claude" && component == "mcp" {
+                claude_mcp_cleanup(&mut receipt)?;
+            }
             verify(&receipt)?;
             if component == "skill" && !remove {
                 upgrade_guidance(&mut receipt, host, &allowed[0])?;
@@ -1126,10 +1410,17 @@ fn setup(args: &SetupArgs, remove: bool) -> Result<SetupReport> {
             continue;
         } else {
             let mut changes = Vec::new();
-            if component == "mcp" {
-                let (_, key) = mcp_path(host, args.global)?;
+            if matches!(component, "mcp" | "tool-hooks" | "mcp-tool-hooks") {
                 let old = read(&allowed[0])?;
-                let after = mcp_bytes(&allowed[0], old.as_deref(), key, &scope, args.global, host)?;
+                let mut after = if component != "tool-hooks" {
+                    let (_, key) = mcp_path(host, args.global)?;
+                    mcp_bytes(&allowed[0], old.as_deref(), key, &scope, args.global, host)?
+                } else {
+                    old.clone().unwrap_or_else(|| b"{}\n".to_vec())
+                };
+                if component != "mcp" {
+                    after = tool_hook_bytes(&after, host, &scope)?;
+                }
                 changes.push(edited(allowed[0].clone(), old, after)?);
             } else {
                 changes.push(planned(
