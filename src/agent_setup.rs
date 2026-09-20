@@ -79,7 +79,7 @@ pub struct SetupReport {
 
 const LIMIT: u64 = 8 * 1024 * 1024;
 const BEGIN: &str = "<!-- graf:begin -->";
-const GUIDANCE_VERSION: u32 = 1;
+const GUIDANCE_VERSION: u32 = 2;
 const HOSTS: &[&str] = &[
     "agents",
     "claude",
@@ -112,7 +112,8 @@ the local SQLite snapshot. With MCP enabled, use the Graf tools for the same
 reads. Use exact returned IDs for ambiguous names, `--json` for structured
 results, and `--db PATH` to select a database. Check `truncated`, diagnostics,
 and unresolved references. Read source files whenever useful to verify results.
-Queries never rebuild, scan source freshness, fetch URLs, or call providers.
+Default graph reads do not check source freshness. Graph reads never rebuild,
+fetch URLs or call providers; explicit memory annotations check cited local files.
 
 ## Create and refresh
 
@@ -161,7 +162,7 @@ parallel/mixed edges and collapse risks without changing topology.
 `graf label --output labels.json` saves deterministic membership-based labels;
 `graf report --labels labels.json` applies only labels whose members still match.
 `graf report --check-freshness` explicitly scans native source fingerprints;
-without it, coverage describes stored inputs and freshness is not checked.
+without it, coverage describes stored inputs rather than checkout freshness.
 `graf benchmark --query SYMBOL --iterations 20` times local bounded SQL reads;
 timings are machine/cache dependent and do not compare other graph tools.
 
@@ -171,6 +172,29 @@ without opening registered sources. Missing sources abort rebuilds and retain
 the previous aggregate. `graf merge --project NAME=PATH --snapshot NAME=FILE
 --output NEW_DB` combines named inputs without collapsing source identities.
 Analysis, labels, and exports never refresh the original graph implicitly.
+
+Save reviewed useful answers explicitly with `graf save-result --question TEXT
+--answer-file FILE --outcome useful --nodes ID`, using exact returned node IDs.
+`graf reflect --if-stale` writes local lessons; ordinary queries never save answers
+automatically. Add `--memory-dir graf-out/memory` to `graf show SYMBOL` or
+`graf report --output report.md` to read observations and check cited sources
+without changing graph data, ranking or lessons; the report still writes its
+requested output. Inspect stale, unverified and omitted observations.
+
+`graf provider detect --json` inspects local configuration without contacting
+providers or verifying authentication. Preview `graf provider template PRESET
+--json`; explicitly register `graf provider --project . setup NAME PRESET`.
+Registration does not enable extraction; `index --provider NAME` does. Only when
+GitHub inspection is requested, use `graf prs --repo OWNER/REPO` or
+`graf prs NUMBER --repo OWNER/REPO`. These contact GitHub through authenticated
+`gh`; they do not post comments/reviews, merge or change worktrees.
+
+Optional project guidance hooks use `graf install --platform claude --project .
+--tool-hooks` (also `codebuddy`). For Gemini with MCP, select `--mcp --tool-hooks`
+together. Hooks never deny source access. Uninstall with the same platform,
+project and component selection; add `--skill` explicitly if wanted. If Gemini
+MCP or hooks are already installed separately, uninstall that selection before
+installing both together.
 
 ## Guidance updates
 

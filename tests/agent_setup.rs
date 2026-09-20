@@ -115,9 +115,9 @@ fn legacy_guidance_upgrades_without_losing_original_undo_or_edit_protection() {
     let (path, original, _) = legacy_guidance(&s);
     let upgraded = s.ok(&["install"]);
     assert_eq!(upgraded["status"], "installed");
-    assert!(upgraded["notes"].to_string().contains("Guidance version 1"));
+    assert!(upgraded["notes"].to_string().contains("Guidance version 2"));
     let receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(receipt["guidance_version"], 1);
+    assert_eq!(receipt["guidance_version"], 2);
     assert_eq!(receipt["changes"][1]["before"], serde_json::json!(original));
     assert!(
         receipt["changes"]
@@ -196,8 +196,9 @@ fn normal_invocation_notices_are_directional_bounded_and_read_only() {
     for (package, revision, direction) in [
         ("0.0.0", 1, "older"),
         ("999999.0.0", 1, "newer"),
-        (env!("CARGO_PKG_VERSION"), 2, "newer"),
-        (env!("CARGO_PKG_VERSION"), 1, ""),
+        (env!("CARGO_PKG_VERSION"), 1, "older"),
+        (env!("CARGO_PKG_VERSION"), 3, "newer"),
+        (env!("CARGO_PKG_VERSION"), 2, ""),
         ("not-a-version", 1, ""),
     ] {
         let content = format!(
@@ -269,8 +270,13 @@ fn normal_invocation_notices_are_directional_bounded_and_read_only() {
 }
 
 #[test]
-fn executable_stamp_refresh_preserves_undo_and_refuses_newer_guidance() {
-    for package in ["0.0.0", "999999.0.0"] {
+fn executable_and_revision_stamp_refresh_preserves_undo_and_refuses_newer_guidance() {
+    for (package, revision, upgrade) in [
+        ("0.0.0", 2, true),
+        ("999999.0.0", 2, false),
+        (env!("CARGO_PKG_VERSION"), 1, true),
+        (env!("CARGO_PKG_VERSION"), 3, false),
+    ] {
         let s = Sandbox::new();
         let original = b"Original rules\r\nKeep spacing.  ";
         write(&s.project.join("AGENTS.md"), original);
@@ -280,17 +286,21 @@ fn executable_stamp_refresh_preserves_undo_and_refuses_newer_guidance() {
         for change in receipt["changes"].as_array_mut().unwrap() {
             let bytes: Vec<u8> = serde_json::from_value(change["after"].clone()).unwrap();
             let changed = String::from_utf8(bytes).unwrap().replace(
-                &format!("executable: {} -->", env!("CARGO_PKG_VERSION")),
-                &format!("executable: {package} -->"),
+                &format!(
+                    "guidance version: 2; executable: {} -->",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                &format!("guidance version: {revision}; executable: {package} -->"),
             );
             write(Path::new(change["path"].as_str().unwrap()), &changed);
             change["after"] = serde_json::json!(changed.into_bytes());
         }
+        receipt["guidance_version"] = serde_json::json!(revision);
         let stamped_receipt = serde_json::to_vec(&receipt).unwrap();
         write(&receipt_path, &stamped_receipt);
         let skill = s.project.join(".agents/skills/graf/SKILL.md");
         let installed = fs::read(&skill).unwrap();
-        if package == "0.0.0" {
+        if upgrade {
             let mut edited = installed.clone();
             edited.extend_from_slice(b"User edit\n");
             write(&skill, edited);
@@ -303,9 +313,19 @@ fn executable_stamp_refresh_preserves_undo_and_refuses_newer_guidance() {
                     .unwrap()
                     .contains(&format!("executable: {} -->", env!("CARGO_PKG_VERSION")))
             );
+            let updated: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            assert_eq!(updated["guidance_version"], 2);
+            assert!(
+                fs::read_to_string(&skill)
+                    .unwrap()
+                    .contains("guidance version: 2;")
+            );
             assert_eq!(s.ok(&["install"])["status"], "unchanged");
         } else {
-            fails(s.cli(&["install"]), "upgrade Graf to avoid a downgrade");
+            fails(
+                s.cli(&["install"]),
+                "installed guidance is newer than this executable",
+            );
             assert_eq!(fs::read(&receipt_path).unwrap(), stamped_receipt);
             assert_eq!(fs::read(&skill).unwrap(), installed);
         }
@@ -342,9 +362,24 @@ fn portable_guidance_preserves_bytes_and_exact_undo() {
         "graf benchmark",
         "--check-freshness",
         "--labels",
-        "Queries never rebuild",
+        "Default graph reads do not check source freshness",
+        "explicit memory annotations check cited local files",
+        "graf save-result --question TEXT",
+        "--answer-file FILE --outcome useful --nodes ID",
+        "graf reflect --if-stale",
+        "--memory-dir graf-out/memory",
+        "requested output",
+        "graf provider detect --json",
+        "graf provider template PRESET",
+        "graf provider --project . setup NAME PRESET",
+        "GitHub inspection is requested",
+        "graf prs NUMBER --repo OWNER/REPO",
+        "graf install --platform claude --project .",
+        "--mcp --tool-hooks",
+        "Hooks never deny source access",
+        "project and component selection",
         "incur costs",
-        "guidance version:",
+        "guidance version: 2;",
     ] {
         assert!(
             skill.contains(workflow),
