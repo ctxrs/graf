@@ -136,6 +136,15 @@ fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
     };
     sql.into_iter().map(|sql| strings(conn, sql)).collect()
 }
+fn postings(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.test_postings USING fts5vocab(main,node_search,instance)",
+    )?;
+    strings(
+        conn,
+        "SELECT json_array(term,doc,col,offset) FROM temp.test_postings ORDER BY term,doc,col,offset",
+    )
+}
 fn assert_integrity(conn: &Connection) -> anyhow::Result<()> {
     assert_eq!(strings(conn, "PRAGMA integrity_check")?, ["ok"]);
     let violations: i64 =
@@ -148,6 +157,154 @@ fn assert_integrity(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn assert_reference_indices(conn: &Connection) -> anyhow::Result<()> {
+    assert_eq!(
+        strings(
+            conn,
+            "SELECT name FROM pragma_index_info('refs_source') ORDER BY seqno"
+        )?,
+        ["source_key"]
+    );
+    for (sql, index) in [
+        ("SELECT rkey FROM refs WHERE source_key=?1", "refs_source"),
+        (
+            "SELECT payload FROM refs WHERE source_key=?1 AND resolved_target_key IS NULL ORDER BY id LIMIT 10",
+            "refs_unresolved_source",
+        ),
+        (
+            "SELECT payload FROM refs WHERE source_key=?1 AND resolved_target_key IS NULL AND relation='calls' ORDER BY id LIMIT 10",
+            "refs_unresolved_relation",
+        ),
+    ] {
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+            .query_map([1_i64], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join("\n");
+        assert!(
+            plan.contains("SEARCH refs") && plan.contains(index),
+            "{plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+    Ok(())
+}
+
+#[test]
+fn reference_source_index_changes_only_in_a_successful_explicit_write() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("source-index.db");
+    seed(&db)?;
+    let sql = Connection::open(&db)?;
+    sql.execute_batch(
+        "DROP INDEX refs_source;
+         CREATE INDEX refs_source ON refs(source_key,id);",
+    )?;
+    let mut stale = Store::open(&db)?;
+    sql.execute("UPDATE metadata SET generation=generation+1", [])?;
+    let before = snapshot(&db)?;
+    let rows = persisted(&sql)?;
+    let old_schema = schema(&sql)?;
+    let expected_neighbors = serde_json::to_value(
+        Store::open_read_only(&db)?.neighbors("z-caller", &QueryOptions::default())?,
+    )?;
+    sql.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let bytes = std::fs::read(&db)?;
+    for reader in [
+        Store::create(&db)?,
+        Store::open(&db)?,
+        Store::open_read_only(&db)?,
+    ] {
+        assert_eq!(serde_json::to_value(reader.snapshot()?)?, before);
+        assert_eq!(
+            serde_json::to_value(reader.neighbors("z-caller", &QueryOptions::default())?)?,
+            expected_neighbors
+        );
+    }
+    assert_eq!(std::fs::read(&db)?, bytes);
+    assert!(
+        stale
+            .apply_native("root", vec![], vec![], Coverage::default())
+            .unwrap_err()
+            .is::<StaleStore>()
+    );
+    assert!(
+        Store::open(&db)?
+            .apply_native("wrong-root", vec![], vec![], Coverage::default())
+            .is_err()
+    );
+    assert!(
+        Store::open(&db)?
+            .refresh_import(ImportedGraph {
+                nodes: vec![],
+                edges: vec![],
+                metadata: Value::Null,
+            })
+            .is_err()
+    );
+    assert_eq!(schema(&sql)?, old_schema);
+    assert_eq!(persisted(&sql)?, rows);
+
+    sql.execute_batch(
+        "CREATE TRIGGER reject_index_write BEFORE UPDATE OF generation ON metadata BEGIN
+         SELECT CASE WHEN (SELECT count(*) FROM pragma_index_info('refs_source'))=1
+           THEN RAISE(ABORT,'after reference index replacement')
+           ELSE RAISE(ABORT,'before reference index replacement') END;
+         END;",
+    )?;
+    let rollback_schema = schema(&sql)?;
+    let mut writer = Store::open(&db)?;
+    let error = writer
+        .apply_native("root", vec![provider()], vec![], Coverage::default())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("after reference index replacement"),
+        "{error:#}"
+    );
+    assert_eq!(schema(&sql)?, rollback_schema);
+    assert_eq!(persisted(&sql)?, rows);
+    assert_eq!(snapshot(&db)?, before);
+    sql.execute_batch("DROP TRIGGER reject_index_write")?;
+
+    let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
+    assert_eq!(report.generation, before["generation"].as_u64().unwrap());
+    assert_eq!(version(&sql)?, 2);
+    assert_reference_indices(&sql)?;
+    assert_eq!(persisted(&sql)?, rows);
+    assert_eq!(snapshot(&db)?, before);
+    assert_eq!(
+        serde_json::to_value(writer.neighbors("z-caller", &QueryOptions::default())?)?,
+        expected_neighbors
+    );
+    let cookie: i64 = sql.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+    writer.apply_native("root", vec![], vec![], Coverage::default())?;
+    assert_eq!(
+        sql.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))?,
+        cookie
+    );
+    // Cascades still remove caller-owned references and their effective keys.
+    writer.apply_native(
+        "root",
+        vec![],
+        vec!["caller.py".into()],
+        Coverage::default(),
+    )?;
+    for table in ["refs", "ref_keys", "edges"] {
+        assert_eq!(
+            sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            0
+        );
+    }
+    assert_eq!(
+        strings(&sql, "SELECT id FROM nodes ORDER BY id")?,
+        ["a-target", "z-target"]
+    );
+    assert_integrity(&sql)?;
+    Ok(())
+}
+
 #[test]
 fn new_compact_stores_keep_public_payloads_and_lexical_order() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
@@ -155,6 +312,7 @@ fn new_compact_stores_keep_public_payloads_and_lexical_order() -> anyhow::Result
     seed(&db)?;
     let sql = Connection::open(&db)?;
     assert_eq!(version(&sql)?, 2);
+    assert_reference_indices(&sql)?;
     for (table, key) in [("files", "fkey"), ("nodes", "nkey"), ("refs", "rkey")] {
         let is_integer_pk: bool = sql.query_row(
             &format!(
@@ -267,6 +425,7 @@ fn real_legacy_layouts_read_without_mutation_then_upgrade_without_graph_change()
         let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
         assert_eq!(report.generation, generation);
         assert_eq!(version(&sql)?, 2);
+        assert_reference_indices(&sql)?;
         assert_eq!(persisted(&sql)?, old_rows);
         assert_eq!(snapshot(&db)?, before);
         assert_eq!(
@@ -642,17 +801,27 @@ fn imported_null_ownership_and_metadata_references_are_not_fabricated_links() ->
         assert_eq!(after[key], before[key]);
     }
     assert_integrity(&sql)?;
+    sql.execute_batch(
+        "DROP INDEX refs_source;
+         CREATE INDEX refs_source ON refs(source_key,id);",
+    )?;
     writer.refresh_import(ImportedGraph {
         nodes: vec![],
         edges: vec![],
         metadata: Value::Null,
     })?;
+    assert_reference_indices(&sql)?;
     assert_eq!(writer.stats()?.nodes, 0);
     assert_eq!(
         strings(&sql, "SELECT CAST(count(*) AS TEXT) FROM node_search")?,
         ["0"]
     );
     writer.refresh_import(imported())?;
+    let before_compact = snapshot(&db)?;
+    let before_rows = persisted(&sql)?;
+    writer.compact()?;
+    assert_eq!(snapshot(&db)?, before_compact);
+    assert_eq!(persisted(&sql)?, before_rows);
     assert_integrity(&sql)?;
     Ok(())
 }
@@ -714,6 +883,7 @@ fn independent_previous_writer_fixture_upgrades_with_exact_records_and_no_genera
     let report = Store::open(&db)?.apply_native("fixture", vec![], vec![], coverage)?;
     assert_eq!(report.generation, stats.generation);
     assert_eq!(version(&sql)?, 2);
+    assert_reference_indices(&sql)?;
     assert_eq!(persisted(&sql)?, old_rows);
     assert_eq!(serde_json::to_value(old_reader.snapshot()?)?, before);
     assert_eq!(
@@ -766,6 +936,15 @@ fn ruby_effective_candidates_survive_upgrade_and_rebind_unchanged_callers() -> a
     let before = persisted(&sql)?;
     let generation = store.stats()?.generation;
     store.apply_native("fixture", vec![], vec![], Coverage::default())?;
+    assert_eq!(persisted(&sql)?, before);
+    assert_eq!(store.stats()?.generation, generation);
+    sql.execute_batch(
+        "DROP INDEX refs_source;
+         CREATE INDEX refs_source ON refs(source_key,id);",
+    )?;
+    store.apply_native("fixture", vec![], vec![], Coverage::default())?;
+    assert_reference_indices(&sql)?;
+    store.compact()?;
     assert_eq!(persisted(&sql)?, before);
     assert_eq!(store.stats()?.generation, generation);
     let has_call = |store: &Store, target: &str| -> anyhow::Result<bool> {
@@ -827,5 +1006,176 @@ fn unsupported_physical_version_and_mismatched_layout_fail_without_repair() -> a
     }
     sql.pragma_update(None, "user_version", 2)?;
     assert_eq!(Store::open_read_only(&db)?.snapshot()?.schema_version, 1);
+    Ok(())
+}
+
+#[test]
+fn vacuum_refuses_legacy_then_preserves_signed_keys_payloads_and_postings() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("vacuum.db");
+    seed(&db)?;
+    let sql = Connection::open(&db)?;
+    storage_legacy::restore_legacy(&sql, false)?;
+    sql.execute_batch(
+        "UPDATE nodes SET rowid=CASE id WHEN 'z-caller' THEN -7 WHEN 'a-helper' THEN 0 ELSE rowid+100 END;
+         UPDATE files SET rowid=rowid+100;
+         UPDATE refs SET rowid=rowid+100;
+         DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )?;
+    let before = snapshot(&db)?;
+    let rows = persisted(&sql)?;
+    let fts = postings(&sql)?;
+    let old_schema = schema(&sql)?;
+    let bytes = std::fs::read(&db)?;
+    let mut store = Store::open(&db)?;
+    let error = store.compact().unwrap_err();
+    assert!(format!("{error:#}").contains("storage format 1"));
+    assert!(format!("{error:#}").contains("update or import refresh"));
+    assert_eq!(std::fs::read(&db)?, bytes);
+    assert_eq!(schema(&sql)?, old_schema);
+    assert_eq!(snapshot(&db)?, before);
+    assert_eq!(persisted(&sql)?, rows);
+    assert_eq!(postings(&sql)?, fts);
+
+    store.apply_native("root", vec![], vec![], Coverage::default())?;
+    assert_eq!(persisted(&sql)?, rows);
+    let compact_schema = schema(&sql)?;
+    sql.execute_batch(
+        "CREATE TABLE discarded(data BLOB);
+         INSERT INTO discarded VALUES(zeroblob(262144));
+         DROP TABLE discarded;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )?;
+    let bytes = std::fs::read(&db)?;
+    let error = Store::open_read_only(&db)?.compact().unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"));
+    assert_eq!(std::fs::read(&db)?, bytes);
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&db)?.ino()
+    };
+    let mut writer = Store::open(&db)?;
+    let report = store.compact()?;
+    assert_eq!(report.schema_version, 1);
+    assert!(report.free_pages_before > 0);
+    assert_eq!(report.free_pages_after, 0);
+    assert!(report.pages_after < report.pages_before);
+    assert!(!report.checkpoint_busy);
+    assert_eq!(
+        std::fs::metadata(&db)?.len(),
+        report.pages_after * report.page_size
+    );
+    assert_eq!(schema(&sql)?, compact_schema);
+    assert_eq!(version(&sql)?, 2);
+    assert_eq!(snapshot(&db)?, before);
+    assert_eq!(persisted(&sql)?, rows);
+    assert_eq!(postings(&sql)?, fts);
+    assert_reference_indices(&sql)?;
+    assert_integrity(&sql)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&db)?.ino(), inode);
+    }
+    // Physical-only compaction leaves a legitimate writer's baseline usable.
+    writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
+    assert_eq!(
+        writer.stats()?.generation,
+        before["generation"].as_u64().unwrap() + 1
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_maintenance_preserves_newer_facts_without_refreshing_its_write_baseline()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("stale-compact.db");
+    seed(&db)?;
+    let mut stale = Store::open(&db)?;
+    let mut writer = Store::open(&db)?;
+    writer.apply_native(
+        "root",
+        vec![],
+        vec!["provider.py".into()],
+        Coverage::default(),
+    )?;
+    let sql = Connection::open(&db)?;
+    let current = snapshot(&db)?;
+    let current_rows = persisted(&sql)?;
+    let fts = postings(&sql)?;
+    stale.compact()?;
+    assert_eq!(snapshot(&db)?, current);
+    assert_eq!(persisted(&sql)?, current_rows);
+    assert_eq!(postings(&sql)?, fts);
+    assert!(
+        stale
+            .apply_native("root", vec![provider()], vec![], Coverage::default())
+            .unwrap_err()
+            .is::<StaleStore>()
+    );
+    assert_eq!(snapshot(&db)?, current);
+    writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
+    assert_eq!(writer.stats()?.unresolved_references, 1);
+    assert_integrity(&sql)?;
+    Ok(())
+}
+
+#[test]
+fn vacuum_keeps_rare_unresolved_streams_bounded_and_ordered() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("rare-compact.db");
+    let mut references: Vec<_> = (0..5_001)
+        .rev()
+        .map(|i| reference(&format!("resolved-{i:05}"), &["z:priority"]))
+        .collect();
+    for id in ["zz-unresolved", "za-unresolved"] {
+        let mut unresolved = reference(id, &["absent"]);
+        unresolved.label = id.into();
+        unresolved.relation = "rare".into();
+        references.push(unresolved);
+    }
+    let mut store = Store::create(&db)?;
+    store.apply_native(
+        "root",
+        vec![
+            facts(
+                "caller.py",
+                vec![node("z-caller", "caller.py", &[])],
+                references,
+            ),
+            provider(),
+        ],
+        vec![],
+        Coverage::default(),
+    )?;
+    let options = QueryOptions {
+        relation: Some("rare".into()),
+        ..Default::default()
+    };
+    let before = store.neighbors("z-caller", &options)?;
+    assert!(!before.truncated);
+    assert!(before.edges.is_empty());
+    assert_eq!(
+        before
+            .unresolved
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect::<Vec<_>>(),
+        ["za-unresolved", "zz-unresolved"]
+    );
+    store.compact()?;
+    assert_eq!(
+        serde_json::to_value(store.neighbors("z-caller", &options)?)?,
+        serde_json::to_value(before)?
+    );
+    let unfiltered = store.neighbors("z-caller", &QueryOptions::default())?;
+    assert!(unfiltered.truncated);
+    assert_eq!(unfiltered.edges.len(), 5_000);
+    let sql = Connection::open(&db)?;
+    assert_reference_indices(&sql)?;
+    assert_integrity(&sql)?;
     Ok(())
 }

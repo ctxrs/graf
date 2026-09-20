@@ -1,6 +1,6 @@
 use graf::{
     languages::parse,
-    model::{Coverage, FileFacts, Node},
+    model::{Coverage, FileFacts, Node, Reference},
     store::Store,
 };
 
@@ -16,6 +16,312 @@ fn node<'a>(facts: &'a FileFacts, qualified: &str) -> &'a Node {
         .iter()
         .find(|n| n.qualified_name.as_deref() == Some(qualified))
         .unwrap_or_else(|| panic!("missing {qualified}"))
+}
+
+fn callback_references(facts: &FileFacts) -> Vec<&Reference> {
+    facts
+        .references
+        .iter()
+        .filter(|r| r.reason.starts_with("callback argument;"))
+        .inspect(|r| assert_eq!(r.relation, "references"))
+        .collect()
+}
+
+fn assert_callback_site(source: &str, reference: &Reference, start: usize) {
+    let end = start + reference.label.len();
+    assert_eq!(&source[start..end], reference.label);
+    assert_eq!(
+        reference.id,
+        format!("references:{}:{start}-{end}", reference.source)
+    );
+    assert_eq!(
+        reference.line as usize,
+        source[..start].bytes().filter(|b| *b == b'\n').count() + 1
+    );
+    assert!(reference.reason.contains("invocation is not implied"));
+}
+
+#[test]
+fn callback_value_references_respect_block_loop_var_and_parameter_scopes() {
+    let source = r#"export function transform() {}
+function block(queue) {
+  { const transform = 0; queue.offer(transform); }
+  queue.offer(transform);
+}
+function forOf(queue, values) {
+  for (const transform of values) { queue.offer(transform); }
+  queue.offer(transform);
+}
+function cStyle(queue) {
+  for (let transform = 0; transform < 1; transform++) { queue.offer(transform); }
+  queue.offer(transform);
+}
+function varBlock(queue) {
+  { var transform = 0; }
+  queue.offer(transform);
+}
+function varLoop(queue, values) {
+  for (var transform of values) { queue.offer(transform); }
+  queue.offer(transform);
+}
+function parameter(queue, transform) { queue.offer(transform); }
+function genuine(queue) { queue.offer(transform); }
+"#;
+    let expected = [
+        ("block", false),
+        ("block", true),
+        ("forOf", false),
+        ("forOf", true),
+        ("cStyle", false),
+        ("cStyle", true),
+        ("varBlock", false),
+        ("varLoop", false),
+        ("varLoop", false),
+        ("parameter", false),
+        ("genuine", true),
+    ];
+    for path in ["scopes.js", "scopes.ts"] {
+        let facts = facts(path, source);
+        let references = callback_references(&facts);
+        assert_eq!(references.len(), expected.len());
+        let sites: Vec<_> = source.match_indices("queue.offer(transform)").collect();
+        assert_eq!(sites.len(), expected.len());
+        for ((offset, _), (owner, resolved)) in sites.into_iter().zip(expected) {
+            let start = offset + "queue.offer(".len();
+            let id = format!(
+                "references:{}:{start}-{}",
+                node(&facts, owner).id,
+                start + "transform".len()
+            );
+            let reference = references.iter().find(|r| r.id == id).unwrap();
+            assert_callback_site(source, reference, start);
+            assert_eq!(reference.file, path);
+            assert_eq!(reference.source, node(&facts, owner).id);
+            assert_eq!(reference.label, "transform");
+            let keys = if resolved {
+                vec![format!("javascript:file:{path}:transform")]
+            } else {
+                vec![]
+            };
+            assert_eq!(reference.candidate_keys, keys, "{path}: {owner}:{start}");
+        }
+        assert!(!facts.references.iter().any(|r| {
+            r.label == "transform" && matches!(r.relation.as_str(), "calls" | "declared_callee")
+        }));
+    }
+}
+
+#[test]
+fn callback_value_references_use_final_write_and_dynamic_scope_checks() {
+    for source in [
+        "export function transform() {} function use() { queue.offer(transform); } transform = other;",
+        "transform = other; export function transform() {} function use() { queue.offer(transform); }",
+        "export function transform() {} function use() { queue.offer(transform); } function replace() { transform = other; }",
+        "export function transform() {} function use() { queue.offer(transform); eval(code); }",
+        "export function transform() {} with (context) { queue.offer(transform); }",
+        "export function transform() {} export function transform() {} queue.offer(transform);",
+    ] {
+        for path in ["writes.js", "writes.ts"] {
+            let facts = facts(path, source);
+            let references: Vec<_> = callback_references(&facts)
+                .into_iter()
+                .filter(|r| r.label == "transform")
+                .collect();
+            assert_eq!(references.len(), 1, "{path}: {source}");
+            assert!(references[0].candidate_keys.is_empty(), "{path}: {source}");
+            assert_callback_site(
+                source,
+                references[0],
+                source.find("queue.offer(transform)").unwrap() + "queue.offer(".len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn callback_value_references_preserve_anonymous_owners_and_each_argument_site() {
+    let source = r#"export function transform() {}
+function make(queue, values) {
+  for (const transform of values) { queue.wrap(() => queue.offer(transform)); }
+  return () => { queue.offer(transform, transform); transform(); };
+}
+"#;
+    for path in ["closures.js", "closures.ts"] {
+        let facts = facts(path, source);
+        let references = callback_references(&facts);
+        assert_eq!(references.len(), 3);
+        let arrows: Vec<_> = facts
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "function" && n.label.starts_with("<anonymous@"))
+            .collect();
+        assert_eq!(arrows.len(), 2);
+        let sites = [
+            ("() => queue.offer", "queue.offer(transform)", false),
+            ("() => {", "queue.offer(transform, transform)", true),
+        ];
+        for (arrow, call, resolved) in sites {
+            let arrow_start = source.find(arrow).unwrap();
+            let owner = arrows
+                .iter()
+                .find(|n| n.metadata["start_byte"] == arrow_start)
+                .unwrap();
+            let owned: Vec<_> = references.iter().filter(|r| r.source == owner.id).collect();
+            assert_eq!(owned.len(), if resolved { 2 } else { 1 });
+            for (index, reference) in owned.iter().enumerate() {
+                let start =
+                    source.find(call).unwrap() + "queue.offer(".len() + index * "transform, ".len();
+                assert_callback_site(source, reference, start);
+                assert_ne!(reference.source, node(&facts, "make").id);
+                assert_eq!(
+                    reference.candidate_keys,
+                    if resolved {
+                        vec![format!("javascript:file:{path}:transform")]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+        let calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.label == "transform" && r.relation == "calls")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source, references[1].source);
+        assert_eq!(
+            calls[0].candidate_keys,
+            [format!("javascript:file:{path}:transform")]
+        );
+    }
+}
+
+#[test]
+fn callback_value_references_store_only_proved_functions_and_retract_stale_links() {
+    let source = r#"import { remote } from './provider';
+export function transform() {}
+const local = () => {};
+const data = 1;
+const produced = factory();
+class Shape {}
+function use(queue) {
+  queue.offer(transform, transform, local, data, produced, remote, unknown, Shape);
+  queue.offer(object.transform, table[transform], ...values, () => {});
+  transform();
+}
+"#;
+    for path in ["values.js", "values.ts"] {
+        let original = facts(path, source);
+        let references = callback_references(&original);
+        assert_eq!(references.len(), 8);
+        for reference in &references {
+            assert_eq!(reference.source, node(&original, "use").id);
+            let expected = match reference.label.as_str() {
+                "transform" => vec![format!("javascript:file:{path}:transform")],
+                "local" => vec![node(&original, "local").binding_key.clone().unwrap()],
+                "data" | "produced" | "remote" | "unknown" | "Shape" => vec![],
+                other => panic!("unexpected callback: {other}"),
+            };
+            assert_eq!(reference.candidate_keys, expected);
+        }
+        assert!(
+            !original
+                .references
+                .iter()
+                .any(|r| r.relation == "declared_callee")
+        );
+        let provenance: Vec<_> = references
+            .iter()
+            .filter(|r| !r.candidate_keys.is_empty())
+            .map(|r| (r.id.clone(), r.line, r.label.clone()))
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+        store
+            .apply_native(
+                "fixture",
+                vec![
+                    original.clone(),
+                    facts("provider.js", "export function remote() {}"),
+                ],
+                vec![],
+                Coverage::default(),
+            )
+            .unwrap();
+        let graph = store.snapshot().unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.relation == "references")
+            .collect();
+        assert_eq!(edges.len(), 3);
+        for (id, line, label) in provenance {
+            let edge = edges
+                .iter()
+                .find(|e| e.metadata["reference_id"] == id)
+                .unwrap();
+            assert_eq!(edge.id, format!("reference:{id}"));
+            assert_eq!(edge.source, node(&original, "use").id);
+            assert_eq!(edge.target, node(&original, &label).id);
+            assert_eq!(edge.file.as_deref(), Some(path));
+            assert_eq!(edge.line, Some(line));
+        }
+        let calls: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.relation == "calls")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].target, node(&original, "transform").id);
+
+        for (changed, count) in [
+            (format!("{source}\ntransform = other; local = other;"), 0),
+            (source.to_owned(), 3),
+            (source.replace("export function transform() {}", ""), 1),
+            (source.to_owned(), 3),
+        ] {
+            store
+                .apply_native(
+                    "fixture",
+                    vec![facts(path, &changed)],
+                    vec![],
+                    Coverage::default(),
+                )
+                .unwrap();
+            let graph = store.snapshot().unwrap();
+            let edges: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|e| e.relation == "references")
+                .collect();
+            assert_eq!(edges.len(), count);
+            assert!(!edges.iter().any(|e| {
+                graph
+                    .nodes
+                    .iter()
+                    .any(|n| n.id == e.target && n.label == "remote")
+            }));
+            if count == 1 {
+                assert_eq!(edges[0].target, node(&facts(path, &changed), "local").id);
+            }
+            assert_eq!(
+                graph.edges.iter().filter(|e| e.relation == "calls").count(),
+                usize::from(count == 3)
+            );
+        }
+        store
+            .apply_native("fixture", vec![], vec![path.into()], Coverage::default())
+            .unwrap();
+        let graph = store.snapshot().unwrap();
+        assert!(!graph.nodes.iter().any(|n| n.file == path));
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| matches!(e.relation.as_str(), "references" | "calls"))
+        );
+    }
 }
 
 #[test]

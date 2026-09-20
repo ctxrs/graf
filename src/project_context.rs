@@ -1835,6 +1835,9 @@ impl JavascriptContext {
                     })
                     .map(str::to_owned)
                     .collect();
+                if keys.is_empty() {
+                    continue;
+                }
                 let declaration = (node.kind == "constant"
                     && node.metadata["declared_callee_binding"] == true
                     && node
@@ -1913,6 +1916,7 @@ impl JavascriptContext {
                 }
             }
         }
+        drop(providers);
         // Join value exports by their actual published symbol. In particular an
         // interface must not shadow a star-exported value, whereas a direct
         // function must shadow it, even though the reserved suffix differs.
@@ -3412,6 +3416,51 @@ mod source_snapshot_tests {
         assert_eq!(restored_hash, hash);
         assert!(context.validate_source(path, &restored_hash).is_ok());
         assert!(edited.validate_source(path, &restored_hash).is_err());
+    }
+
+    #[test]
+    fn javascript_provider_scratch_preserves_raw_facts_and_caller_outcomes() {
+        let root = tempfile::tempdir().unwrap();
+        let caller = "import {Shape, ordinary} from './provider'; function use(value: Shape): Shape { Shape(); ordinary(); return value; }";
+        std::fs::write(root.path().join("main.ts"), caller).unwrap();
+        let paths = ["provider.ts".into(), "main.ts".into()];
+        let mut previous = None;
+        for private_count in [0, 16, 0] {
+            let mut provider = String::from(
+                "export interface Shape {}\nexport const Shape = factory();\nexport function ordinary() {}\nfunction privateScope() {\nfunction local() {} local();\n",
+            );
+            for i in 0..private_count {
+                provider.push_str(&format!("function helper_{i}() {{}} helper_{i}();\n"));
+            }
+            provider.push_str("}\n");
+            std::fs::write(root.path().join("provider.ts"), &provider).unwrap();
+            let mut context =
+                ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                    .unwrap();
+            let provider_hash = blake3::hash(provider.as_bytes()).to_hex().to_string();
+            let raw = crate::languages::parse("provider.ts", &provider, &provider_hash)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&raw).unwrap(),
+                serde_json::to_value(&context.javascript.raw_facts["provider.ts"]).unwrap()
+            );
+            let caller_hash = blake3::hash(caller.as_bytes()).to_hex().to_string();
+            let mut applied = context
+                .take_cached_facts("main.ts", &caller_hash)
+                .unwrap()
+                .unwrap();
+            context.apply(&mut applied);
+            let outcome = (
+                context.javascript.imported_callees.clone(),
+                context.fingerprint("main.ts"),
+                serde_json::to_value(applied).unwrap(),
+            );
+            if let Some(previous) = previous {
+                assert_eq!(previous, outcome);
+            }
+            previous = Some(outcome);
+        }
     }
 
     #[test]

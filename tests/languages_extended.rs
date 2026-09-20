@@ -215,6 +215,212 @@ fn verilog_package_class_function_and_module_instantiation() {
     );
     assert!(!f.nodes.iter().any(|n| n.label == "Fake"));
 }
+
+#[test]
+fn verilog_local_instantiation_uses_one_definition_in_either_order() {
+    use graf::{
+        model::{Coverage, Direction, QueryOptions},
+        store::Store,
+    };
+
+    let buffer = "module Buffer(); endmodule\n";
+    let board = "module Board();\n  Buffer segment();\n  AbsentBuffer missing();\nendmodule\n";
+    for (source, local_line, absent_line) in [
+        (format!("{buffer}{board}"), 3, 4),
+        (format!("{board}{buffer}"), 2, 3),
+    ] {
+        let file = facts("board.sv", &source);
+        let board_id = node(&file, "Board").id.clone();
+        let buffer_id = node(&file, "Buffer").id.clone();
+        assert_eq!(file.nodes.iter().filter(|n| n.label == "Buffer").count(), 1);
+        assert_eq!(key(&file, "Buffer"), "verilog:symbol:Buffer");
+        assert!(!file.nodes.iter().any(|n| n.label == "AbsentBuffer"));
+        let references: Vec<_> = file
+            .references
+            .iter()
+            .filter(|r| r.relation == "instantiates")
+            .collect();
+        assert_eq!(references.len(), 2);
+        for (label, line) in [("Buffer", local_line), ("AbsentBuffer", absent_line)] {
+            let reference = references.iter().find(|r| r.label == label).unwrap();
+            assert_eq!(reference.source, board_id);
+            assert_eq!(reference.line, line);
+            assert_eq!(
+                reference.candidate_keys,
+                [format!("verilog:symbol:{label}")]
+            );
+        }
+        let reference_id = references
+            .iter()
+            .find(|r| r.label == "Buffer")
+            .unwrap()
+            .id
+            .clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+        store
+            .apply_native("fixture", vec![file], vec![], Coverage::default())
+            .unwrap();
+        let result = store
+            .neighbors(
+                &board_id,
+                &QueryOptions {
+                    direction: Direction::Outgoing,
+                    relation: Some("instantiates".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.edges.len(), 1);
+        let edge = &result.edges[0];
+        assert_eq!((&edge.source, &edge.target), (&board_id, &buffer_id));
+        assert_eq!(edge.relation, "instantiates");
+        assert_eq!(edge.file.as_deref(), Some("board.sv"));
+        assert_eq!(edge.line, Some(local_line));
+        assert_eq!(edge.metadata["reference_id"], reference_id);
+        assert_eq!(result.unresolved.len(), 1);
+        let absent = &result.unresolved[0];
+        assert_eq!(
+            (
+                &absent.source,
+                absent.label.as_str(),
+                absent.file.as_str(),
+                absent.line
+            ),
+            (&board_id, "AbsentBuffer", "board.sv", absent_line)
+        );
+        let graph = store.snapshot().unwrap();
+        assert_eq!(
+            graph.nodes.iter().filter(|n| n.label == "Buffer").count(),
+            1
+        );
+        assert!(!graph.nodes.iter().any(|n| n.label == "AbsentBuffer"));
+    }
+}
+
+#[test]
+fn verilog_provider_removal_and_duplicate_definitions_leave_instantiation_unresolved() {
+    use graf::{
+        model::{Coverage, Direction, QueryOptions},
+        store::Store,
+    };
+
+    let caller = facts(
+        "board.sv",
+        "module Board();\n  Buffer segment();\nendmodule\n",
+    );
+    let board = node(&caller, "Board").id.clone();
+    assert!(!caller.nodes.iter().any(|n| n.label == "Buffer"));
+    let reference = caller
+        .references
+        .iter()
+        .find(|r| r.relation == "instantiates")
+        .unwrap()
+        .clone();
+    assert_eq!(reference.candidate_keys, ["verilog:symbol:Buffer"]);
+    let provider = facts("buffer.sv", "module Buffer(); endmodule\n");
+    let buffer = node(&provider, "Buffer").id.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    let check = |store: &Store, target: Option<&str>, ambiguous: bool| {
+        let result = store
+            .neighbors(
+                &board,
+                &QueryOptions {
+                    direction: Direction::Outgoing,
+                    relation: Some("instantiates".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!result.truncated);
+        if let Some(target) = target {
+            assert_eq!(result.edges.len(), 1);
+            assert_eq!(result.edges[0].source, board);
+            assert_eq!(result.edges[0].target, target);
+            assert_eq!(result.edges[0].line, Some(2));
+            assert_eq!(result.edges[0].metadata["reference_id"], reference.id);
+            assert!(result.unresolved.is_empty());
+        } else {
+            assert!(result.edges.is_empty());
+            assert_eq!(result.unresolved.len(), 1);
+            let unresolved = &result.unresolved[0];
+            assert_eq!(
+                (
+                    &unresolved.source,
+                    unresolved.label.as_str(),
+                    unresolved.file.as_str(),
+                    unresolved.line
+                ),
+                (&board, "Buffer", "board.sv", 2)
+            );
+            assert_eq!(unresolved.reason.contains("ambiguous binding"), ambiguous);
+        }
+        assert!(
+            !store
+                .snapshot()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|n| n.label == "Buffer" && n.file == "board.sv")
+        );
+    };
+    store
+        .apply_native("fixture", vec![caller], vec![], Coverage::default())
+        .unwrap();
+    check(&store, None, false);
+    store
+        .apply_native("fixture", vec![provider], vec![], Coverage::default())
+        .unwrap();
+    check(&store, Some(&buffer), false);
+    store
+        .apply_native(
+            "fixture",
+            vec![facts("duplicate.sv", "module Buffer(); endmodule\n")],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    check(&store, None, true);
+    assert_eq!(
+        store
+            .snapshot()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|n| n.label == "Buffer")
+            .count(),
+        2
+    );
+    store
+        .apply_native(
+            "fixture",
+            vec![],
+            vec!["duplicate.sv".into()],
+            Coverage::default(),
+        )
+        .unwrap();
+    check(&store, Some(&buffer), false);
+    store
+        .apply_native(
+            "fixture",
+            vec![],
+            vec!["buffer.sv".into()],
+            Coverage::default(),
+        )
+        .unwrap();
+    check(&store, None, false);
+    assert!(
+        !store
+            .snapshot()
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|n| n.label == "Buffer")
+    );
+}
+
 #[test]
 fn zig_container_function_and_imported_call() {
     let lib = facts("lib.zig", "pub fn helper(x: i32) i32 { return x; }\n");

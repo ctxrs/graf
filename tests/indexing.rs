@@ -943,3 +943,71 @@ fn unreadable_ignore_rules_preserve_generation_and_recover() {
         assert_eq!(Store::open(&db).unwrap().stats().unwrap().files, 1);
     }
 }
+
+#[test]
+fn failed_inventory_preserves_whole_graph_then_valid_shrink_keeps_unchanged_sources() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let active = root.path().join("active.py");
+    let provider = root.path().join("provider.py");
+    fs::write(&provider, "def retained():\n    pass\n").unwrap();
+    fs::write(
+        &active,
+        "from provider import retained\ndef old():\n    retained()\ndef removed_one():\n    pass\ndef removed_two():\n    pass\n",
+    )
+    .unwrap();
+    index::run(root.path(), &db).unwrap();
+    let before = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+    let retained: Vec<_> = before
+        .nodes
+        .iter()
+        .filter(|node| node.file == "provider.py")
+        .map(|node| serde_json::to_value(node).unwrap())
+        .collect();
+    assert!(!retained.is_empty());
+
+    fs::write(
+        &active,
+        "from provider import retained\ndef replacement():\n    retained()\n",
+    )
+    .unwrap();
+    let rules = root.path().join(".grafignore");
+    fs::write(&rules, [0xff]).unwrap();
+    assert!(index::run(root.path(), &db).is_err());
+    assert_eq!(
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+
+    fs::write(&rules, "").unwrap();
+    let report = index::run(root.path(), &db).unwrap();
+    assert_eq!((report.parsed_files, report.unchanged_files), (1, 1));
+    let store = Store::open_read_only(&db).unwrap();
+    let after = store.snapshot().unwrap();
+    assert_eq!(after.generation, before.generation + 1);
+    assert!(after.nodes.len() < before.nodes.len());
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .filter(|node| node.file == "provider.py")
+            .map(|node| serde_json::to_value(node).unwrap())
+            .collect::<Vec<_>>(),
+        retained
+    );
+    assert!(
+        after
+            .nodes
+            .iter()
+            .all(|node| !["old", "removed_one", "removed_two"].contains(&node.label.as_str()))
+    );
+    let graph = callees(&store, "replacement");
+    assert_eq!(graph.edges.len(), 1);
+    assert!(graph.nodes.iter().any(|node| node.label == "retained"));
+    drop(store);
+    let unchanged = index::run(root.path(), &db).unwrap();
+    assert_eq!(
+        (unchanged.parsed_files, unchanged.generation),
+        (0, after.generation)
+    );
+}
