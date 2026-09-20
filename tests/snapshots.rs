@@ -1,3 +1,6 @@
+#[path = "support/storage_legacy.rs"]
+mod storage_legacy;
+
 use std::{
     io::Write,
     sync::{Arc, Barrier},
@@ -473,6 +476,7 @@ fn schema_one_opens_without_migration_and_indexing_backfills_aliases() {
         .apply_native("root", vec![target], vec![], Coverage::default())
         .unwrap();
     let sql = rusqlite::Connection::open(&path).unwrap();
+    storage_legacy::restore_legacy(&sql, true).unwrap();
     sql.execute_batch("DROP TABLE node_aliases").unwrap();
     drop(store);
     let mut store = Store::open(&path).unwrap();
@@ -500,7 +504,7 @@ fn schema_one_opens_without_migration_and_indexing_backfills_aliases() {
     assert_eq!(
         sql.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
 }
 

@@ -1,8 +1,8 @@
 # Graf usage
 
-This guide targets Graf 0.4.0. Its workflow additions require Graf 0.4.0 or a
-build from this checkout; installing 0.3.0 does not enable them. Installers fetch
-the latest published release by default, which may precede this checkout.
+This guide describes unreleased Graf 0.5.0. Build from this checkout to use its
+0.5 additions. Installers fetch the latest published release by default, which
+may not include the features described here.
 See the [README](../README.md#install) for release installation and
 [building from source](../README.md#build-from-source).
 
@@ -27,6 +27,12 @@ a model. Explicit learning annotations also check cited local files.
 Use `--db PATH` to select a database; otherwise reads discover the nearest
 ancestor `.graf/index.db`.
 
+Graf 0.5 can read older indexes without upgrading them. Writing an existing
+index, such as with `graf update`, upgrades its storage format in the same
+transaction; a failed write preserves the previous format and graph. After
+upgrading, open that database with Graf 0.5 or later. The portable JSON snapshot
+format is unchanged.
+
 Query supports BFS by default, `--dfs`, repeated `--file`, `--kind`, and
 `--context` filters, plus `--direction in|out|both` and `--relation`. Depth is
 0–6 and the result limit is 1–500. `--budget` estimates tokens from JSON bytes,
@@ -36,14 +42,16 @@ exact IDs when names are ambiguous. `explain` aliases `show`; `affected` aliases
 `impact`.
 
 `impact` follows recorded call, import, type, and other dependency relations
-backwards. A file or class also seeds its contained definitions. Repeat
+backwards, including `declared_member` and `declared_callee` source navigation.
+Those declaration links do not establish runtime dispatch. A file or class also
+seeds its contained definitions. Repeat
 `--relation calls --relation references` to narrow the relation set. Its JSON
 result includes `graph` plus `seeds`: seeds are starting evidence, not affected
 dependents. `show`, `impact`, and path endpoints prefer exact IDs and names,
 then try Unicode/accent-normalized names, prefixes, and substrings. Punctuation
-stays literal and ambiguous matches remain errors. Convenience lookup examines
-at most 5,000 scoped nodes and 8 MiB of name fields; use an exact ID or narrower
-`--file`/`--kind` scope when that bound is reached. File paths stay exact.
+stays literal and ambiguous matches remain errors. Convenience lookup refuses
+incomplete results when its work or byte budget is exhausted; use an exact ID
+or narrower `--file`/`--kind` scope in that case. File paths stay exact.
 
 `graf watch --interval-ms 1000` is an explicit foreground polling loop. It runs
 updates when local fingerprints change; it is not installed as a service.
@@ -72,7 +80,9 @@ Counts detect reductions, not every possible change of meaning.
 `--log-responses` also records returned graph data. MCP does not write query logs.
 
 Keep the SQLite index out of Git and update it after merging source changes.
-Graf does not install a graph merge driver. Installed guidance and MCP tools
+`graf hook install` can opt into refreshing an existing index after commits and
+merges; it does not add the index to Git. Graf does not install a graph merge
+driver. Installed guidance and MCP tools
 provide graph access; [optional tool hooks](#optional-tool-guidance)
 can also suggest it before supported reads/searches, without requiring a graph
 read first. `graf merge` explicitly combines saved graphs while retaining project
@@ -153,7 +163,22 @@ unambiguous indexed project, without evaluating MSBuild. Partial declarations
 and interface navigation retain separate source records and do not assert a
 runtime dispatch target.
 
-Supply Swift module membership explicitly when cross-file navigation is needed:
+For supported dynamic member calls, `declared_member` links to the declaration
+that the written receiver identifies while the `calls` reference remains
+unresolved. For example, a method called through Python `self` or JavaScript
+`this` can be overridden. Use these declaration links to navigate source;
+they do not identify the implementation that will run.
+
+For an immutable JavaScript or TypeScript value created by a factory,
+`declared_callee` can link a use to its written `const` declaration, including
+supported named imports and reexports. The factory's result is not assumed to
+be a particular function or class: runtime `calls` remain unresolved, and a
+same-named interface keeps its separate type identity.
+
+Graf discovers ordinary literal SwiftPM `Sources/` and `Tests/` targets and
+declared local dependencies from an indexed `Package.swift`. Supply module
+membership explicitly when the package uses nonliteral or otherwise opaque
+build configuration and cross-file navigation is needed:
 
 ```sh
 graf index . --swift-module Core=Sources/Core --swift-module App=Sources/App
@@ -430,13 +455,15 @@ soft targets: inspect `community_split_attempts` and
 
 ### Community algorithms
 
-Louvain remains the default. Select native Leiden explicitly for analysis and
-commands that accept analysis options:
+Source builds targeting 0.5 use native Leiden by default; released 0.4 uses
+Louvain. Select either algorithm explicitly for stable behavior across that
+upgrade. For example:
 
 ```sh
 graf analyze --community-algorithm leiden --community-seed 42 \
   --community-local-max-passes 100 --json
 graf export html --community-algorithm leiden --output graph.html
+graf analyze --community-algorithm louvain --json
 ```
 
 Both algorithms use a weighted, symmetric projection of recorded edges and
@@ -711,6 +738,12 @@ Questions are limited to 16 KiB, answers and corrections to 256 KiB each, and
 citations to 100 node IDs per save. Reflection reads immediate `.md` files only,
 at most 4,096 documents of at most 2 MiB each and 32 MiB total. Keep memory and
 reflections out of version control when they contain private work.
+
+`reflect --memory-dir DIR` also reads Graphify Markdown memory records with
+`contributor: graphify`, UTC timestamps and an Answer section. Citations use
+exact IDs or unique exact labels; missing source fingerprints stay unverified.
+Graf does not consume or rewrite Graphify's mutable learning sidecar, infer
+missing provenance, or silently apply those records to query ranking.
 
 ### Read learning observations during navigation
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
-const EXTRACTOR_REVISION: u32 = 9;
+const EXTRACTOR_REVISION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -214,13 +214,15 @@ fn run_prepared(
         .map(|f| (f.path, f.hash))
         .collect();
     let (files, mut coverage) = discover(&root, &db.canonicalize()?, options)?;
-    let context = ProjectContext::discover_with_swift_modules(
+    let mut context = ProjectContext::discover_with_swift_modules(
         &root,
         &files.iter().map(|f| f.1.clone()).collect::<Vec<_>>(),
         &options.swift_modules,
     )?;
     let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
     let mut python = python_inventory(&files, options, &old, &context, &ingest_fingerprint)?;
+    #[cfg(test)]
+    tests::after_python_inventory();
     let detect_ms = started.elapsed().as_secs_f64() * 1000.0;
     let extracting = std::time::Instant::now();
     let mut changed = vec![];
@@ -234,13 +236,14 @@ fn run_prepared(
         };
         let (content_hash, content) = read_source(&path, maximum)?;
         context.validate_source(&relative, &content_hash)?;
+        python.validate_source(&relative, &content_hash)?;
         let hash = stamp(
             &relative,
             &content_hash,
             &context,
             &ingest_fingerprint,
             options,
-            &python.fingerprint,
+            python.context_token(&relative),
         );
         let unchanged = old
             .remove(&relative)
@@ -267,16 +270,7 @@ fn run_prepared(
                                 .facts
                                 .remove(&relative)
                                 .context("Python inventory changed during scan; retry indexing")?;
-                            ensure!(
-                                facts.hash == content_hash,
-                                "Python source changed during scan; retry indexing"
-                            );
                             facts.hash = hash.clone();
-                            python
-                                .context
-                                .as_ref()
-                                .context("Python inventory changed during scan; retry indexing")?
-                                .apply(&mut facts);
                             facts
                         } else if is_robot(&relative) && options.robot_python.is_some() {
                             let python = options.robot_python.as_ref().unwrap();
@@ -289,6 +283,11 @@ fn run_prepared(
                             languages::templates::parse_robot_official(
                                 &relative, source, &hash, &python,
                             )?
+                        } else if let Some(mut facts) =
+                            context.take_cached_facts(&relative, &content_hash)?
+                        {
+                            facts.hash = hash.clone();
+                            facts
                         } else {
                             languages::parse(&relative, source, &hash)?.unwrap_or_else(|| {
                                 diagnostic(
@@ -549,13 +548,14 @@ pub fn check_update(root: &Path, db: &Path) -> Result<Freshness> {
             };
         let (hash, _) = read_source(&path, maximum)?;
         context.validate_source(&relative, &hash)?;
+        python.validate_source(&relative, &hash)?;
         let hash = stamp(
             &relative,
             &hash,
             &context,
             &ingest_fingerprint,
             &options,
-            &python.fingerprint,
+            python.context_token(&relative),
         );
         match old.remove(&relative) {
             None => result.added.push(relative),
@@ -610,10 +610,31 @@ fn python_source_root<'a>(path: &str, options: &'a IndexOptions) -> Option<&'a s
         .map(String::as_str)
 }
 
+#[derive(Default)]
 struct PythonInventory {
-    context: Option<PythonContext>,
-    fingerprint: String,
     facts: HashMap<String, FileFacts>,
+    source_hashes: HashMap<String, String>,
+    context_tokens: HashMap<String, String>,
+}
+
+const PYTHON_TERMINAL_CONTEXT: &str = "terminal-v2";
+
+impl PythonInventory {
+    fn validate_source(&self, path: &str, hash: &str) -> Result<()> {
+        ensure!(
+            self.source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == hash),
+            "Python source changed during scan; retry indexing"
+        );
+        Ok(())
+    }
+
+    fn context_token(&self, path: &str) -> &str {
+        self.context_tokens
+            .get(path)
+            .map_or(PYTHON_TERMINAL_CONTEXT, String::as_str)
+    }
 }
 
 fn python_inventory(
@@ -627,12 +648,12 @@ fn python_inventory(
         !path.starts_with(".graf/sources/")
             && (path.ends_with(".py") || Path::new(path).extension().is_none())
     };
-    let paths: std::collections::BTreeSet<_> = files
+    let paths: BTreeSet<_> = files
         .iter()
         .map(|(_, path)| path.as_str())
         .filter(|p| possible_python(p))
         .collect();
-    let old_paths: std::collections::BTreeSet<_> = old
+    let old_paths: BTreeSet<_> = old
         .keys()
         .map(String::as_str)
         .filter(|p| possible_python(p))
@@ -641,48 +662,50 @@ fn python_inventory(
     // option, inventory member or extractor revision differs, rebuild context.
     // This still hashes source bytes, so equal timestamps cannot conceal edits.
     if !options.force && !paths.is_empty() && paths == old_paths {
-        let first = paths.first().unwrap();
-        let previous = &old[*first];
-        let token = if first.ends_with(".py") {
-            previous.split(':').nth(1)
-        } else {
-            previous.split(':').nth(2)
-        };
-        if let Some(token) =
-            token.filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            let mut unchanged = true;
-            for (path, relative) in files.iter().filter(|(_, path)| possible_python(path)) {
-                let (hash, _) = read_source(path, MAX_SOURCE_BYTES as u64)?;
-                if old.get(relative)
-                    != Some(&stamp(
-                        relative,
-                        &hash,
-                        project,
-                        ingest_fingerprint,
-                        options,
-                        token,
-                    ))
-                {
-                    unchanged = false;
-                    break;
-                }
+        let mut inventory = PythonInventory::default();
+        let mut unchanged = true;
+        for (path, relative) in files.iter().filter(|(_, path)| possible_python(path)) {
+            let Some(token) = old
+                .get(relative)
+                .and_then(|stamp| previous_python_context(stamp))
+            else {
+                unchanged = false;
+                break;
+            };
+            let (hash, _) = read_source(path, MAX_SOURCE_BYTES as u64)?;
+            if old.get(relative)
+                != Some(&stamp(
+                    relative,
+                    &hash,
+                    project,
+                    ingest_fingerprint,
+                    options,
+                    token,
+                ))
+            {
+                unchanged = false;
+                break;
             }
-            if unchanged {
-                return Ok(PythonInventory {
-                    context: None,
-                    fingerprint: token.to_owned(),
-                    facts: HashMap::new(),
-                });
-            }
+            inventory.source_hashes.insert(relative.clone(), hash);
+            inventory
+                .context_tokens
+                .insert(relative.clone(), token.into());
+        }
+        if unchanged {
+            return Ok(inventory);
         }
     }
+    let mut inventory = PythonInventory::default();
     let mut facts = Vec::new();
     for (path, relative) in files {
-        if !relative.ends_with(".py") && Path::new(relative).extension().is_some() {
+        if !possible_python(relative) {
             continue;
         }
         let (hash, bytes) = read_source(path, MAX_SOURCE_BYTES as u64)?;
+        // Even an invalid source or non-Python shebang contributed to discovery.
+        inventory
+            .source_hashes
+            .insert(relative.clone(), hash.clone());
         let Some(bytes) = bytes else { continue };
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
@@ -700,11 +723,84 @@ fn python_inventory(
         )?);
     }
     let context = PythonContext::from_facts(&facts);
-    Ok(PythonInventory {
-        fingerprint: context.fingerprint().to_owned(),
-        context: Some(context),
-        facts: facts.into_iter().map(|f| (f.path.clone(), f)).collect(),
-    })
+    let modules: BTreeSet<_> = facts
+        .iter()
+        .flat_map(|facts| &facts.nodes)
+        .filter_map(|node| node.binding_key.as_deref())
+        .filter(|key| key.starts_with("module:"))
+        .map(str::to_owned)
+        .collect();
+    for mut facts in facts {
+        context.apply(&mut facts);
+        for reference in &mut facts.references {
+            // An unavailable submodule is not an eligible fallback. Keeping the
+            // terminal key lets Store rebind ordinary definition additions and
+            // deletions; an actual submodule addition changes this file's token.
+            if reference.relation == "imports"
+                && let [_, fallback] = reference.candidate_keys.as_slice()
+                && fallback.starts_with("module:")
+                && !modules.contains(fallback)
+            {
+                reference.candidate_keys.pop();
+            }
+        }
+        inventory
+            .context_tokens
+            .insert(facts.path.clone(), python_binding_token(&facts)?);
+        inventory.facts.insert(facts.path.clone(), facts);
+    }
+    Ok(inventory)
+}
+
+fn python_binding_token(facts: &FileFacts) -> Result<String> {
+    // Hash the context outcome, not the corpus or target availability. Stable
+    // candidate keys remain Store-owned even when their terminal targets vanish.
+    let mut references: Vec<_> = facts
+        .references
+        .iter()
+        .map(|reference| {
+            (
+                &reference.id,
+                &reference.relation,
+                &reference.candidate_keys,
+            )
+        })
+        .collect();
+    let mut bindings: Vec<_> = facts
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                &node.id,
+                &node.binding_key,
+                &node.metadata["binding_aliases"],
+            )
+        })
+        .collect();
+    // Export references are emitted from a HashMap; enumeration is not identity.
+    references.sort_by(|a, b| a.0.cmp(b.0));
+    bindings.sort_by(|a, b| a.0.cmp(b.0));
+    let outcome = serde_json::to_vec(&(references, bindings))?;
+    Ok(format!(
+        "{PYTHON_TERMINAL_CONTEXT}-{}",
+        blake3::hash(&outcome)
+    ))
+}
+
+fn previous_python_context(stamp: &str) -> Option<&str> {
+    let context = if let Some(rest) = stamp.strip_prefix("python-v") {
+        let (_, rest) = rest.split_once(':')?;
+        rest.split_once(':').map_or(rest, |(context, _)| context)
+    } else if stamp.starts_with("languages-") {
+        stamp.split(':').nth(2)?
+    } else {
+        return None;
+    };
+    (context == PYTHON_TERMINAL_CONTEXT
+        || context.strip_prefix("terminal-v2-").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        }))
+    .then_some(context)
 }
 
 /// Recover the raw local-source digest from formats produced by this indexer.
@@ -999,4 +1095,92 @@ pub(crate) fn read_source(path: &Path, maximum: u64) -> Result<(String, Option<V
         "source changed during both read attempts: {}",
         path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::RefCell, fs};
+
+    thread_local! {
+        static AFTER_PYTHON_INVENTORY: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_python_inventory() {
+        let hook = AFTER_PYTHON_INVENTORY.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[test]
+    fn python_inventory_restore_before_unchanged_check_preserves_generation() {
+        for api_name in ["api.py", "api"] {
+            let root = tempfile::tempdir().unwrap();
+            let db = root.path().join(".graf/index.db");
+            let api = root.path().join(api_name);
+            let original = "#!/usr/bin/env python3\nfrom impl import first as entry\n";
+            let temporary = "#!/usr/bin/env python3\nfrom impl import second as entry\n";
+            fs::write(&api, original).unwrap();
+            fs::write(
+                root.path().join("impl.py"),
+                "def first(): return 1\ndef second(): return 2\n",
+            )
+            .unwrap();
+            fs::write(
+                root.path().join("consumer.py"),
+                "from api import entry\ndef run(): return entry()\n",
+            )
+            .unwrap();
+            let initial = run(root.path(), &db).unwrap();
+            let snapshot = || Store::open_read_only(&db).unwrap().snapshot().unwrap();
+            let before = serde_json::to_value(snapshot()).unwrap();
+            let target = |graph: &GraphSnapshot| {
+                let call = graph
+                    .edges
+                    .iter()
+                    .find(|edge| edge.relation == "calls")
+                    .unwrap();
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == call.target)
+                    .unwrap()
+                    .qualified_name
+                    .clone()
+                    .unwrap()
+            };
+            assert_eq!(target(&snapshot()), "first");
+
+            fs::write(&api, temporary).unwrap();
+            let restored = api.clone();
+            AFTER_PYTHON_INVENTORY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || fs::write(restored, original).unwrap()));
+            });
+            let error = run(root.path(), &db).unwrap_err();
+            // Extensionless sources are also probed for a JavaScript shebang.
+            // That earlier inventory guard detects this same byte mismatch first.
+            let expected_error = if api_name.ends_with(".py") {
+                "Python source changed during scan"
+            } else {
+                "source changed during JavaScript context discovery"
+            };
+            assert!(
+                error.to_string().contains(expected_error),
+                "{api_name}: {error}"
+            );
+            assert_eq!(snapshot().generation, initial.generation);
+            assert_eq!(serde_json::to_value(snapshot()).unwrap(), before);
+            assert_eq!(
+                run(root.path(), &db).unwrap().generation,
+                initial.generation
+            );
+
+            // The nearest ordinary case still updates the actual target.
+            fs::write(&api, temporary).unwrap();
+            run(root.path(), &db).unwrap();
+            assert_eq!(target(&snapshot()), "second");
+            assert_eq!(run(root.path(), &db).unwrap().parsed_files, 0);
+        }
+    }
 }

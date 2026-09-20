@@ -624,6 +624,159 @@ fn late_endpoint_prefix_and_substring_support_neighbors_path_and_impact() {
 }
 
 #[test]
+fn late_prefix_index_keeps_unicode_ties_and_same_store_recovery() {
+    let mut nodes: Vec<_> = (0..25_000)
+        .map(|i| node(&format!("m{i:05}"), "Unrelated", "filler.rs"))
+        .collect();
+    nodes.push(node("a-early", "LateCafé", "early.rs"));
+    nodes.push(node("z-late", "LateCafe", "late.rs"));
+    let (_dir, store) = store(nodes, vec![]);
+    let options = SearchOptions::default();
+
+    let error = store
+        .resolve_endpoint("latecafe", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ambiguous"), "{error}");
+    assert!(error.contains("a-early, z-late"), "{error}");
+
+    // A failed normalized lookup must leave the same connection usable, and a
+    // strict file scope must still resolve the late raw spelling exactly.
+    assert_eq!(
+        store
+            .resolve_endpoint("late.rs::LateCafe", &options)
+            .unwrap()
+            .id,
+        "z-late"
+    );
+    assert_eq!(
+        store.resolve_endpoint("z-late", &options).unwrap().id,
+        "z-late"
+    );
+    assert_eq!(store.stats().unwrap().nodes, 25_002);
+}
+
+#[test]
+fn legacy_endpoint_postings_keep_compound_accent_ties_and_exact_tiers() {
+    for version in [3, 4] {
+        for (accent, plain, ambiguous) in [
+            ("Cộde", "Code", true),
+            ("Cộde", "CodeExtra", false),
+            ("CộdeExtra", "CodeElse", true),
+            ("Cộde()", "CodeExtra", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("graph.db");
+            let mut graph = Store::create(&path).unwrap();
+            graph
+                .apply_native(
+                    "repo",
+                    vec![FileFacts {
+                        path: "f.rs".into(),
+                        hash: "fixture".into(),
+                        module: "f".into(),
+                        nodes: vec![node("a", accent, "f.rs"), node("b", plain, "f.rs")],
+                        edges: vec![],
+                        references: vec![],
+                        diagnostics: vec![],
+                    }],
+                    vec![],
+                    Coverage::default(),
+                )
+                .unwrap();
+            let generation = graph.stats().unwrap().generation;
+            drop(graph);
+
+            let sql = rusqlite::Connection::open(&path).unwrap();
+            sql.execute("UPDATE metadata SET search_version=?", [version])
+                .unwrap();
+            // Restore the actual old projection, not just its version marker.
+            // These labels are already NFKC. V3 has raw + NFKC + camel text;
+            // V4 has NFKC + camel text. Neither has the v5 accent companion.
+            for (id, label) in [("a", accent), ("b", plain)] {
+                let spelling = format!("{id} {label}  f.rs");
+                let camel = spelling.replace("Extra", " Extra").replace("Else", " Else");
+                let search = if version == 3 {
+                    format!("{spelling} {spelling} {camel}")
+                } else {
+                    format!("{spelling} {camel}")
+                };
+                sql.execute(
+                    "UPDATE nodes SET search=?1 WHERE id=?2",
+                    rusqlite::params![search, id],
+                )
+                .unwrap();
+            }
+            sql.execute_batch(
+                "DELETE FROM node_search;
+                 INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes;",
+            )
+            .unwrap();
+            let candidates: String = sql
+                .query_row(
+                    "SELECT group_concat(n.id) FROM node_search s JOIN nodes n ON n.rowid=s.rowid
+                     WHERE node_search MATCH '\"code\"*'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(candidates, "b", "v{version}: {accent}, {plain}");
+            drop(sql);
+
+            let before = std::fs::read(&path).unwrap();
+            let graph = Store::open_read_only(&path).unwrap();
+            let options = SearchOptions::default();
+            for text in ["code", "f.rs::code"] {
+                let result = graph.resolve_endpoint(text, &options);
+                if ambiguous {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("ambiguous") && error.contains("a, b"),
+                        "{error}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap().id, "a", "v{version}: {accent}, {plain}");
+                }
+            }
+            // Literal spelling still wins, and failed lookups do not poison reads.
+            assert_eq!(graph.resolve_endpoint(accent, &options).unwrap().id, "a");
+            assert_eq!(graph.resolve_endpoint(plain, &options).unwrap().id, "b");
+            assert_eq!(graph.stats().unwrap().generation, generation);
+            drop(graph);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+
+            let mut graph = Store::open(&path).unwrap();
+            graph
+                .apply_native("repo", vec![], vec![], Coverage::default())
+                .unwrap();
+            let sql = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                sql.query_row("SELECT search_version FROM metadata", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                5
+            );
+            assert_eq!(
+                sql.query_row(
+                    "SELECT count(*) FROM node_search WHERE node_search MATCH '\"code\"*'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            assert_eq!(graph.stats().unwrap().generation, generation + 1);
+            let result = graph.resolve_endpoint("code", &options);
+            if ambiguous {
+                assert!(result.unwrap_err().to_string().contains("ambiguous"));
+            } else {
+                assert_eq!(result.unwrap().id, "a");
+            }
+        }
+    }
+}
+
+#[test]
 fn lexical_endpoint_scope_preserves_exact_accent_spelling_before_convenience() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::create(&dir.path().join("graph.db")).unwrap();
@@ -1812,7 +1965,7 @@ fn search_migration_is_write_only_atomic_and_advances_generation_once() {
     assert_eq!(
         sql.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
 }
 

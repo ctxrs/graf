@@ -1953,7 +1953,7 @@ impl PythonContext {
         // Ordinary terminal definitions/body edits keep per-file parsing; Store
         // already rebinds references when those defining keys change.
         let mut hash = blake3::Hasher::new();
-        hash.update(b"python-import-context-6");
+        hash.update(b"python-import-context-7");
         for (module, files) in &context.modules {
             if files.len() == 1 && files[0].exports.is_empty() && files[0].stars.is_empty() {
                 continue;
@@ -2136,6 +2136,44 @@ impl PythonContext {
                         expanded.push(symbol);
                     }
                 }
+            }
+        }
+        // A subclass can override an implicit receiver's target. Keep the
+        // declaration reachable without claiming that it is the runtime callee.
+        for reference in &facts.references {
+            if reference.relation != "calls" {
+                continue;
+            }
+            let Some(key) = reference.candidate_keys.first() else {
+                continue;
+            };
+            let Some((class, member)) = key
+                .strip_prefix("python-receiver:")
+                .and_then(|rest| rest.rsplit_once('.'))
+            else {
+                continue;
+            };
+            let class = format!("python:{class}");
+            if self.receiver_target(&class, member, false).is_some() {
+                continue;
+            }
+            let Some(mro) = self.mro(&class, &mut BTreeSet::new(), &mut BTreeMap::new()) else {
+                continue;
+            };
+            let Some(target) = self
+                .receiver_in_mro(&mro, &class, member, false)
+                .filter(|target| self.methods.contains(target))
+            else {
+                continue;
+            };
+            let mut declaration = reference.clone();
+            declaration.id.push_str(":declared_member");
+            declaration.relation = "declared_member".into();
+            declaration.candidate_keys = vec![target];
+            declaration.reason =
+                "receiver declaration; subclass dispatch remains unresolved".into();
+            if !facts.references.iter().any(|r| r.id == declaration.id) {
+                expanded.push(declaration);
             }
         }
         facts.references.extend(expanded);

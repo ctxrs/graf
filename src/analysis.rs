@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Edge, GraphSnapshot};
 
-/// Community engine. Louvain remains the compatibility default.
+/// Community engine. Louvain is available for compatibility with earlier defaults.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CommunityAlgorithm {
-    Leiden,
     #[default]
+    Leiden,
     Louvain,
 }
 
@@ -53,7 +53,7 @@ impl Default for AnalysisOptions {
             tolerance: 1e-10,
             max_iterations: 200,
             community_max_passes: 100,
-            community_algorithm: CommunityAlgorithm::Louvain,
+            community_algorithm: CommunityAlgorithm::default(),
             community_seed: 42,
             community_local_max_passes: 100,
             resolution: 1.0,
@@ -101,6 +101,8 @@ pub struct FileDependency {
 /// Fixed output bounds; analysis still considers every eligible graph record.
 pub const SURPRISE_LIMIT: usize = 5;
 pub const QUESTION_LIMIT: usize = 7;
+/// Refinement temperature for the total-strength-two normalized projection.
+const LEIDEN_RANDOMNESS: f64 = 0.001;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurpriseSignal {
@@ -567,7 +569,7 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
         community_modularity:modularity,community_resolution:options.resolution,community_passes:passes,community_converged,
         community_split_attempts,unsatisfied_community_constraints,
         file_dependencies:dependencies.into_iter().map(|((source_file,target_file,relation,directed),evidence)| FileDependency {source_file,target_file,relation,directed,evidence}).collect(),call_edges,
-        methodology:"Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: selected native Leiden or deterministic multilevel Louvain on the weighted symmetric projection with positive resolution and retained self loops. Leiden uses seeded stochastic refinement and aggregation; its local pass limit bounds node processing per call at each level, not total runtime. Its pass count is outer iterations; unchanged consecutive partitions stop iteration but do not certify convergence. The core does not report cap exhaustion, so nontrivial Leiden runs report community_converged=false and community_convergence_known=false. Connectivity splitting protects capped partitions. Louvain counts local sweeps. Neither engine supplies semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the selected engine's total pass budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed.".into(),
+        methodology:"Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: selected native Leiden or deterministic multilevel Louvain on the weighted symmetric projection with positive resolution and retained self loops. Leiden uses seeded stochastic refinement and aggregation, retains the highest modularity candidate observed across its bounded warm-start iterations, and uses a dimensionless randomness value after total-strength normalization; its local pass limit bounds node processing per call at each level, not total runtime. Its pass count is outer iterations; unchanged consecutive partitions stop iteration but do not certify convergence. The core does not report cap exhaustion, so nontrivial Leiden runs report community_converged=false and community_convergence_known=false. Connectivity splitting protects capped partitions. Louvain counts local sweeps. Neither engine supplies semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the selected engine's total pass budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed.".into(),
     })
 }
 
@@ -743,6 +745,8 @@ fn partition(
         .context("cannot construct Leiden projection")?;
     let mut rng = SmallRng::seed_from_u64(options.community_seed);
     let mut passes = 0;
+    let mut best_membership = None;
+    let mut best_modularity = f64::NEG_INFINITY;
     for _ in 0..max_passes {
         let groups = membership.iter().max().map_or(0, |id| id + 1);
         let initial = Clustering::as_defined(membership.clone(), groups);
@@ -751,7 +755,7 @@ fn partition(
             Some(initial),
             Some(1),
             Some(resolution),
-            Some(0.001),
+            Some(LEIDEN_RANDOMNESS),
             &mut rng,
             true,
             Some(options.community_local_max_passes),
@@ -767,17 +771,29 @@ fn partition(
         // Capped local moving may stop before refinement can repair every group.
         // Repair also keeps isolates separate before the next warm start.
         let next = connected_membership(adjacency, &next);
+        let candidate_modularity = partition_modularity(adjacency, strengths, &next, resolution);
+        ensure!(
+            candidate_modularity.is_finite(),
+            "Leiden produced non-finite modularity"
+        );
         passes += 1;
         let unchanged = next == membership;
+        if candidate_modularity > best_modularity {
+            best_modularity = candidate_modularity;
+            best_membership = Some(next.clone());
+        }
         membership = next;
         if unchanged {
             break;
         }
     }
-    let modularity = partition_modularity(adjacency, strengths, &membership, resolution);
+    let membership =
+        best_membership.ok_or_else(|| anyhow::anyhow!("Leiden produced no candidate"))?;
     // The core exposes improvement, not convergence or cap exhaustion. Even an
     // unchanged partition is only an observed stopping point under this seed.
-    Ok((membership, modularity, passes, false))
+    // Keep the best evaluated candidate because stochastic refinement can make a
+    // later warm start worse even though it reports that some change occurred.
+    Ok((membership, best_modularity, passes, false))
 }
 
 fn communities(

@@ -102,7 +102,7 @@ fn communities_separate_dense_cliques_joined_by_a_bridge() {
     records.push((4, 5, 1.0, false));
     let snapshot = graph(11, &records);
     let report = analyze(&snapshot, &AnalysisOptions::default()).unwrap();
-    assert!(report.community_converged);
+    assert!(!report.community_converged && !report.community_convergence_known);
     assert_eq!(
         report
             .communities
@@ -737,11 +737,25 @@ fn leiden_options() -> AnalysisOptions {
     }
 }
 
+fn weighted_planted_partition_fixture() -> GraphSnapshot {
+    let mut records = Vec::new();
+    for block in 0..4 {
+        for a in 0..6 {
+            for b in a + 1..6 {
+                records.push((block * 6 + a, block * 6 + b, 4.0, false));
+            }
+        }
+        records.push((block * 6 + 5, ((block + 1) % 4) * 6, 0.25, true));
+    }
+    graph(26, &records)
+}
+
 #[test]
 fn native_leiden_known_modularity_and_legacy_choice() {
     use graf::analysis::CommunityAlgorithm;
     let defaults: AnalysisOptions = serde_json::from_str("{}").unwrap();
-    assert_eq!(defaults.community_algorithm, CommunityAlgorithm::Louvain);
+    assert_eq!(defaults.community_algorithm, CommunityAlgorithm::Leiden);
+    assert_eq!(CommunityAlgorithm::default(), CommunityAlgorithm::Leiden);
     let snapshot = joined_cliques();
     for algorithm in [CommunityAlgorithm::Louvain, CommunityAlgorithm::Leiden] {
         let options = AnalysisOptions {
@@ -781,16 +795,7 @@ fn native_leiden_known_modularity_and_legacy_choice() {
 fn native_leiden_recovers_independently_planted_weighted_partition() {
     // Four blocks, strong complete internal topology and weak ring bridges.
     // The planted truth is fixed before either engine is called.
-    let mut records = Vec::new();
-    for block in 0..4 {
-        for a in 0..6 {
-            for b in a + 1..6 {
-                records.push((block * 6 + a, block * 6 + b, 4.0, false));
-            }
-        }
-        records.push((block * 6 + 5, ((block + 1) % 4) * 6, 0.25, true));
-    }
-    let snapshot = graph(26, &records);
+    let snapshot = weighted_planted_partition_fixture();
     let report = analyze(&snapshot, &leiden_options()).unwrap();
     for i in 0..24 {
         for j in 0..24 {
@@ -1014,6 +1019,7 @@ fn preserved_community_identity_survives_analysis_and_composition() {
 #[test]
 fn native_leiden_loop_strength_and_weight_scale_change_no_objective() {
     // Separate loop-heavy nodes have Q = 8/9 - 1/2 = 7/18; merging gives zero.
+    let mut baseline = None;
     for scale in [1e-200, 1.0, 1e200] {
         let snapshot = graph(
             2,
@@ -1026,7 +1032,40 @@ fn native_leiden_loop_strength_and_weight_scale_change_no_objective() {
         let report = analyze(&snapshot, &leiden_options()).unwrap();
         assert_eq!(report.communities.len(), 2);
         assert!((report.community_modularity - 7.0 / 18.0).abs() < 1e-10);
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                serde_json::to_value(&report.communities).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        } else {
+            baseline = Some(report.communities.clone());
+        }
     }
+}
+
+#[test]
+fn native_leiden_keeps_the_best_warm_start_candidate() {
+    let snapshot = weighted_planted_partition_fixture();
+    let one = analyze(
+        &snapshot,
+        &AnalysisOptions {
+            community_max_passes: 1,
+            ..leiden_options()
+        },
+    )
+    .unwrap();
+    let more = analyze(
+        &snapshot,
+        &AnalysisOptions {
+            community_max_passes: 4,
+            ..leiden_options()
+        },
+    )
+    .unwrap();
+    assert!(more.community_passes >= one.community_passes);
+    assert!(more.community_passes <= 4);
+    assert!(more.community_modularity + 1e-12 >= one.community_modularity);
+    assert_connected(&snapshot, &more);
 }
 
 #[test]
