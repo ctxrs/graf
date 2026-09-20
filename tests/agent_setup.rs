@@ -15,7 +15,11 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> Self {
         let temp = tempdir().unwrap();
-        let project = temp.path().join("project with spaces '$()'");
+        let project = temp.path().join(if cfg!(windows) {
+            "project with spaces"
+        } else {
+            "project with spaces '$()'"
+        });
         let home = temp.path().join("synthetic home");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&home).unwrap();
@@ -1283,4 +1287,306 @@ fn real_hook_refresh_handles_executable_metacharacters_and_preserves_staging() {
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(s.ok(&["hook", "status"])["status"], "modified");
     fails(s.cli(&["hook", "uninstall"]), "permissions changed");
+}
+
+#[test]
+fn tool_hooks_are_explicit_reversible_and_preserve_existing_settings() {
+    for (host, event, matcher) in [
+        ("claude", "PreToolUse", "Read|Glob|Grep|Bash"),
+        ("codebuddy", "PreToolUse", "Read|Glob|Grep|Bash"),
+        ("gemini", "BeforeTool", "read_file|list_directory"),
+    ] {
+        let s = Sandbox::new();
+        let path = s.project.join(format!(".{host}/settings.json"));
+        let original = format!(
+            "{{\n  \"theme\": \"dark\",\n  \"hooks\": {{\"{event}\": [{{\"matcher\":\"Other\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo existing\"}}]}}]}}\n}}\n"
+        );
+        write(&path, &original);
+        let flags = ["install", "--platform", host, "--tool-hooks"];
+        assert_eq!(s.ok(&flags)["status"], "installed");
+        let bytes = fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["theme"], "dark");
+        let entries = value["hooks"][event].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matcher"], matcher);
+        assert_eq!(entries[1]["hooks"][0]["command"], "echo existing");
+        let command = entries[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.starts_with(&format!("graf hook-guard --platform {host} --project ")));
+        assert!(entries[0]["hooks"][0]["timeout"].as_u64().unwrap() > 0);
+        assert!(!command.contains("--strict"));
+        assert_eq!(s.ok(&flags)["status"], "unchanged");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            !s.project
+                .join(format!(".{host}/skills/graf/SKILL.md"))
+                .exists()
+        );
+        s.ok(&["uninstall", "--platform", host, "--tool-hooks"]);
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        s.ok(&flags);
+        let later = format!("{} ", String::from_utf8(fs::read(&path).unwrap()).unwrap());
+        write(&path, &later);
+        fails(
+            s.cli(&["uninstall", "--platform", host, "--tool-hooks"]),
+            "changed after installation",
+        );
+        assert_eq!(fs::read(&path).unwrap(), later.as_bytes());
+    }
+}
+
+#[test]
+fn tool_hooks_reject_unsupported_scopes_and_malformed_settings_without_overwrite() {
+    let s = Sandbox::new();
+    fails(
+        s.cli(&[
+            "install",
+            "--platform",
+            "claude",
+            "--tool-hooks",
+            "--global",
+        ]),
+        "project installations",
+    );
+    fails(
+        s.cli(&["install", "--platform", "codex", "--tool-hooks"]),
+        "project installations",
+    );
+    assert!(!s.project.join(".graf/setup").exists());
+    for invalid in [
+        r#"{"hooks":{"PreToolUse":{}}}"#,
+        r#"{"hooks":{},"hooks":{}}"#,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"graf hook-guard --platform claude"}]}]}}"#,
+    ] {
+        let path = s.project.join(".claude/settings.json");
+        write(&path, invalid);
+        assert!(
+            !s.cli(&["install", "--platform", "claude", "--tool-hooks"])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        assert!(
+            !s.project
+                .join(".graf/setup/claude-tool-hooks.json")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn gemini_mcp_and_tool_hooks_share_one_receipt_and_refuse_overlapping_ownership() {
+    let s = Sandbox::new();
+    let path = s.project.join(".gemini/settings.json");
+    let original=b"{\n// user comment\n\"theme\":\"dark\",\"mcpServers\":{\"other\":{\"command\":\"other\"}}\n}\n";
+    write(&path, original);
+    s.ok(&["install", "--platform", "gemini", "--mcp", "--tool-hooks"]);
+    let bytes = fs::read(&path).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains("// user comment"));
+    assert!(text.contains("hook-guard --platform gemini"));
+    assert!(text.contains("\"graf\": {\"args\":"));
+    assert!(
+        s.project
+            .join(".graf/setup/gemini-mcp-tool-hooks.json")
+            .exists()
+    );
+    assert!(!s.project.join(".graf/setup/gemini-mcp.json").exists());
+    fails(
+        s.cli(&["uninstall", "--platform", "gemini", "--mcp"]),
+        "already owned",
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    s.ok(&["uninstall", "--platform", "gemini", "--mcp", "--tool-hooks"]);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    s.ok(&["install", "--platform", "gemini", "--mcp"]);
+    let before = fs::read(&path).unwrap();
+    fails(
+        s.cli(&["install", "--platform", "gemini", "--tool-hooks"]),
+        "already owned",
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    s.ok(&["uninstall", "--platform", "gemini", "--mcp"]);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn claude_global_uninstall_preserves_first_run_metadata_and_added_servers() {
+    for custom in [false, true] {
+        let s = Sandbox::new();
+        let selected = s.home.join("custom claude");
+        fs::create_dir_all(&selected).unwrap();
+        let scope = if custom { &selected } else { &s.home };
+        let path = scope.join(".claude.json");
+        let original =
+            b"{\r\n \"mcpServers\": {\"alpha\":{\"command\":\"alpha\"}}, \"theme\":\"dark\"\r\n}  ";
+        write(&path, original);
+        let mut flags = vec!["--platform", "claude", "--global", "--mcp"];
+        if custom {
+            flags.extend(["--config-root", selected.to_str().unwrap()]);
+        }
+        let mut install = vec!["install"];
+        install.extend(&flags);
+        let mut uninstall = vec!["uninstall"];
+        uninstall.extend(&flags);
+        s.ok(&install);
+        s.ok(&uninstall);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        s.ok(&install);
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let graf = &installed["mcpServers"]["graf"];
+        let current = format!(
+            "{{\r\n  \"firstStartTime\": \"synthetic-time\",\r\n  \"theme\":\"dark\",\r\n  \"mcpServers\": {{\"alpha\":{{\"command\":\"alpha\"}}, \"graf\":{graf},  \"zulu\": {{\"command\":\"new-user-server\"}}}},\r\n  \"migrationVersion\": 4\r\n}}  "
+        );
+        write(&path, &current);
+        fails(s.cli(&install), "changed after installation");
+        assert_eq!(fs::read(&path).unwrap(), current.as_bytes());
+        s.ok(&uninstall);
+        let expected = current.replace(&format!("\"graf\":{graf},"), "");
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        let value: Value = serde_json::from_str(&expected).unwrap();
+        assert_eq!(value["firstStartTime"], "synthetic-time");
+        assert_eq!(value["mcpServers"]["zulu"]["command"], "new-user-server");
+        assert!(!scope.join(".graf/setup/claude-mcp.json").exists());
+        assert_eq!(s.ok(&uninstall)["status"], "unchanged");
+    }
+}
+
+#[test]
+fn claude_global_cleanup_refuses_modified_owned_entry_and_ambiguous_json() {
+    for mutation in [
+        "owned",
+        "duplicate",
+        "nested-duplicate",
+        "malformed",
+        "map-type",
+    ] {
+        let s = Sandbox::new();
+        let path = s.home.join(".claude.json");
+        write(&path, b"{}");
+        s.ok(&["install", "--platform", "claude", "--global", "--mcp"]);
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let graf = &installed["mcpServers"]["graf"];
+        let current=match mutation {
+            "owned" => r#"{"mcpServers":{"graf":{"command":"sensitive-fixture-must-not-be-printed","args":[]}},"firstStartTime":"time"}"#.to_owned(),
+            "duplicate" => format!("{{\"mcpServers\":{{\"graf\":{graf},\"graf\":{graf}}}}}"),
+            "nested-duplicate" => format!("{{\"mcpServers\":{{\"graf\":{graf}}},\"host\":{{\"userID\":1,\"userID\":2}}}}"),
+            "malformed" => "{not JSON}".into(),
+            _ => r#"{"mcpServers":[],"firstStartTime":"time"}"#.into(),
+        };
+        write(&path, &current);
+        let receipt = s.home.join(".graf/setup/claude-mcp.json");
+        let receipt_before = fs::read(&receipt).unwrap();
+        let output = s.cli(&["uninstall", "--platform", "claude", "--global", "--mcp"]);
+        assert!(!output.status.success(), "{mutation}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .contains("sensitive-fixture-must-not-be-printed")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        assert_eq!(fs::read(&receipt).unwrap(), receipt_before);
+    }
+}
+
+#[test]
+fn claude_global_cleanup_handles_created_map_and_already_absent_entry() {
+    for originally_present in [false, true] {
+        for already_absent in [false, true] {
+            let s = Sandbox::new();
+            let path = s.home.join(".claude.json");
+            write(
+                &path,
+                if originally_present {
+                    b"{\"mcpServers\":{}}".as_slice()
+                } else {
+                    b"{}".as_slice()
+                },
+            );
+            s.ok(&["install", "--platform", "claude", "--global", "--mcp"]);
+            let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let graf = &installed["mcpServers"]["graf"];
+            let current = if already_absent {
+                "{\"firstStartVersion\":\"fixture\",\"mcpServers\":{}}".to_owned()
+            } else {
+                format!("{{\"firstStartVersion\":\"fixture\",\"mcpServers\":{{\"graf\":{graf}}}}}")
+            };
+            write(&path, &current);
+            s.ok(&["uninstall", "--platform", "claude", "--global", "--mcp"]);
+            let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(value["firstStartVersion"], "fixture");
+            assert!(value["mcpServers"].get("graf").is_none());
+            assert_eq!(
+                value.get("mcpServers").is_some(),
+                originally_present || already_absent
+            );
+            if already_absent {
+                assert_eq!(fs::read_to_string(&path).unwrap(), current);
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_global_mcp_cleanup_does_not_bypass_guidance_edit_guards_or_project_receipts() {
+    let s = Sandbox::new();
+    let path = s.home.join(".claude.json");
+    write(&path, b"{}");
+    s.ok(&[
+        "install",
+        "--platform",
+        "claude",
+        "--global",
+        "--mcp",
+        "--skill",
+    ]);
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["firstStartTime"] = Value::String("fixture".into());
+    let current = serde_json::to_vec(&value).unwrap();
+    write(&path, &current);
+    write(&s.home.join(".claude/CLAUDE.md"), b"user guidance edit");
+    fails(
+        s.cli(&[
+            "uninstall",
+            "--platform",
+            "claude",
+            "--global",
+            "--mcp",
+            "--skill",
+        ]),
+        "changed after installation",
+    );
+    assert_eq!(fs::read(&path).unwrap(), current);
+    let project = s.project.join(".mcp.json");
+    s.ok(&["install", "--platform", "claude", "--mcp"]);
+    let mut bytes = fs::read(&project).unwrap();
+    bytes.push(b' ');
+    write(&project, &bytes);
+    fails(
+        s.cli(&["uninstall", "--platform", "claude", "--mcp"]),
+        "changed after installation",
+    );
+    assert_eq!(fs::read(&project).unwrap(), bytes);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_tool_hooks_refuse_unsupported_shell_path_without_changing_settings() {
+    for host in ["claude", "codebuddy", "gemini"] {
+        let mut s = Sandbox::new();
+        s.project = s._temp.path().join("project with $ shell syntax");
+        fs::create_dir_all(&s.project).unwrap();
+        let path = s.project.join(format!(".{host}/settings.json"));
+        let original = b"{\r\n \"theme\": \"dark\", \"hooks\": {}\r\n}  ";
+        write(&path, original);
+        fails(
+            s.cli(&["install", "--platform", host, "--tool-hooks"]),
+            "project path cannot be quoted safely for this host shell",
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            !s.project
+                .join(format!(".graf/setup/{host}-tool-hooks.json"))
+                .exists()
+        );
+    }
 }

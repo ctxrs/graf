@@ -1786,3 +1786,448 @@ fn star_provider_updates_publish_and_retract_definitions_and_member_aliases() {
         assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
     }
 }
+
+fn receiver_call_pairs(graph: &GraphSnapshot) -> Vec<(String, String)> {
+    let mut pairs: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.relation == "calls")
+        .map(|e| {
+            let source = graph.nodes.iter().find(|n| n.id == e.source).unwrap();
+            let target = graph.nodes.iter().find(|n| n.id == e.target).unwrap();
+            (
+                format!(
+                    "{}:{}",
+                    source.file,
+                    source.qualified_name.as_deref().unwrap()
+                ),
+                format!(
+                    "{}:{}",
+                    target.file,
+                    target.qualified_name.as_deref().unwrap()
+                ),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+// The same independent expected endpoints must survive both public ingestion
+// paths. No candidate key or resolver result supplies the expected answer.
+fn check_receiver_navigation(files: &[(&str, &str)], expected: &[(&str, &str)]) {
+    let mut expected: Vec<_> = expected
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    expected.sort();
+    let dir = tempdir().unwrap();
+    let mut store = Store::create(&dir.path().join("direct.db")).unwrap();
+    store
+        .apply_native(
+            "fixture-root",
+            contextualize(inventory(files)),
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        receiver_call_pairs(&store.snapshot().unwrap()),
+        expected,
+        "Store: {files:?}"
+    );
+    let root = dir.path().join("project");
+    fs::create_dir(&root).unwrap();
+    for (path, source) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let db = root.join(".graf/index.db");
+    index::run(&root, &db).unwrap();
+    let graph = Store::open(&db).unwrap().snapshot().unwrap();
+    assert_eq!(receiver_call_pairs(&graph), expected, "index: {files:?}");
+    for edge in graph.edges.iter().filter(|e| e.relation == "calls") {
+        assert_eq!(edge.metadata["context"], "receiver_declaration");
+    }
+    assert_eq!(index::run(&root, &db).unwrap().parsed_files, 0);
+}
+
+#[test]
+fn implicit_receivers_keep_class_identity_across_files_and_builtin_descriptors() {
+    check_receiver_navigation(
+        &[
+            (
+                "pkg/base.py",
+                "class Parent:\n    def inherited(self): return 1\n    @classmethod\n    def construct(cls): return 2\n",
+            ),
+            ("pkg/__init__.py", "from .base import Parent as Public\n"),
+            (
+                "worker.py",
+                r#"from pkg import Public
+class Worker(Public):
+    def local(self): return 3
+    @staticmethod
+    def utility(): return 4
+    @classmethod
+    def class_local(cls): return 5
+    def via_self(self): return self.local()
+    def via_inherited(this): return this.inherited()
+    def via_static(self): return self.utility()
+    def via_typed(this: 'Worker'): return this.local()
+    @classmethod
+    def via_cls(cls): return cls.construct()
+    @classmethod
+    def via_cls_local(cls): return cls.class_local()
+    def via_super(self): return super().inherited()
+    @classmethod
+    def via_class_super(cls): return super().construct()
+    def initialized(self):
+        self.state = 1
+        return self.local()
+class Decoy:
+    def local(self): return 99
+    def inherited(self): return 99
+def local(): return 99
+def opaque(factory): return factory().local()
+"#,
+            ),
+        ],
+        &[
+            ("worker.py:Worker.via_self", "worker.py:Worker.local"),
+            (
+                "worker.py:Worker.via_inherited",
+                "pkg/base.py:Parent.inherited",
+            ),
+            ("worker.py:Worker.via_static", "worker.py:Worker.utility"),
+            ("worker.py:Worker.via_typed", "worker.py:Worker.local"),
+            ("worker.py:Worker.via_cls", "pkg/base.py:Parent.construct"),
+            (
+                "worker.py:Worker.via_cls_local",
+                "worker.py:Worker.class_local",
+            ),
+            ("worker.py:Worker.via_super", "pkg/base.py:Parent.inherited"),
+            (
+                "worker.py:Worker.via_class_super",
+                "pkg/base.py:Parent.construct",
+            ),
+            ("worker.py:Worker.initialized", "worker.py:Worker.local"),
+        ],
+    );
+}
+
+#[test]
+fn implicit_receivers_reject_shadowing_mutation_overloads_and_dynamic_descriptors() {
+    let base = "class Base:\n    def work(self): return 1\n";
+    let supported =
+        "from base import Base\nclass Child(Base):\n    def run(self): return self.work()\n";
+    check_receiver_navigation(
+        &[("base.py", base), ("child.py", supported)],
+        &[("child.py:Child.run", "base.py:Base.work")],
+    );
+    for source in [
+        "class Child(Base):\n    def run(self):\n        self = other\n        return self.work()\n",
+        "class Child(Base):\n    def run(self):\n        self.work()\n        self = other\n",
+        "class Child(Base):\n    def run(self):\n        self.work = other\n        return self.work()\n",
+        "class Child(Base):\n    def __init__(self): self.work = other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def mutate(self): del self.work\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def mutate(self): delattr(self, 'work')\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def mutate(self): setattr(self, 'work', other)\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def mutate(self, name): setattr(self, name, other)\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def mutate(self): self.__dict__['work'] = other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    work = other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def work(self): return 2\n    def work(self): return 3\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    @overload\n    def work(self): ...\n    def work(self): return 3\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    @property\n    def work(self): return other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    @unknown\n    def work(self): return 2\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    @staticmethod\n    def run(self): return self.work()\n",
+        "classmethod = unknown\nclass Child(Base):\n    @classmethod\n    def run(cls): return cls.work()\n",
+        "class Child(Base):\n    def run(self, other): return other.work()\n",
+        "class Child(Base):\n    def run(self): return self.child.work()\n",
+        "class Child(Base):\n    def run(self):\n        def inner(self): return self.work()\n",
+        "class Child(Base):\n    def run(self):\n        def inner(): return super().work()\n",
+        "class Child(Base):\n    def run(self, super): return super().work()\n",
+        "super = replacement\nclass Child(Base):\n    def run(self): return super().work()\n",
+        "class Child(Base):\n    def run(self):\n        self.__class__ = other\n        return super().work()\n",
+        "class Child(Base):\n    def run(self): return super(Child, self).work()\n",
+        "class Child(Base):\n    def __getattribute__(self, name): return other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def __getattr__(self, name): return other\n    def run(self): return self.work()\n",
+        "class Child(Base):\n    def run(self): return self.work()\nChild = other\n",
+        "class Child(Base, metaclass=custom):\n    def run(self): return self.work()\n",
+    ] {
+        let source = format!("from base import Base\n{source}");
+        check_receiver_navigation(&[("base.py", base), ("child.py", &source)], &[]);
+    }
+}
+
+#[test]
+fn implicit_receivers_use_c3_and_preserve_visible_override_uncertainty() {
+    let base = "class Root:\n    def work(self): return 1\nclass Left(Root): pass\nclass Right(Root):\n    def work(self): return 2\n";
+    check_receiver_navigation(
+        &[(
+            "model.py",
+            &format!(
+                "{base}class Child(Left, Right):\n    def run(self): return self.work()\n    def via_super(self): return super().work()\n"
+            ),
+        )],
+        &[
+            ("model.py:Child.run", "model.py:Right.work"),
+            ("model.py:Child.via_super", "model.py:Right.work"),
+        ],
+    );
+    for tail in [
+        "class Conflict(Left, Right): pass\nclass Reverse(Right, Left): pass\nclass Child(Conflict, Reverse):\n    def run(self): return self.work()\n",
+        "class Child(Unknown, Root):\n    def run(self): return self.work()\n",
+        "class Child(Root):\n    def run(self): return self.work()\nclass Override(Child):\n    def work(self): return 3\n",
+        "class Child(Root):\n    def run(self): return self.work()\nclass UnknownChild(Child, Unknown): pass\n",
+        "class Child(Left):\n    def run(self): return super().work()\nclass Reordered(Child, Right): pass\n",
+    ] {
+        check_receiver_navigation(&[("model.py", &format!("{base}{tail}"))], &[]);
+    }
+}
+
+#[test]
+fn implicit_receiver_member_evidence_cannot_borrow_a_submodule_alias() {
+    check_receiver_navigation(
+        &[
+            (
+                "pkg/model.py",
+                "class Child:\n    class work: pass\n    def run(self): return self.work()\n",
+            ),
+            ("pkg/model/Child.py", "def work(): return 9\n"),
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn implicit_receiver_missing_member_rejects_submodule_alias() {
+    let missing = "class Child:\n    def run(self): return self.work()\n";
+    let actual =
+        "class Child:\n    def run(self): return self.work()\n    def work(self): return 1\n";
+    for files in [
+        vec![("pkg/model.py", missing)],
+        vec![
+            ("pkg/model.py", missing),
+            ("pkg/model/Child.py", "def work(): return 9\n"),
+        ],
+    ] {
+        let facts = contextualize(inventory(&files));
+        let keys = &reference(&facts[0], "Child.run", "self.work", "calls").candidate_keys;
+        if files.len() == 1 {
+            // Keep the safe unresolved terminal key for later Store rebinding.
+            assert_eq!(keys, &["python-member:pkg.model:Child.work"]);
+        } else {
+            assert!(keys.is_empty());
+        }
+        check_receiver_navigation(&files, &[]);
+    }
+    check_receiver_navigation(
+        &[("pkg/model.py", actual)],
+        &[("pkg/model.py:Child.run", "pkg/model.py:Child.work")],
+    );
+    assert_eq!(
+        PythonContext::from_facts(&inventory(&[("pkg/model.py", missing)])).fingerprint(),
+        PythonContext::from_facts(&inventory(&[("pkg/model.py", actual)])).fingerprint(),
+        "ordinary terminal method addition must not invalidate unrelated files",
+    );
+}
+
+#[test]
+fn receiver_missing_member_collision_refreshes_only_on_binding_changes() {
+    let dir = tempdir().unwrap();
+    let model = dir.path().join("pkg/model.py");
+    let decoy = dir.path().join("pkg/model/Child.py");
+    fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+    let missing = "class Child:\n    def run(self): return self.work()\n";
+    let actual =
+        "class Child:\n    def run(self): return self.work()\n    def work(self): return 1\n";
+    let unrelated = "def keep(): return 1\n";
+    fs::write(&model, missing).unwrap();
+    fs::write(dir.path().join("unrelated.py"), unrelated).unwrap();
+    let db = dir.path().join(".graf/index.db");
+    index::run(dir.path(), &db).unwrap();
+    assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
+    assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+    let baseline = PythonContext::from_facts(&inventory(&[
+        ("pkg/model.py", missing),
+        ("unrelated.py", unrelated),
+    ]));
+    let mut collision_fingerprint = None;
+    for (source, parsed, unchanged) in [
+        ("def work(): return 9\n", 3, 0),
+        ("def work(): return 10\n", 1, 2),
+    ] {
+        fs::write(&decoy, source).unwrap();
+        let context = PythonContext::from_facts(&inventory(&[
+            ("pkg/model.py", missing),
+            ("pkg/model/Child.py", source),
+            ("unrelated.py", unrelated),
+        ]));
+        assert_ne!(baseline.fingerprint(), context.fingerprint());
+        if let Some(previous) = &collision_fingerprint {
+            assert_eq!(
+                previous,
+                context.fingerprint(),
+                "decoy body edits keep the same proof"
+            );
+        }
+        collision_fingerprint = Some(context.fingerprint().to_owned());
+        let update = index::run(dir.path(), &db).unwrap();
+        assert_eq!(update.parsed_files, parsed);
+        assert_eq!(update.unchanged_files, unchanged);
+        assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
+        assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+    }
+    fs::remove_file(&decoy).unwrap();
+    let update = index::run(dir.path(), &db).unwrap();
+    assert_eq!(
+        update.parsed_files, 2,
+        "removing the collision restores the terminal lookup"
+    );
+    assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
+    assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+    fs::write(&model, actual).unwrap();
+    let context = PythonContext::from_facts(&inventory(&[
+        ("pkg/model.py", actual),
+        ("unrelated.py", unrelated),
+    ]));
+    assert_eq!(baseline.fingerprint(), context.fingerprint());
+    let update = index::run(dir.path(), &db).unwrap();
+    assert_eq!(update.parsed_files, 1);
+    assert_eq!(update.unchanged_files, 1);
+    assert_eq!(
+        receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()),
+        [(
+            "pkg/model.py:Child.run".into(),
+            "pkg/model.py:Child.work".into()
+        )],
+    );
+    assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+}
+
+#[test]
+fn receiver_body_edits_do_not_broaden_incremental_invalidation() {
+    let dir = tempdir().unwrap();
+    let base = "class Parent:\n    def work(self): return 1\n";
+    fs::write(dir.path().join("base.py"), base).unwrap();
+    fs::write(dir.path().join("unrelated.py"), "def keep(): return 1\n").unwrap();
+    let db = dir.path().join(".graf/index.db");
+    let mut fingerprint = None;
+    for body in [
+        "pass",
+        "self.work()",
+        "super().work()",
+        "return 42",
+        "self.state = 7",
+        "self.work()",
+        "pass",
+    ] {
+        let caller =
+            format!("from base import Parent\nclass Child(Parent):\n    def run(self): {body}\n");
+        let context =
+            PythonContext::from_facts(&inventory(&[("base.py", base), ("caller.py", &caller)]));
+        fs::write(dir.path().join("caller.py"), &caller).unwrap();
+        let update = index::run(dir.path(), &db).unwrap();
+        if let Some(previous) = &fingerprint {
+            assert_eq!(previous, context.fingerprint(), "{body}");
+            assert_eq!(update.parsed_files, 1, "{body}");
+            assert_eq!(update.unchanged_files, 2, "{body}");
+        }
+        fingerprint = Some(context.fingerprint().to_owned());
+        let expected = if body.ends_with("work()") {
+            vec![("caller.py:Child.run".into(), "base.py:Parent.work".into())]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()),
+            expected,
+            "{body}"
+        );
+        assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+    }
+}
+
+#[test]
+fn receiver_navigation_refreshes_after_replacement_deletion_and_override_changes() {
+    let dir = tempdir().unwrap();
+    let caller = "from base import Parent\nclass Child(Parent):\n    def run(self): return self.work()\n    def parent(self): return super().work()\n";
+    fs::write(dir.path().join("caller.py"), caller).unwrap();
+    let db = dir.path().join(".graf/index.db");
+    let mut direct = Store::create(&dir.path().join("direct.db")).unwrap();
+    for (base, subclass, target) in [
+        (
+            Some("class Parent:\n    def work(self): return 1\n"),
+            "",
+            Some("Parent.work"),
+        ),
+        (
+            Some("class Root:\n    def work(self): return 2\nclass Parent(Root): pass\n"),
+            "",
+            Some("Root.work"),
+        ),
+        (Some("class Parent:\n    work = replacement\n"), "", None),
+        (
+            Some("class Parent:\n    def work(self): return 3\n"),
+            "",
+            Some("Parent.work"),
+        ),
+        (None, "", None),
+        (
+            Some("class Parent:\n    def work(self): return 4\n"),
+            "",
+            Some("Parent.work"),
+        ),
+        (Some("def Parent(): pass\n"), "", None),
+        (
+            Some("class Parent:\n    def work(self): return 5\n"),
+            "from caller import Child\nclass Override(Child):\n    def work(self): return 6\n",
+            Some("Parent.work"),
+        ),
+        (
+            Some("class Parent:\n    def work(self): return 5\n"),
+            "",
+            Some("Parent.work"),
+        ),
+    ] {
+        let mut files = vec![("caller.py", caller), ("subclass.py", subclass)];
+        let deleted = if let Some(base) = base {
+            files.push(("base.py", base));
+            fs::write(dir.path().join("base.py"), base).unwrap();
+            vec![]
+        } else {
+            fs::remove_file(dir.path().join("base.py")).unwrap();
+            vec!["base.py".into()]
+        };
+        fs::write(dir.path().join("subclass.py"), subclass).unwrap();
+        direct
+            .apply_native(
+                "fixture-root",
+                contextualize(inventory(&files)),
+                deleted,
+                Coverage::default(),
+            )
+            .unwrap();
+        index::run(dir.path(), &db).unwrap();
+        let mut expected = Vec::new();
+        if let Some(target) = target {
+            expected.push(("caller.py:Child.parent".into(), format!("base.py:{target}")));
+            if subclass.is_empty() {
+                expected.push(("caller.py:Child.run".into(), format!("base.py:{target}")));
+            }
+        }
+        expected.sort();
+        assert_eq!(
+            receiver_call_pairs(&direct.snapshot().unwrap()),
+            expected,
+            "Store: {files:?}"
+        );
+        assert_eq!(
+            receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()),
+            expected,
+            "index: {files:?}"
+        );
+        assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+    }
+}

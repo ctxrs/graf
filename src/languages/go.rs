@@ -34,28 +34,68 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
     let receivers: HashMap<_, _> = go
         .receivers
         .iter()
-        .map(|(marker, scope, parts)| {
+        .map(|(marker, scope, parts, pointer)| {
             (
                 marker.trim_end_matches(':').to_owned(),
-                go.type_keys(*scope, parts),
+                (go.type_keys(*scope, parts), *pointer),
             )
         })
         .collect();
     let mut facts = go.e.finish();
+    let mut declarations = vec![];
     for reference in &mut facts.references {
+        let mut declared_keys = vec![];
         reference.candidate_keys = reference
             .candidate_keys
             .iter()
             .flat_map(|key| {
                 if let Some((marker, member)) = key.rsplit_once(':')
-                    && let Some(types) = receivers.get(marker)
+                    && let Some((types, pointer)) = receivers.get(marker)
                 {
+                    if reference.relation == "calls" && !pointer && !member.contains('.') {
+                        declared_keys
+                            .extend(types.iter().map(|ty| format!("{ty}#declared.{member}")));
+                    }
                     types.iter().map(|ty| format!("{ty}.{member}")).collect()
                 } else {
                     vec![key.clone()]
                 }
             })
             .collect();
+        if !declared_keys.is_empty() {
+            let mut declaration = reference.clone();
+            declaration.id.push_str(":declared_member");
+            declaration.relation = "declared_member".into();
+            declaration.candidate_keys = declared_keys;
+            declaration.reason = "written interface member; runtime dispatch is unresolved".into();
+            declarations.push(declaration);
+        }
+    }
+    facts.references.extend(declarations);
+    // Interface signatures have declaration-only aliases, never callable keys.
+    let owners: HashMap<_, _> = facts
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "interface")
+        .filter_map(|n| {
+            n.binding_key
+                .as_ref()
+                .map(|key| (n.id.clone(), key.clone()))
+        })
+        .collect();
+    let parents: HashMap<_, _> = facts
+        .edges
+        .iter()
+        .filter(|e| e.relation == "contains")
+        .map(|e| (e.target.clone(), e.source.clone()))
+        .collect();
+    for node in &mut facts.nodes {
+        if node.kind == "method"
+            && let Some(owner) = parents.get(&node.id).and_then(|id| owners.get(id))
+        {
+            node.metadata["binding_aliases"] =
+                serde_json::json!([format!("{owner}#declared.{}", node.label)]);
+        }
     }
     Ok(facts)
 }
@@ -63,7 +103,7 @@ struct Go<'a> {
     e: Extractor<'a>,
     prefix: String,
     types: Vec<(usize, usize, Vec<String>)>,
-    receivers: Vec<(String, usize, Vec<String>)>,
+    receivers: Vec<(String, usize, Vec<String>, bool)>,
 }
 impl Go<'_> {
     fn receiver_binding(binding: &Binding) -> bool {
@@ -183,7 +223,13 @@ impl Go<'_> {
                 self.e.facts.path,
                 name.start_byte()
             );
-            self.receivers.push((marker.clone(), owner, parts));
+            self.receivers.push((
+                marker.clone(),
+                owner,
+                parts,
+                ty.is_some_and(|n| n.kind() == "pointer_type"),
+            ));
+
             self.e.bind(
                 scope,
                 self.e.text(name),

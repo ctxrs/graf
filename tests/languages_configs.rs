@@ -1006,6 +1006,325 @@ module "child" { source = "./child" }
     assert_eq!(facts("prod.tfvars", "region = \"east\"\n").nodes.len(), 1);
 }
 #[test]
+fn terraform_attributes_keep_literal_types_unicode_and_nested_block_ownership() {
+    let f = facts(
+        "infra/settings.tf",
+        r#"
+resource "queue" "jobs" {
+  enabled = true
+  paused = false
+  capacity = 73
+  offset = -9
+  ratio = 0.125
+  absent = null
+  label = "café 東京 \u03bb \U0001F642"
+  escapes = "line\n\t\"quoted\"\\path"
+  template_literal = "$${var.name} %%{if true}"
+  region = "asia-east1"
+  modes = [true, 4, "batch", null, { mode = "quiet" }]
+  tags = { café = "東京", "team.name" = "worker", empty = {}, list = [] }
+  capacity_hint = /* comment does not become a value */ 81
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+variable "label" { default = "queue" }
+data "image" "base" { current = true }
+provider "cloud" { alias = "backup" }
+module "jobs" { source = "./workers" }
+output "hint" { value = "queue" }
+"#,
+    );
+    let attrs = &node(&f, "queue.jobs").metadata["attributes"];
+    assert_eq!(attrs["enabled"], true);
+    assert_eq!(attrs["paused"], false);
+    assert_eq!(attrs["capacity"].as_u64(), Some(73));
+    assert_eq!(attrs["offset"].as_i64(), Some(-9));
+    assert_eq!(attrs["ratio"].as_f64(), Some(0.125));
+    assert_eq!(attrs.get("absent"), Some(&serde_json::Value::Null));
+    assert_eq!(attrs["label"], "café 東京 λ 🙂");
+    assert_eq!(attrs["escapes"], "line\n\t\"quoted\"\\path");
+    assert_eq!(attrs["template_literal"], "${var.name} %{if true}");
+    assert_eq!(attrs["region"], "asia-east1");
+    assert_eq!(
+        attrs["modes"],
+        serde_json::json!([true, 4, "batch", null, {"mode":"quiet"}])
+    );
+    assert_eq!(
+        attrs["tags"],
+        serde_json::json!({"café":"東京", "team.name":"worker", "empty":{}, "list":[]})
+    );
+    assert_eq!(attrs["capacity_hint"], 81);
+    assert!(attrs.get("lifecycle").is_none());
+    assert!(attrs.get("prevent_destroy").is_none());
+    for (label, key, expected) in [
+        ("var.label", "default", serde_json::json!("queue")),
+        ("data.image.base", "current", serde_json::json!(true)),
+        ("provider.cloud", "alias", serde_json::json!("backup")),
+        ("module.jobs", "source", serde_json::json!("./workers")),
+        ("output.hint", "value", serde_json::json!("queue")),
+    ] {
+        assert_eq!(node(&f, label).metadata["attributes"][key], expected);
+    }
+    let restored: FileFacts = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+    assert_eq!(
+        node(&restored, "queue.jobs").metadata,
+        node(&f, "queue.jobs").metadata
+    );
+}
+
+#[test]
+fn terraform_attributes_leave_expressions_unresolved_and_preserve_reference_owners() {
+    let f = facts(
+        "infra/main.tf",
+        r#"
+variable "region" {}
+provider "cloud" { alias = "backup" }
+resource "queue" "base" {}
+resource "queue" "jobs" {
+  region = var.region
+  quoted = "var.region"
+  provider = cloud.backup
+  depends_on = [queue.base]
+  mixed = ["static", var.region, { selected = queue.base.id }]
+  computed = { (var.region) = "computed-key-value" }
+  result = file("do-not-open-this-file")
+  template = "not-retained-${var.region}"
+  transformed = [for item in [queue.base] : item.id]
+  arithmetic = 2 + 3
+  lifecycle { replace_triggered_by = [queue.base] }
+}
+module "jobs" {
+  source = "./workers"
+  input = queue.jobs.id
+}
+output "result" { value = module.jobs.id }
+"#,
+    );
+    let jobs = node(&f, "queue.jobs");
+    let attrs = &jobs.metadata["attributes"];
+    assert_eq!(attrs["quoted"], "var.region");
+    for value in [
+        &attrs["region"],
+        &attrs["provider"],
+        &attrs["computed"],
+        &attrs["result"],
+        &attrs["template"],
+        &attrs["transformed"],
+        &attrs["arithmetic"],
+        &attrs["mixed"][1],
+        &attrs["mixed"][2]["selected"],
+    ] {
+        assert_eq!(value["$hcl"], "unresolved");
+        assert!(value["kind"].is_string());
+    }
+    assert_eq!(attrs["mixed"][0], "static");
+    for (label, relation) in [
+        ("var.region", "references"),
+        ("cloud.backup", "references"),
+        ("queue.base", "depends_on"),
+        ("queue.base", "references"),
+    ] {
+        assert!(
+            f.references
+                .iter()
+                .any(|r| r.source == jobs.id && r.label == label && r.relation == relation)
+        );
+    }
+    assert!(!f.references.iter().any(|r| r.label.starts_with("item.")));
+    assert!(
+        f.references
+            .iter()
+            .any(|r| r.source == node(&f, "module.jobs").id
+                && r.relation == "module_source"
+                && r.label == "./workers")
+    );
+    assert!(
+        f.references
+            .iter()
+            .any(|r| r.source == node(&f, "output.result").id
+                && r.candidate_keys == ["terraform:module-output:infra:jobs:id"])
+    );
+    let serialized = serde_json::to_string(&f).unwrap();
+    for withheld in [
+        "computed-key-value",
+        "do-not-open-this-file",
+        "not-retained-",
+    ] {
+        assert!(!serialized.contains(withheld));
+    }
+}
+
+#[test]
+fn terraform_attributes_redact_before_serialization_recursively_and_in_module_sources() {
+    // Construct deliberately invalid credential-shaped fixtures; no real key material.
+    let synthetic_key = format!("AKIA{}", "0".repeat(16));
+    let synthetic_pem = format!(
+        "-----BEGIN {}-----\\nfixture-pem-9\\n-----END {}-----",
+        "PRIVATE KEY", "PRIVATE KEY"
+    );
+    let source = r#"
+resource "database" "main" {
+  name = "ordinary-safe-name"
+  PASSWORD = "fixture-password-1"
+  apiKey = "fixture-api-2"
+  settings = { connection = { client_secret = "fixture-client-3", port = 2345 } }
+  replicas = [{ token = "fixture-token-4", region = "west" }, [{ "private-key" = "fixture-key-5" }]]
+  encoded = { "pass\u0077ord" = "fixture-escape-6" }
+  endpoint = "https://user:fixture-url-7@example.invalid/repo"
+  query = "https://example.invalid/repo?token=fixture-query-8"
+  certificate = "TEST_PEM_PLACEHOLDER"
+  identifier = "TEST_KEY_PLACEHOLDER"
+  header = "Bearer fixture-bearer-10"
+  payload = "{\"password\": \"fixture-json-11\"}"
+  rendered = format("fixture-format-12", var.region)
+  password_ref = var.region
+  lifecycle { ignored_secret = "fixture-nested-13" }
+}
+variable "db_password" { default = "fixture-default-14" }
+variable "ordinary" {
+  sensitive = true
+  default = ["fixture-sensitive-15"]
+}
+output "ordinary" {
+  sensitive = true
+  value = "fixture-output-16"
+}
+module "remote" {
+  source = "git::https://user:fixture-module-17@example.invalid/repo"
+  input = var.region
+}
+module "safe" { source = "./workers" }
+"#
+    .replace("TEST_PEM_PLACEHOLDER", &synthetic_pem)
+    .replace("TEST_KEY_PLACEHOLDER", &synthetic_key);
+    let f = facts("infra/main.tf", &source);
+    let attrs = &node(&f, "database.main").metadata["attributes"];
+    for key in [
+        "PASSWORD",
+        "apiKey",
+        "endpoint",
+        "query",
+        "certificate",
+        "identifier",
+        "header",
+        "payload",
+        "password_ref",
+    ] {
+        assert_eq!(attrs[key], "[redacted]", "{key}");
+    }
+    assert_eq!(
+        attrs["settings"]["connection"]["client_secret"],
+        "[redacted]"
+    );
+    assert_eq!(attrs["settings"]["connection"]["port"], 2345);
+    assert_eq!(attrs["replicas"][0]["token"], "[redacted]");
+    assert_eq!(attrs["replicas"][0]["region"], "west");
+    assert_eq!(attrs["replicas"][1][0]["private-key"], "[redacted]");
+    assert_eq!(attrs["encoded"]["password"], "[redacted]");
+    assert_eq!(attrs["name"], "ordinary-safe-name");
+    for (label, key) in [
+        ("var.db_password", "default"),
+        ("var.ordinary", "default"),
+        ("output.ordinary", "value"),
+    ] {
+        assert_eq!(node(&f, label).metadata["attributes"][key], "[redacted]");
+    }
+    assert_eq!(
+        node(&f, "module.remote").metadata["module_source"],
+        "[redacted]"
+    );
+    assert_eq!(
+        node(&f, "module.remote").metadata["attributes"]["source"],
+        "[redacted]"
+    );
+    assert_eq!(
+        node(&f, "module.safe").metadata["module_source"],
+        "./workers"
+    );
+    for label in ["database.main", "module.remote"] {
+        assert!(
+            f.references
+                .iter()
+                .any(|r| r.source == node(&f, label).id && r.label == "var.region")
+        );
+    }
+    let serialized = serde_json::to_string(&f).unwrap();
+    for secret in [
+        "fixture-password-1",
+        "fixture-api-2",
+        "fixture-client-3",
+        "fixture-token-4",
+        "fixture-key-5",
+        "fixture-escape-6",
+        "fixture-url-7",
+        "fixture-query-8",
+        "fixture-pem-9",
+        &synthetic_key,
+        "fixture-bearer-10",
+        "fixture-json-11",
+        "fixture-format-12",
+        "fixture-nested-13",
+        "fixture-default-14",
+        "fixture-sensitive-15",
+        "fixture-output-16",
+        "fixture-module-17",
+    ] {
+        assert!(!serialized.contains(secret), "secret leaked: {secret}");
+    }
+}
+
+#[test]
+fn terraform_attributes_mark_unsupported_values_without_raw_fallbacks() {
+    let deep = format!(
+        "{}\"depth-private-value\"{}",
+        "[".repeat(35),
+        "]".repeat(35)
+    );
+    let source = format!(
+        r#"
+resource "queue" "jobs" {{
+  large = 18446744073709551616
+  duplicate = {{ same = "first-private-value", same = "second-private-value" }}
+  text = <<EOT
+heredoc-private-value
+EOT
+  deep = {deep}
+}}
+"#
+    );
+    let f = facts("main.tf", &source);
+    let attrs = &node(&f, "queue.jobs").metadata["attributes"];
+    assert_eq!(attrs["large"]["kind"], "numeric_range");
+    assert_eq!(attrs["duplicate"]["kind"], "duplicate_key");
+    assert_eq!(attrs["text"]["$hcl"], "unresolved");
+    let serialized = serde_json::to_string(&f).unwrap();
+    assert!(serialized.contains("depth_limit"));
+    for text in [
+        "depth-private-value",
+        "first-private-value",
+        "second-private-value",
+        "heredoc-private-value",
+    ] {
+        assert!(!serialized.contains(text));
+    }
+    let malformed = parse(
+        "broken.tf",
+        "resource \"queue\" \"jobs\" { password = \"fixture-broken-value\"",
+        "h",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(malformed.nodes.is_empty());
+    assert!(!malformed.diagnostics.is_empty());
+    assert!(
+        !serde_json::to_string(&malformed)
+            .unwrap()
+            .contains("fixture-broken-value")
+    );
+}
+
+#[test]
 fn sql_constraints_indexes_ctes_and_quoted_identifiers() {
     let f = facts(
         "schema.sql",
@@ -1639,6 +1958,167 @@ output "ambiguous_output" { value = module.valid.duplicate }
         for path in ["../outside.tf", "/outside.tf", "child/../main.tf"] {
             assert!(TerraformContext::discover(&a.root(), &[path.into()]).is_err());
         }
+    }
+
+    #[test]
+    fn credential_assignment_whitespace_never_reaches_facts_or_search() {
+        use graf::model::QueryOptions;
+        let f = Fixture::new();
+        let mut source = String::from("resource \"queue\" \"jobs\" {\n");
+        let mut cases = vec![
+            ("payload".to_owned(), "fixtureleakmarker".to_owned()),
+            ("settings".to_owned(), "fixtureassignmentmarker".to_owned()),
+        ];
+        source.push_str(
+            r#"payload = "{\"password\" : \"fixtureleakmarker\"}"
+settings = "password = fixtureassignmentmarker"
+ordinary = "region = west"
+compact = "region=west"
+prose = "password notes = public"
+"#,
+        );
+        for before in ["", " ", "\t", "\n", " \t\r\n"] {
+            for after in ["", " ", "\t", "\n", " \t\r\n"] {
+                for quoted in [false, true] {
+                    let field = format!("field{}", cases.len());
+                    let marker = format!("fixturewhitespace{}marker", cases.len());
+                    let value = if quoted {
+                        format!("{{\"password\"{before}:{after}\"{marker}\"}}")
+                    } else {
+                        format!("password{before}={after}{marker}")
+                    };
+                    source.push_str(&format!(
+                        "{field} = {}\n",
+                        serde_json::to_string(&value).unwrap()
+                    ));
+                    cases.push((field, marker));
+                }
+            }
+        }
+        source.push_str("}\n");
+        let facts = super::facts("main.tf", &source);
+        let attrs = &super::node(&facts, "queue.jobs").metadata["attributes"];
+        let serialized = serde_json::to_string(&facts).unwrap();
+        for (field, marker) in &cases {
+            assert_eq!(attrs[field], "[redacted]", "{field}");
+            assert!(!serialized.contains(marker), "{field} leaked into facts");
+        }
+        assert_eq!(attrs["ordinary"], "region = west");
+        assert_eq!(attrs["compact"], "region=west");
+        assert_eq!(attrs["prose"], "password notes = public");
+
+        f.write("main.tf", &source);
+        let graph = f.update(&["main.tf"]);
+        let persisted = serde_json::to_string(&graph).unwrap();
+        let store = Store::open_read_only(&f.temp.path().join("graph.db")).unwrap();
+        let options = QueryOptions {
+            depth: 0,
+            ..Default::default()
+        };
+        for (field, marker) in &cases {
+            assert!(!persisted.contains(marker), "{field} leaked into Store");
+            assert!(store.query(marker, &options).unwrap().nodes.is_empty());
+        }
+        assert!(
+            store
+                .query("west", &options)
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|n| n.label == "queue.jobs")
+        );
+    }
+
+    #[test]
+    fn safe_attribute_search_replaces_old_values_and_never_indexes_credentials() {
+        use graf::model::QueryOptions;
+        let f = Fixture::new();
+        let query = |text: &str| {
+            Store::open_read_only(&f.temp.path().join("graph.db"))
+                .unwrap()
+                .query(
+                    text,
+                    &QueryOptions {
+                        depth: 0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        f.write("main.tf", "resource \"queue\" \"jobs\" {\n force_destroy = false\n tags = { purpose = \"catalogqueryold\" }\n password = \"neverindexcredential\"\n}\n");
+        f.update(&["main.tf"]);
+        for term in ["force_destroy", "catalogqueryold"] {
+            let result = query(term);
+            let resource = result
+                .nodes
+                .iter()
+                .find(|n| n.label == "queue.jobs")
+                .unwrap();
+            assert_eq!(resource.metadata["attributes"]["force_destroy"], false);
+        }
+        assert!(query("neverindexcredential").nodes.is_empty());
+        f.write("main.tf", "resource \"queue\" \"jobs\" {\n force_destroy = true\n tags = { purpose = \"catalogquerynew\" }\n}\n");
+        f.update(&["main.tf"]);
+        assert!(query("catalogqueryold").nodes.is_empty());
+        assert!(query("neverindexcredential").nodes.is_empty());
+        assert_eq!(
+            query("catalogquerynew")
+                .nodes
+                .iter()
+                .find(|n| n.label == "queue.jobs")
+                .unwrap()
+                .metadata["attributes"]["force_destroy"],
+            true
+        );
+        f.update(&[]);
+        assert!(query("catalogquerynew").nodes.is_empty());
+        assert!(query("force_destroy").nodes.is_empty());
+    }
+
+    #[test]
+    fn attributes_round_trip_update_and_delete_without_changing_module_links() {
+        let f = Fixture::new();
+        f.write("main.tf", "module \"jobs\" { source = \"./workers\" }\noutput \"result\" { value = module.jobs.id }\n");
+        f.write("workers/main.tf", "resource \"queue\" \"jobs\" {\n capacity = 17\n password = \"fixture-incremental-secret\"\n tags = { stage = \"initial\" }\n}\noutput \"id\" { value = queue.jobs.id }\n");
+        let paths = ["main.tf", "workers/main.tf"];
+        let first = f.update(&paths);
+        let original = find(&first, "workers/main.tf", "queue.jobs");
+        assert_eq!(original.metadata["attributes"]["capacity"], 17);
+        assert_eq!(original.metadata["attributes"]["password"], "[redacted]");
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("fixture-incremental-secret")
+        );
+        let unchanged = f.update(&paths);
+        assert_eq!(
+            find(&unchanged, "workers/main.tf", "queue.jobs").metadata,
+            original.metadata
+        );
+
+        f.write("workers/main.tf", "resource \"queue\" \"jobs\" {\n capacity = 29\n tags = { stage = \"revised\" }\n}\noutput \"id\" { value = queue.jobs.id }\n");
+        let updated = f.update(&paths);
+        let resource = find(&updated, "workers/main.tf", "queue.jobs");
+        assert_eq!(resource.id, original.id);
+        assert_eq!(resource.binding_key, original.binding_key);
+        assert_eq!(resource.metadata["attributes"]["capacity"], 29);
+        assert_eq!(resource.metadata["attributes"]["tags"]["stage"], "revised");
+        assert!(resource.metadata["attributes"].get("password").is_none());
+        assert!(linked(
+            &updated,
+            ("main.tf", "module.jobs"),
+            "module_source",
+            ("workers/main.tf", "Terraform module: workers")
+        ));
+        assert!(linked(
+            &updated,
+            ("main.tf", "output.result"),
+            "references",
+            ("workers/main.tf", "output.id")
+        ));
+        let removed = f.update(&["main.tf"]);
+        assert!(!removed.nodes.iter().any(|n| n.id == resource.id));
+        assert!(!serde_json::to_string(&removed).unwrap().contains("revised"));
     }
 
     #[cfg(unix)]

@@ -61,6 +61,82 @@ fn success(output: Output) -> Value {
 }
 
 #[test]
+fn explicit_memory_commands_work_without_a_graph_and_do_not_create_one() {
+    let s = Sandbox::new();
+    let saved = s.ok(&[
+        "--json",
+        "save-result",
+        "--question",
+        "Where is retry policy configured?",
+        "--answer",
+        "The queue owns its retry policy.",
+        "--outcome",
+        "useful",
+    ]);
+    let path = PathBuf::from(saved["saved"].as_str().unwrap());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        s.root.join(path)
+    };
+    assert!(path.is_file());
+    let before = fs::read(&path).unwrap();
+    let reflected = s.ok(&["--json", "reflect", "--min-corroboration", "1"]);
+    assert_eq!(reflected["records"], 1);
+    assert!(s.root.join("graf-out/reflections/LESSONS.md").is_file());
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert!(!s.root.join(".graf/index.db").exists());
+    let rejected = s.cli(&[
+        "--json",
+        "save-result",
+        "--question",
+        "q",
+        "--answer",
+        "a",
+        "--nodes",
+        "invented",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires a graph"));
+}
+
+#[test]
+fn leiden_cli_flags_report_their_budget_and_leave_the_store_unchanged() {
+    let s = Sandbox::new();
+    let db = s.db("source", "example");
+    let before = fs::read(&db).unwrap();
+    let report = s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-algorithm",
+        "leiden",
+        "--community-seed",
+        "9",
+        "--community-local-max-passes",
+        "1",
+    ]);
+    assert_eq!(report["community_pass_unit"], "leiden_iterations");
+    assert_eq!(report["community_convergence_known"], false);
+    assert!(
+        report["community_algorithm"]
+            .as_str()
+            .unwrap()
+            .contains("seed 9")
+    );
+    assert_eq!(fs::read(&db).unwrap(), before);
+    let rejected = s.cli(&[
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-local-max-passes",
+        "0",
+    ]);
+    assert!(!rejected.status.success());
+}
+
+#[test]
 fn snapshot_exports_guard_shrink_and_preserve_previous_bytes() {
     let s = Sandbox::new();
     let db = s.db("source", "example");
@@ -1029,6 +1105,142 @@ fn multigraph_diagnostics_count_direction_and_parallel_records_without_changes()
 
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn explicit_memory_reports_verify_native_sources_without_graph_mutations() {
+    let s = Sandbox::new();
+    fs::write(s.root.join("queue.py"), "def deliver():\n    return 1\n").unwrap();
+    let db = s.root.join(".graf/index.db");
+    graf::index::run(&s.root, &db).unwrap();
+    let graph = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+    let id = graph
+        .nodes
+        .iter()
+        .find(|n| n.label == "deliver")
+        .unwrap()
+        .id
+        .clone();
+    let memories = s.home.join("observations");
+    for question in ["Which function delivers?", "Where is delivery implemented?"] {
+        s.ok(&[
+            "--json",
+            "--db",
+            string(&db),
+            "save-result",
+            "--question",
+            question,
+            "--answer",
+            "The deliver function.",
+            "--outcome",
+            "useful",
+            "--nodes",
+            &id,
+            "--memory-dir",
+            string(&memories),
+        ]);
+    }
+    let output = s.root.join("observations.md");
+    s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "report",
+        "--format",
+        "markdown",
+        "--memory-dir",
+        string(&memories),
+        "--output",
+        string(&output),
+    ]);
+    let text = fs::read_to_string(&output).unwrap();
+    let preferred = text
+        .split("## preferred")
+        .nth(1)
+        .unwrap()
+        .split("## tentative")
+        .next()
+        .unwrap();
+    assert!(preferred.contains(&id));
+    assert!(preferred.contains("verified"));
+    assert_eq!(
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+        serde_json::to_value(&graph).unwrap()
+    );
+    assert!(!memories.join("LESSONS.md").exists());
+    fs::write(s.root.join("queue.py"), "def deliver():\n    return 2\n").unwrap();
+    s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "report",
+        "--format",
+        "markdown",
+        "--memory-dir",
+        string(&memories),
+        "--output",
+        string(&output),
+    ]);
+    let text = fs::read_to_string(&output).unwrap();
+    assert!(text.contains("stale"));
+    let preferred = text
+        .split("## preferred")
+        .nth(1)
+        .unwrap()
+        .split("## tentative")
+        .next()
+        .unwrap();
+    assert!(!preferred.contains(&id));
+    assert_eq!(
+        Store::open_read_only(&db)
+            .unwrap()
+            .stats()
+            .unwrap()
+            .generation,
+        graph.generation
+    );
+    fails(
+        s.cli(&[
+            "--db",
+            string(&db),
+            "export",
+            "snapshot-json",
+            "--memory-dir",
+            string(&memories),
+        ]),
+        "--memory-dir",
+    );
+}
+
+#[test]
+fn external_imports_are_unresolved_references_not_dangling_diagnostic_edges() {
+    let s = Sandbox::new();
+    fs::write(
+        s.root.join("entry.ts"),
+        "import 'unavailable-package/component'; export function run() { unavailable(); }\n",
+    )
+    .unwrap();
+    let db = s.root.join(".graf/index.db");
+    graf::index::run(&s.root, &db).unwrap();
+    let graph = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+    let stats = Store::open_read_only(&db).unwrap().stats().unwrap();
+    assert!(stats.unresolved_references >= 2);
+    let result = s.ok(&["--json", "--db", string(&db), "diagnose"]);
+    assert_eq!(
+        result["unresolved_reference_count"],
+        stats.unresolved_references
+    );
+    assert_eq!(result["edge_count"], graph.edges.len());
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|e| graph.nodes.iter().any(|n| n.id == e.source)
+                && graph.nodes.iter().any(|n| n.id == e.target))
+    );
+    let mut malformed = graph.clone();
+    malformed.edges[0].target = "missing-internal-target".into();
+    assert!(graf::snapshot::merge(vec![("invalid".into(), malformed)]).is_err());
 }
 
 #[test]

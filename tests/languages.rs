@@ -1071,3 +1071,305 @@ const _: () = ();
     assert_eq!(node(&f, "OPTIONAL").metadata["conditional"], true);
     assert!(node(&f, "_").binding_key.is_none());
 }
+
+#[test]
+fn written_contract_members_are_navigation_not_runtime_calls() {
+    use graf::{model::Coverage, store::Store};
+
+    for (path, source, replacement, member, caller, negatives) in [
+        (
+            "contract.ts",
+            r#"export interface Channel { send(): number }
+class First { send() { return 1; } }
+class Second { send() { return 2; } }
+function invoke(value: Channel) { return value.send(); }
+function shadow(value: Channel) { { let value: unknown; value.send(); } }
+function changed(value: Channel, other: Channel) { value = other; value.send(); }
+function structural(value: { send(): number }) { value.send(); }
+function staticUse() { Channel.send(); }
+function constructed() { const value = new Channel(); value.send(); }
+"#,
+            "export interface Channel { receive(): number } function invoke(value: Channel) { value.send(); }",
+            "send",
+            "invoke",
+            vec![
+                "shadow",
+                "changed",
+                "structural",
+                "staticUse",
+                "constructed",
+            ],
+        ),
+        (
+            "contract.go",
+            r#"package wire
+type Channel interface { Send() int }
+type First struct {}
+func (First) Send() int { return 1 }
+type Second struct {}
+func (Second) Send() int { return 2 }
+func invoke(value Channel) int { return value.Send() }
+func shadow(value Channel) { { value := unknown; value.Send() } }
+func changed(value Channel, other Channel) { value = other; value.Send() }
+func structural(value interface { Send() int }) { value.Send() }
+func staticUse() { Channel.Send() }
+func pointer(value *Channel) { value.Send() }
+"#,
+            "package wire\ntype Channel interface { Receive() int }\nfunc invoke(value Channel) { value.Send() }",
+            "Send",
+            "invoke",
+            vec!["shadow", "changed", "structural", "staticUse", "pointer"],
+        ),
+        (
+            "src/lib.rs",
+            r#"trait Channel { fn send(&self) -> i32; }
+struct First;
+impl Channel for First { fn send(&self) -> i32 { 1 } }
+struct Second;
+impl Channel for Second { fn send(&self) -> i32 { 2 } }
+fn invoke(value: &dyn Channel) -> i32 { value.send() }
+fn shadow(value: &dyn Channel) { let value = unknown; value.send(); }
+fn changed(mut value: &dyn Channel, other: &dyn Channel) { value = other; value.send(); }
+fn structural<T>(value: T) { value.send(); }
+fn static_use() { Channel::send(); }
+"#,
+            "trait Channel { fn receive(&self); } fn invoke(value: &dyn Channel) { value.send(); }",
+            "send",
+            "invoke",
+            vec!["shadow", "changed", "structural", "static_use"],
+        ),
+    ] {
+        let original = facts(path, source);
+        let contract = node(&original, "Channel");
+        let target = original
+            .nodes
+            .iter()
+            .find(|n| {
+                n.label == member
+                    && original.edges.iter().any(|e| {
+                        e.relation == "contains" && e.source == contract.id && e.target == n.id
+                    })
+            })
+            .unwrap();
+        assert!(
+            target.binding_key.is_none(),
+            "{path}: signature became callable"
+        );
+        let target = target.id.clone();
+        let source = node(&original, caller).id.clone();
+        let forbidden: Vec<_> = negatives
+            .iter()
+            .map(|name| node(&original, name).id.clone())
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+        store
+            .apply_native("fixture", vec![original], vec![], Coverage::default())
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let navigation: Vec<_> = snapshot
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == source && matches!(e.relation.as_str(), "calls" | "declared_member")
+            })
+            .collect();
+        assert_eq!(navigation.len(), 1, "{path}: {navigation:?}");
+        assert_eq!(
+            (&navigation[0].relation, &navigation[0].target),
+            (&"declared_member".to_owned(), &target)
+        );
+        assert!(
+            !snapshot.edges.iter().any(|e| forbidden.contains(&e.source)
+                && matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{path}: {:?}",
+            snapshot.edges
+        );
+        store
+            .apply_native(
+                "fixture",
+                vec![facts(path, replacement)],
+                vec![],
+                Coverage::default(),
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(!snapshot.nodes.iter().any(|n| n.id == target), "{path}");
+        assert!(
+            !snapshot
+                .edges
+                .iter()
+                .any(|e| matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{path}: {:?}",
+            snapshot.edges
+        );
+    }
+}
+
+#[test]
+fn imported_typescript_interface_member_keeps_its_written_declaration() {
+    use graf::{model::Coverage, store::Store};
+    let contract = facts("channel.ts", "export interface Channel { send(): number }");
+    let target = node(&contract, "send").id.clone();
+    let caller = facts(
+        "entry.ts",
+        "import type { Channel as Port } from './channel'; function invoke(value: Port) { return value.send(); }",
+    );
+    let source = node(&caller, "invoke").id.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native(
+            "fixture",
+            vec![contract, caller],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(
+        snapshot
+            .edges
+            .iter()
+            .any(|e| e.source == source && e.target == target && e.relation == "declared_member")
+    );
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|e| e.source == source && e.relation == "calls")
+    );
+    store
+        .apply_native(
+            "fixture",
+            vec![facts(
+                "channel.ts",
+                "export interface Channel { receive(): number }",
+            )],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.nodes.iter().any(|n| n.id == target));
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|e| e.source == source
+                && matches!(e.relation.as_str(), "calls" | "declared_member"))
+    );
+}
+
+#[test]
+fn ambiguous_or_conditional_contract_signatures_stay_unresolved() {
+    use graf::{model::Coverage, store::Store};
+    for (path, source) in [
+        (
+            "duplicate.ts",
+            "interface Channel { send(): void; send(x: number): void } function invoke(value: Channel) { value.send(); }",
+        ),
+        (
+            "optional.ts",
+            "interface Channel { send?(): void } function invoke(value: Channel) { value.send(); }",
+        ),
+        (
+            "duplicate.go",
+            "package wire\ntype Channel interface { Send(); Send(int) }\nfunc invoke(value Channel) { value.Send() }",
+        ),
+        (
+            "src/lib.rs",
+            "trait Channel { fn send(&self); fn send(&self, x: i32); } fn invoke(value: &dyn Channel) { value.send(); }",
+        ),
+        (
+            "src/lib.rs",
+            "#[cfg(feature = \"extra\")] trait Channel { fn send(&self); } fn invoke(value: &dyn Channel) { value.send(); }",
+        ),
+        (
+            "src/lib.rs",
+            "trait Channel { #[cfg(feature = \"extra\")] fn send(&self); } fn invoke(value: &dyn Channel) { value.send(); }",
+        ),
+        (
+            "src/lib.rs",
+            "trait Channel { fn send(); } fn invoke(value: &dyn Channel) { value.send(); }",
+        ),
+    ] {
+        let file = facts(path, source);
+        let caller = node(&file, "invoke").id.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+        store
+            .apply_native("fixture", vec![file], vec![], Coverage::default())
+            .unwrap();
+        assert!(
+            !store
+                .snapshot()
+                .unwrap()
+                .edges
+                .iter()
+                .any(|e| e.source == caller
+                    && matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{path}: {source}"
+        );
+    }
+}
+
+#[test]
+fn rust_simple_generic_impls_keep_exact_self_and_scoped_self_keys() {
+    let provider = facts(
+        "src/provider.rs",
+        "use crate::model::Register; impl<Key, Value> Register<Key, Value> { pub fn inspect(&self) {} pub fn empty() {} }",
+    );
+    let caller = facts(
+        "src/consumer.rs",
+        "use crate::model::Register as Table; impl<Left, Right> Table<Left, Right> { pub fn visit(&self) { self.inspect(); Self::empty(); } }",
+    );
+    assert_eq!(node(&provider, "inspect").metadata["generic_impl_arity"], 2);
+    assert_eq!(
+        node(&caller, "visit").metadata["generic_impl_type"],
+        "rust:.:model::Register"
+    );
+    assert_eq!(
+        calls(&caller, "self.inspect")[0].candidate_keys,
+        [key(node(&provider, "inspect"))]
+    );
+    assert_eq!(
+        calls(&caller, "Self::empty")[0].candidate_keys,
+        [key(node(&provider, "empty"))]
+    );
+    let model = facts("src/model.rs", "pub struct Register<A, B>(pub A, pub B);");
+    assert_eq!(node(&model, "Register").metadata["generic_type_arity"], 2);
+}
+
+#[test]
+fn rust_restricted_impl_headers_do_not_erase_type_constraints() {
+    for header in [
+        "impl<T: Copy> Register<T>",
+        "impl<T> Register<T> where T: Copy",
+        "impl<T> Inspect for Register<T>",
+        "impl<'a, T> Register<'a, T>",
+        "impl<const SIZE: usize> Register<SIZE>",
+        "impl<T> Register<Option<T>>",
+        "impl Register<u16>",
+        "impl<T> Register<T, T>",
+        "impl<A, B> Register<B, A>",
+    ] {
+        let source = format!(
+            "fn helper() {{}} {header} {{ fn inspect(&self) {{}} fn visit(&self) {{ self.inspect(); Self::inspect(self); helper(); }} }}"
+        );
+        let file = facts("src/lib.rs", &source);
+        assert!(node(&file, "inspect").binding_key.is_none(), "{header}");
+        assert!(node(&file, "visit").binding_key.is_none(), "{header}");
+        for spelling in ["self.inspect", "Self::inspect"] {
+            assert!(
+                calls(&file, spelling)[0].candidate_keys.is_empty(),
+                "{header}: {spelling}"
+            );
+        }
+        assert_eq!(
+            calls(&file, "helper")[0].candidate_keys,
+            [key(node(&file, "helper"))],
+            "{header}"
+        );
+    }
+}
