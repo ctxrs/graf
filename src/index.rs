@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
-const EXTRACTOR_REVISION: u32 = 7;
+const EXTRACTOR_REVISION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -77,6 +77,61 @@ pub struct Freshness {
     pub fresh: bool,
 }
 
+/// Run-local reservations and provider receipts survive a failed extraction or
+/// commit. Available through anyhow downcasting; never written into the graph.
+#[derive(Debug, Serialize)]
+pub struct FailedSemanticUsage {
+    pub semantic_usage: Option<ingest::SemanticUsage>,
+    pub provider_usage: Vec<ingest::ProviderUsage>,
+    pub usage_unavailable: bool,
+    #[serde(skip)]
+    message: String,
+}
+impl std::fmt::Display for FailedSemanticUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; semantic usage before failure: {}",
+            self.message,
+            serde_json::to_string(self).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
+impl std::error::Error for FailedSemanticUsage {}
+
+pub(crate) fn retain_semantic_usage(error: anyhow::Error, options: &IndexOptions) -> anyhow::Error {
+    if error.downcast_ref::<FailedSemanticUsage>().is_some() {
+        return error;
+    }
+    let Some(semantic) = &options.ingest.semantic else {
+        return error;
+    };
+    let reserved = semantic
+        .runtime_budget
+        .as_ref()
+        .map(|b| b.usage())
+        .transpose();
+    let actual = semantic
+        .runtime_usage
+        .as_ref()
+        .map(|r| r.snapshot())
+        .transpose();
+    let usage = FailedSemanticUsage {
+        message: error.to_string(),
+        usage_unavailable: reserved.is_err() || actual.is_err(),
+        semantic_usage: reserved.ok().flatten(),
+        provider_usage: actual.ok().flatten().unwrap_or_default(),
+    };
+    if usage.usage_unavailable
+        || usage.semantic_usage.is_some_and(|u| u.calls > 0)
+        || !usage.provider_usage.is_empty()
+    {
+        error.context(usage)
+    } else {
+        error
+    }
+}
+
 pub fn stored_options(db: &Path) -> Result<IndexOptions> {
     if !db.try_exists()? {
         return Ok(IndexOptions::default());
@@ -104,9 +159,18 @@ pub(crate) fn run_with_reserved_semantic_files(
     options: &IndexOptions,
     reserved: usize,
 ) -> Result<IndexReport> {
-    let started = std::time::Instant::now();
     let prepared = prepare_semantic_budget(options);
-    let options = &prepared;
+    run_prepared(root, db, &prepared, reserved)
+        .map_err(|error| retain_semantic_usage(error, &prepared))
+}
+
+fn run_prepared(
+    root: &Path,
+    db: &Path,
+    options: &IndexOptions,
+    reserved: usize,
+) -> Result<IndexReport> {
+    let started = std::time::Instant::now();
     for source_root in &options.python_source_roots {
         ensure!(
             source_root.is_empty()
@@ -325,6 +389,13 @@ pub(crate) fn run_with_reserved_semantic_files(
         .and_then(|semantic| semantic.runtime_budget.as_ref())
         .map(|budget| budget.usage())
         .transpose()?;
+    report.provider_usage = options
+        .ingest
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.runtime_usage.as_ref())
+        .map(|recorder| recorder.snapshot())
+        .transpose()?;
     if options.timing {
         report.timings = Some(IndexTimings {
             detect_ms,
@@ -339,13 +410,17 @@ pub(crate) fn run_with_reserved_semantic_files(
 
 pub(crate) fn prepare_semantic_budget(options: &IndexOptions) -> IndexOptions {
     let mut prepared = options.clone();
-    if let Some(semantic) = &mut prepared.ingest.semantic
-        && semantic.runtime_budget.is_none()
-    {
-        semantic.runtime_budget = Some(std::sync::Arc::new(ingest::SemanticBudget::new(
-            options.max_semantic_calls,
-            options.max_semantic_output_tokens,
-        )));
+    if let Some(semantic) = &mut prepared.ingest.semantic {
+        if semantic.runtime_budget.is_none() {
+            semantic.runtime_budget = Some(std::sync::Arc::new(ingest::SemanticBudget::new(
+                options.max_semantic_calls,
+                options.max_semantic_output_tokens,
+            )));
+        }
+        if semantic.runtime_usage.is_none() {
+            semantic.runtime_usage =
+                Some(std::sync::Arc::new(ingest::SemanticUsageRecorder::default()));
+        }
     }
     prepared
 }
@@ -630,6 +705,38 @@ fn python_inventory(
         context: Some(context),
         facts: facts.into_iter().map(|f| (f.path.clone(), f)).collect(),
     })
+}
+
+/// Recover the raw local-source digest from formats produced by this indexer.
+/// Managed captures hash a saved extraction record instead, so never qualify.
+pub(crate) fn indexed_source_digest(stamp: &str) -> Option<&str> {
+    let (family, _) = stamp.split_once(':')?;
+    let known = if let Some(version) = family.strip_prefix("python-v") {
+        version
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|v| (1..=EXTRACTOR_REVISION).contains(&v))
+    } else if let Some(version) = family.strip_prefix("languages-native-languages-") {
+        let current = languages::revision()
+            .strip_prefix("native-languages-")?
+            .parse::<u32>()
+            .ok()?;
+        version
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|v| (1..=current).contains(&v))
+    } else {
+        family == "ingest-v1"
+    };
+    if !known || stamp.split(':').count() < 3 || stamp.contains(":oversized:") {
+        return None;
+    }
+    let digest = stamp.rsplit(':').next()?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(digest)
 }
 
 fn stamp(

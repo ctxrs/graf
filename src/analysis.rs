@@ -3,9 +3,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
+use network_partitions::{clustering::Clustering, leiden::leiden_view, network::CsrNetworkView};
+use rand::{SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Edge, GraphSnapshot};
+
+/// Community engine. Louvain remains the compatibility default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunityAlgorithm {
+    Leiden,
+    #[default]
+    Louvain,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -13,7 +24,14 @@ pub struct AnalysisOptions {
     pub damping: f64,
     pub tolerance: f64,
     pub max_iterations: usize,
+    /// Total Louvain sweeps or Leiden outer iterations, including split retries.
     pub community_max_passes: usize,
+    pub community_algorithm: CommunityAlgorithm,
+    /// Fixed RNG seed for Leiden; ignored by deterministic Louvain.
+    pub community_seed: u64,
+    /// Leiden only: at most this many times the level's node count are processed
+    /// per local-moving call. Positive; not a global sweep or wall-clock budget.
+    pub community_local_max_passes: u32,
     /// Positive modularity resolution; larger values favor smaller groups.
     pub resolution: f64,
     /// Optional split trigger, not a guaranteed cap. Unsplit groups are reported.
@@ -35,6 +53,9 @@ impl Default for AnalysisOptions {
             tolerance: 1e-10,
             max_iterations: 200,
             community_max_passes: 100,
+            community_algorithm: CommunityAlgorithm::Louvain,
+            community_seed: 42,
+            community_local_max_passes: 100,
             resolution: 1.0,
             max_community_size: None,
             min_cohesion: None,
@@ -129,6 +150,10 @@ pub struct AnalysisReport {
     pub community_resolution: f64,
     pub community_passes: usize,
     pub community_converged: bool,
+    /// False when the engine cannot certify convergence/cap exhaustion.
+    pub community_convergence_known: bool,
+    /// `louvain_sweeps` or `leiden_iterations`; counts include split retries.
+    pub community_pass_unit: String,
     pub community_split_attempts: usize,
     /// Final community IDs still outside requested optional split thresholds.
     pub unsatisfied_community_constraints: Vec<usize>,
@@ -163,6 +188,67 @@ pub(crate) fn attributes(mut value: &serde_json::Value) -> &serde_json::Value {
         value = &value["original_metadata"];
     }
     value
+}
+
+/// Imported identities are a separate namespace from recomputed communities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreservedCommunity {
+    /// Composition names from outermost to innermost; empty for a direct import.
+    pub project: Vec<String>,
+    /// Original integer or string identity, without coercing one into the other.
+    pub id: serde_json::Value,
+    /// All distinct recorded names; conflicting names remain visible.
+    pub names: Vec<String>,
+    pub nodes: Vec<String>,
+}
+
+/// Read stored memberships without clustering, modifying the graph, or guessing
+/// identity from a node-ID prefix. Missing/null/unsupported IDs are unassigned.
+pub fn preserved_communities(snapshot: &GraphSnapshot) -> Vec<PreservedCommunity> {
+    let mut groups = BTreeMap::<(Vec<String>, String), PreservedCommunity>::new();
+    for node in &snapshot.nodes {
+        let mut value = &node.metadata;
+        let mut project = Vec::new();
+        while let (Some(name), Some(_), Some(original)) = (
+            value.get("project").and_then(serde_json::Value::as_str),
+            value.get("original_id").and_then(serde_json::Value::as_str),
+            value.get("original_metadata"),
+        ) {
+            project.push(name.to_owned());
+            value = original;
+        }
+        let Some(id) = value
+            .get("community")
+            .filter(|id| id.is_i64() || id.is_u64() || id.as_str().is_some_and(|s| !s.is_empty()))
+        else {
+            continue;
+        };
+        let group = groups
+            .entry((project.clone(), id.to_string()))
+            .or_insert_with(|| PreservedCommunity {
+                project,
+                id: id.clone(),
+                names: Vec::new(),
+                nodes: Vec::new(),
+            });
+        group.nodes.push(node.id.clone());
+        if let Some(name) = value
+            .get("community_name")
+            .and_then(serde_json::Value::as_str)
+            && !name.is_empty()
+        {
+            group.names.push(name.to_owned());
+        }
+    }
+    groups
+        .into_values()
+        .map(|mut group| {
+            group.nodes.sort();
+            group.names.sort();
+            group.names.dedup();
+            group
+        })
+        .collect()
 }
 
 /// A missing weight is 1; explicit weights must be finite and nonnegative.
@@ -216,6 +302,11 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
             "hub percentile must be in [0, 100]"
         );
     }
+    ensure!(
+        options.community_algorithm != CommunityAlgorithm::Leiden
+            || options.community_local_max_passes > 0,
+        "Leiden local pass limit must be positive"
+    );
     let mut nodes: Vec<_> = snapshot.nodes.iter().collect();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let indices: BTreeMap<_, _> = nodes
@@ -334,12 +425,13 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
             .map(|row| row.values().sum())
             .collect::<Vec<f64>>()
     });
-    let (mut membership, _, mut passes, mut community_converged) = communities(
+    let (mut membership, _, mut passes, mut community_converged) = partition(
         filtered.as_deref().unwrap_or(&adjacency),
         filtered_strengths.as_deref().unwrap_or(&strengths),
         options.community_max_passes,
         options.resolution,
-    );
+        options,
+    )?;
     let mut assigned: Vec<_> = excluded.iter().map(|v| !v).collect();
     // IDs are sorted. Majority votes count distinct positive-weight neighbors,
     // not parallel-edge multiplicity; ties choose the lowest partition ID.
@@ -366,9 +458,14 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
         &mut membership,
         options,
         options.community_max_passes - passes,
-    );
+    )?;
     passes += split_passes;
     community_converged &= split_converged;
+    let community_convergence_known = options.community_algorithm == CommunityAlgorithm::Louvain
+        || strengths.iter().all(|w| *w == 0.0);
+    if !community_convergence_known {
+        community_converged = false;
+    }
     let modularity = partition_modularity(&adjacency, &strengths, &membership, options.resolution);
     let labels: BTreeMap<_, _> = nodes
         .iter()
@@ -458,11 +555,19 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
         confidence_counts, isolates, cross_community_edges, import_cycles, excluded_hubs, noise_filtered_hubs,
         schema_version:snapshot.schema_version,generation:snapshot.generation,nodes:metrics,hubs,communities:groups,
         pagerank_iterations:iterations,pagerank_converged:rank_converged,
-        community_algorithm:format!("deterministic multilevel Louvain with connectivity splitting (resolution {})", options.resolution),
+        community_algorithm: match options.community_algorithm {
+            CommunityAlgorithm::Louvain => format!("deterministic multilevel Louvain with connectivity splitting (resolution {})", options.resolution),
+            CommunityAlgorithm::Leiden => format!("native Leiden (network_partitions 0.3.0; seed {}; resolution {}; local pass limit {}) with final connectivity splitting", options.community_seed, options.resolution, options.community_local_max_passes),
+        },
+        community_convergence_known,
+        community_pass_unit: match options.community_algorithm {
+            CommunityAlgorithm::Louvain => "louvain_sweeps",
+            CommunityAlgorithm::Leiden => "leiden_iterations",
+        }.into(),
         community_modularity:modularity,community_resolution:options.resolution,community_passes:passes,community_converged,
         community_split_attempts,unsatisfied_community_constraints,
         file_dependencies:dependencies.into_iter().map(|((source_file,target_file,relation,directed),evidence)| FileDependency {source_file,target_file,relation,directed,evidence}).collect(),call_edges,
-        methodology:"Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: deterministic multilevel Louvain on the weighted symmetric projection with configurable positive resolution, disconnected-community splitting at each level and retained self loops; no Leiden guarantee or semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the total sweep budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed.".into(),
+        methodology:"Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: selected native Leiden or deterministic multilevel Louvain on the weighted symmetric projection with positive resolution and retained self loops. Leiden uses seeded stochastic refinement and aggregation; its local pass limit bounds node processing per call at each level, not total runtime. Its pass count is outer iterations; unchanged consecutive partitions stop iteration but do not certify convergence. The core does not report cap exhaustion, so nontrivial Leiden runs report community_converged=false and community_convergence_known=false. Connectivity splitting protects capped partitions. Louvain counts local sweeps. Neither engine supplies semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the selected engine's total pass budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed.".into(),
     })
 }
 
@@ -581,6 +686,100 @@ fn local_move(
     (member, modularity, passes, converged)
 }
 
+/// Canonical, connected components within a partition, using positive edges.
+fn connected_membership(adjacency: &[BTreeMap<usize, f64>], membership: &[usize]) -> Vec<usize> {
+    let mut refined = vec![usize::MAX; adjacency.len()];
+    let mut group = 0;
+    for seed in 0..adjacency.len() {
+        if refined[seed] != usize::MAX {
+            continue;
+        }
+        refined[seed] = group;
+        let mut pending = vec![seed];
+        while let Some(i) = pending.pop() {
+            for (&j, &w) in &adjacency[i] {
+                if w > 0.0 && membership[j] == membership[seed] && refined[j] == usize::MAX {
+                    refined[j] = group;
+                    pending.push(j);
+                }
+            }
+        }
+        group += 1;
+    }
+    refined
+}
+
+fn partition(
+    adjacency: &[BTreeMap<usize, f64>],
+    strengths: &[f64],
+    max_passes: usize,
+    resolution: f64,
+    options: &AnalysisOptions,
+) -> Result<(Vec<usize>, f64, usize, bool)> {
+    if options.community_algorithm == CommunityAlgorithm::Louvain {
+        return Ok(communities(adjacency, strengths, max_passes, resolution));
+    }
+    let mut membership: Vec<_> = (0..adjacency.len()).collect();
+    let total: f64 = strengths.iter().sum();
+    if total == 0.0 {
+        return Ok((membership, 0.0, 0, true));
+    }
+    // Normalize to total strength two, avoiding overflow in core products.
+    // CSR diagonals store loop weight once; node strengths count it twice.
+    let node_weights: Vec<_> = strengths.iter().map(|w| (w / total) * 2.0).collect();
+    let mut offsets = vec![0];
+    let mut indices = Vec::new();
+    let mut weights = Vec::new();
+    for (i, row) in adjacency.iter().enumerate() {
+        for (&j, &w) in row {
+            if w > 0.0 {
+                indices.push(j);
+                weights.push(if i == j { w / total } else { (w / total) * 2.0 });
+            }
+        }
+        offsets.push(indices.len());
+    }
+    let network = CsrNetworkView::new(&offsets, &indices, &weights, &node_weights)
+        .context("cannot construct Leiden projection")?;
+    let mut rng = SmallRng::seed_from_u64(options.community_seed);
+    let mut passes = 0;
+    for _ in 0..max_passes {
+        let groups = membership.iter().max().map_or(0, |id| id + 1);
+        let initial = Clustering::as_defined(membership.clone(), groups);
+        let (_, output) = leiden_view(
+            &network,
+            Some(initial),
+            Some(1),
+            Some(resolution),
+            Some(0.001),
+            &mut rng,
+            true,
+            Some(options.community_local_max_passes),
+        )
+        .map_err(|error| anyhow::anyhow!("Leiden failed: {error:?}"))?;
+        let next = (0..adjacency.len())
+            .map(|i| {
+                output
+                    .cluster_at(i)
+                    .map_err(|e| anyhow::anyhow!("invalid Leiden partition: {e:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Capped local moving may stop before refinement can repair every group.
+        // Repair also keeps isolates separate before the next warm start.
+        let next = connected_membership(adjacency, &next);
+        passes += 1;
+        let unchanged = next == membership;
+        membership = next;
+        if unchanged {
+            break;
+        }
+    }
+    let modularity = partition_modularity(adjacency, strengths, &membership, resolution);
+    // The core exposes improvement, not convergence or cap exhaustion. Even an
+    // unchanged partition is only an observed stopping point under this seed.
+    Ok((membership, modularity, passes, false))
+}
+
 fn communities(
     adjacency: &[BTreeMap<usize, f64>],
     strengths: &[f64],
@@ -606,25 +805,8 @@ fn communities(
         passes += used;
         // Louvain can leave disconnected communities after a vertex moves away.
         // Split them along positive-weight connectivity before every aggregation.
-        let mut refined = vec![usize::MAX; level.len()];
-        let mut groups = 0;
-        for seed in 0..level.len() {
-            if refined[seed] != usize::MAX {
-                continue;
-            }
-            refined[seed] = groups;
-            let mut pending = vec![seed];
-            while let Some(i) = pending.pop() {
-                for (&j, &weight) in &level[i] {
-                    if weight > 0.0 && membership[j] == membership[seed] && refined[j] == usize::MAX
-                    {
-                        refined[j] = groups;
-                        pending.push(j);
-                    }
-                }
-            }
-            groups += 1;
-        }
+        let refined = connected_membership(&level, &membership);
+        let groups = refined.iter().max().map_or(0, |id| id + 1);
         for group in &mut original {
             *group = refined[*group];
         }
@@ -703,9 +885,9 @@ fn repartition(
     membership: &mut [usize],
     options: &AnalysisOptions,
     budget: usize,
-) -> (usize, usize, bool) {
+) -> Result<(usize, usize, bool)> {
     if options.max_community_size.is_none() && options.min_cohesion.is_none() {
-        return (0, 0, true);
+        return Ok((0, 0, true));
     }
     let mut groups = BTreeMap::<usize, Vec<usize>>::new();
     for (node, &group) in membership.iter().enumerate() {
@@ -740,12 +922,13 @@ fn repartition(
             })
             .collect();
         let strengths: Vec<f64> = induced.iter().map(|row| row.values().sum()).collect();
-        let (split, _, used, stable) = communities(
+        let (split, _, used, stable) = partition(
             &induced,
             &strengths,
             budget - passes,
             options.resolution.max(1.0),
-        );
+            options,
+        )?;
         attempts += 1;
         passes += used;
         converged &= stable;
@@ -764,7 +947,7 @@ fn repartition(
         }
         pending.extend(parts.into_values().rev());
     }
-    (attempts, passes, converged)
+    Ok((attempts, passes, converged))
 }
 
 fn is_noise(node: &crate::model::Node) -> bool {

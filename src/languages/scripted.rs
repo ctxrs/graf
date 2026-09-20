@@ -110,12 +110,19 @@ pub fn parse_named(
     };
     let root = tree.root_node();
     e.root(root, format!("{lang}:module:{}", e.facts.module));
-    let facts = match lang {
+    let mut facts = match lang {
         "ruby" => Ruby::new(e).extract(root),
         "php" => Php::new(e).extract(root),
         "elixir" => Elixir::new(e).extract(root),
         _ => Script::new(e).extract(root),
     };
+    if lang == "php" {
+        let regions = descendants(root, "text")
+            .into_iter()
+            .map(|n| n.byte_range())
+            .collect::<Vec<_>>();
+        super::templates::append_inline_javascript(&mut facts, source, &regions)?;
+    }
     Ok(Some(facts))
 }
 fn child<'a>(n: Syntax<'a>, kind: &str) -> Option<Syntax<'a>> {

@@ -4,13 +4,32 @@ A persistent local code graph, written in Rust. Index a project or import a
 Graphify snapshot, then find symbols, inspect callers, and follow dependencies
 from your terminal or an AI agent.
 
-Graf stores its graph in SQLite. Navigation queries use persistent search and
-adjacency indexes; they do not reload graph JSON, rebuild the graph, or scan for
-source changes. Run an explicit update when you want a new snapshot.
+Graf stores its graph in SQLite. By default, navigation queries use persistent
+search and adjacency indexes; they do not reload graph JSON, rebuild the graph,
+or scan for source changes. Run an explicit update when you want a new snapshot.
 
-Graf 0.3 adds language and document extraction, graph analysis, exports, and
+Graf supports language and document extraction, graph analysis, exports, and
 agent integrations. See the [usage guide](docs/usage.md) for supported workflows
 and their limits.
+
+Graf 0.4.0 adds the workflows below. They require Graf 0.4.0 or a build from this
+checkout; installing 0.3.0 does not enable them:
+
+- [Provider discovery and setup](docs/usage.md#provider-discovery-and-setup),
+  with explicit selection, usage receipts, and bounded recovery.
+- [Saved answers and local reflection](docs/usage.md#save-answers-and-reflect),
+  with explicit limits on source verification and
+  [opt-in CLI/MCP annotations](docs/usage.md#read-learning-observations-during-navigation).
+- [Optional project tool hooks](docs/usage.md#optional-tool-guidance)
+  that suggest graph navigation while allowing source reads and searches.
+- [Read-only PR inspection](docs/usage.md#inspect-github-pull-requests)
+  and explicitly enabled GitHub MCP tools.
+- [Optional Leiden analysis](docs/usage.md#community-algorithms) alongside
+  Louvain, and [preserved imported communities](docs/usage.md#preserved-communities).
+- [Offline graph exploration](docs/usage.md#explore-an-html-graph) with
+  topology-based layout, clickable neighbors and recorded group outlines.
+  [Optional work-memory annotations](docs/usage.md#work-memory-annotations-in-exports)
+  show saved observations without changing the graph.
 
 ## Install
 
@@ -26,8 +45,10 @@ On Windows x64, in PowerShell:
 irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 ```
 
-The installers verify the signed release manifest and download hashes, decompress
-gzip releases, and verify the executable's signed hash and size before installing.
+The installers fetch the latest published release by default, which may precede
+this checkout. They verify the signed release manifest and download hashes,
+decompress gzip releases, and verify the executable's signed hash and size before
+installing.
 Linux and macOS need `curl`, `openssl`, `gzip`, and standard shell utilities;
 Windows needs PowerShell 5.1 or newer. Linux and macOS default to `~/.local/bin`;
 Windows defaults to
@@ -180,7 +201,9 @@ bound traversal, and `truncated` marks incomplete results. Default traversal
 returns examined edges, not every edge among returned nodes.
 
 Graf also offers [reversible agent setup](docs/usage.md#agent-setup-and-mcp),
-optional Git refresh hooks, Streamable HTTP, and named project routing. Other
+optional Git refresh hooks, Streamable HTTP, and named project routing. In Graf 0.4.0,
+[Claude global MCP cleanup](docs/usage.md#claude-global-mcp-cleanup)
+preserves host-added settings when removing an unchanged Graf entry. Other
 commands cover [analysis and exports](docs/usage.md#analysis-and-exports),
 [stored cross-project graphs](docs/usage.md#multiple-projects), and
 [explicit database connectors](docs/usage.md#database-connectors).

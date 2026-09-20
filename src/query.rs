@@ -8,19 +8,26 @@ use std::{
 
 const MAX_SEEDS: usize = 20;
 const MAX_EXAMINED: usize = 5_000;
+// Ranking and endpoint lookup inspect the catalog; traversal admits neighbors.
+// Separate budgets keep a common word or a late endpoint discoverable.
+const MAX_RANK_POSTINGS: usize = 250_000;
+const MAX_RANK_BYTES: usize = 64 * 1024 * 1024;
 
 // The handler belongs to this request, not the Store: stats and writes must
 // not inherit a query's exhausted budget, including after an error.
 struct QueryBudget<'a>(&'a Connection);
 impl<'a> QueryBudget<'a> {
     fn install(conn: &'a Connection) -> Result<Self> {
+        Self::with_steps(conn, 2_000)
+    }
+    fn with_steps(conn: &'a Connection, max_callbacks: usize) -> Result<Self> {
         let start = Instant::now();
         let mut callbacks = 0;
         conn.progress_handler(
             1_000,
             Some(move || {
                 callbacks += 1;
-                callbacks >= 2_000 || start.elapsed() >= Duration::from_secs(2)
+                callbacks >= max_callbacks || start.elapsed() >= Duration::from_secs(2)
             }),
         )?;
         Ok(Self(conn))
@@ -35,7 +42,14 @@ impl Drop for QueryBudget<'_> {
 }
 fn budgeted<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
     let _budget = QueryBudget::install(conn)?;
-    work().map_err(|error| {
+    query_errors(work())
+}
+fn catalog_budgeted<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _budget = QueryBudget::with_steps(conn, 20_000)?;
+    query_errors(work())
+}
+fn query_errors<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
         if matches!(error.downcast_ref::<rusqlite::Error>(),
             Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::OperationInterrupted) {
             error.context("query exceeded its SQLite work/time budget; use a more specific symbol, fewer search terms, or a smaller depth/limit")
@@ -530,11 +544,42 @@ pub struct ImpactOptions {
 }
 
 impl crate::store::Store {
+    /// Convenience lookup and traversal in one snapshot. Endpoints use the same
+    /// exact-first tiers as resolve_endpoint. A relation filter selects a unique
+    /// incident relation by exact spelling, normalized spelling, prefix, then
+    /// substring; ties are errors. neighbors_extended remains exact-only.
+    pub fn neighbors_resolved(&self, text: &str, options: &SearchOptions) -> Result<SearchResult> {
+        catalog_budgeted(&self.conn, || {
+            let mut options = options.clone();
+            if let Some(relation) = &options.graph.relation {
+                ensure!(
+                    relation.len() <= 1024,
+                    "relation must be at most 1024 bytes"
+                );
+                if relation.trim().is_empty() {
+                    options.graph.relation = None;
+                }
+            }
+            validate_search(&options)?;
+            let text = validate_text(text)?;
+            let tx = self.conn.unchecked_transaction()?;
+            let mut output = new_search(&tx, contexts("", &options))?;
+            let seed = resolve_endpoint_in(&tx, text, &options)?;
+            if let Some(relation) = &options.graph.relation {
+                options.graph.relation =
+                    Some(resolve_relation(&tx, &seed.id, relation, &options.graph)?);
+            }
+            explore(&tx, vec![seed], &options, &mut output)?;
+            tx.commit()?;
+            finish_search(output)
+        })
+    }
+
     /// Resolve a unique endpoint: exact ID/label/scope, exact file, then literal
     /// Unicode/accent-insensitive exact, prefix and substring tiers. Punctuation
     /// stays literal; ties and incomplete convenience scans return errors.
     pub fn resolve_endpoint(&self, text: &str, options: &SearchOptions) -> Result<Node> {
-        budgeted(&self.conn, || {
+        catalog_budgeted(&self.conn, || {
             validate_search(options)?;
             let tx = self.conn.unchecked_transaction()?;
             let node = resolve_endpoint_in(&tx, validate_text(text)?, options)?;
@@ -546,7 +591,7 @@ impl crate::store::Store {
     /// Include grounded root/member/file seeds, then reverse dependencies.
     /// SearchResult.seeds distinguishes starting evidence from affected nodes.
     pub fn impact_extended(&self, text: &str, options: &ImpactOptions) -> Result<SearchResult> {
-        budgeted(&self.conn, || {
+        catalog_budgeted(&self.conn, || {
             validate_search(&options.search)?;
             let text = validate_text(text)?;
             ensure!(options.relations.len() <= 32, "at most 32 impact relations");
@@ -599,7 +644,7 @@ impl crate::store::Store {
     }
 }
 
-const CANDIDATES_PER_TERM: usize = 64;
+const MAX_SEARCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn validate_search(options: &SearchOptions) -> Result<()> {
     validate(&options.graph)?;
@@ -640,7 +685,7 @@ fn validate_text(text: &str) -> Result<&str> {
 
 fn normalize(text: &str) -> String {
     use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
-    text.nfd()
+    text.nfkd()
         .filter(|c| !is_combining_mark(*c))
         .flat_map(char::to_lowercase)
         .collect()
@@ -827,6 +872,106 @@ fn require_unique(nodes: Vec<Node>, text: &str) -> Result<Node> {
     }
 }
 
+fn resolve_relation(
+    conn: &Connection,
+    id: &str,
+    text: &str,
+    options: &QueryOptions,
+) -> Result<String> {
+    let mut streams = Vec::new();
+    for (column, outgoing) in [("source", true), ("target", false)] {
+        let undirected_only = matches!(
+            (options.direction, outgoing),
+            (Direction::Incoming, true) | (Direction::Outgoing, false)
+        );
+        streams.push(format!(
+            "edges WHERE {column}=?1{}",
+            if undirected_only {
+                " AND directed=0"
+            } else {
+                ""
+            }
+        ));
+    }
+    if options.direction != Direction::Incoming {
+        streams.push("refs WHERE source=?1 AND resolved_target IS NULL".into());
+    }
+    // Exact relation probes use directional relation indexes even for huge hubs.
+    for stream in &streams {
+        if conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {stream} AND relation=?2)"),
+            params![id, text],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(text.to_owned());
+        }
+    }
+    let term = normalize(text.trim());
+    ensure!(
+        !term.is_empty(),
+        "relation has no searchable normalized spelling"
+    );
+    let mut tiers: [BTreeSet<String>; 3] = Default::default();
+    let start = Instant::now();
+    let mut examined = 0;
+    let mut bytes = 0;
+    for stream in &streams {
+        // Seek to the next distinct indexed name. SELECT DISTINCT would still
+        // walk every edge at a high-degree hub before discovering a second name.
+        let mut first = conn.prepare(&format!(
+            "SELECT relation FROM {stream} ORDER BY relation LIMIT 1"
+        ))?;
+        let mut next = conn.prepare(&format!(
+            "SELECT relation FROM {stream} AND relation>?2 ORDER BY relation LIMIT 1"
+        ))?;
+        let mut relation: Option<String> = first.query_row([id], |r| r.get(0)).optional()?;
+        while let Some(name) = relation {
+            ensure!(
+                examined < MAX_EXAMINED && start.elapsed() < Duration::from_secs(2),
+                "relation lookup exceeded its work/time budget; use an exact relation"
+            );
+            examined += 1;
+            bytes += name.len();
+            ensure!(
+                bytes <= MAX_SEARCH_BYTES,
+                "relation lookup exceeded its byte budget; use an exact relation"
+            );
+            let folded = normalize(&name);
+            let tier = if folded == term {
+                Some(0)
+            } else if folded.starts_with(&term) {
+                Some(1)
+            } else if folded.contains(&term) {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(tier) = tier {
+                // Keep the lexically first two distinct names for a stable error.
+                tiers[tier].insert(name.clone());
+                if tiers[tier].len() > 2 {
+                    tiers[tier].pop_last();
+                }
+            }
+            relation = next.query_row(params![id, name], |r| r.get(0)).optional()?;
+        }
+    }
+    let matches = tiers
+        .into_iter()
+        .find(|names| !names.is_empty())
+        .unwrap_or_default();
+    ensure!(
+        matches.len() <= 1,
+        "ambiguous relation {text:?}; use an exact relation: {}",
+        matches.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    // An unmatched filter must stay restrictive, never become all relations.
+    Ok(matches
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| text.to_owned()))
+}
+
 fn source_path(conn: &Connection, text: &str) -> Result<String> {
     use std::path::{Component, Path};
     let root: Option<String> =
@@ -925,12 +1070,11 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
     // FTS token candidates cannot prove completeness for literal substrings,
     // punctuation or Unicode normalization. Stream only endpoint fields, keep
     // two IDs per tier, and never claim uniqueness from an incomplete scan.
-    // ponytail: bounded scans suffice here; a write-side normalized index is
-    // needed if unscoped convenience must cover more than MAX_EXAMINED nodes.
+    // The catalog budget is independent of the number of traversed edges.
     let sql = format!(
         "SELECT n.id,n.label,n.qualified_name FROM nodes n WHERE 1=1{filters}
         ORDER BY n.id LIMIT {}",
-        MAX_EXAMINED + 1
+        MAX_RANK_POSTINGS + 1
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
@@ -940,7 +1084,7 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
     let mut examined = 0;
     while let Some(row) = rows.next()? {
         ensure!(
-            examined < MAX_EXAMINED && start.elapsed() < Duration::from_secs(2),
+            examined < MAX_RANK_POSTINGS && start.elapsed() < Duration::from_secs(2),
             "endpoint lookup exceeded its work/time budget; use an exact ID or a smaller file/kind scope"
         );
         examined += 1;
@@ -949,9 +1093,10 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
         let qualified: Option<&str> = row.get_ref(2)?.as_str_or_null()?;
         // Normalization runs outside SQLite's VM guard. Bound its input too,
         // before allocating strings for arbitrarily long imported identifiers.
-        bytes += id.len() + label.len() + qualified.map_or(0, str::len);
+        let record_bytes = id.len() + label.len() + qualified.map_or(0, str::len);
+        bytes += record_bytes;
         ensure!(
-            bytes <= 8 * 1024 * 1024,
+            record_bytes <= MAX_SEARCH_BYTES && bytes <= MAX_RANK_BYTES,
             "endpoint lookup exceeded its normalization byte budget; use an exact ID or a smaller file/kind scope"
         );
         let normalized = [
@@ -1061,14 +1206,38 @@ fn impact_seeds(
     Ok((seeds, examined))
 }
 
-fn search_terms(text: &str) -> Result<Vec<String>> {
+fn search_terms(conn: &Connection, text: &str) -> Result<Vec<String>> {
+    use unicode_normalization::UnicodeNormalization;
+    // Compatibility composition agrees with the enriched write-side index,
+    // without decomposing Hangul or dropping Greek accents before MATCH.
+    let mut spelling: String = text.nfkc().collect();
+    if spelling != text {
+        let has_version: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='search_version')",
+            [],
+            |r| r.get(0),
+        )?;
+        let version: i64 = if has_version {
+            conn.query_row(
+                "SELECT search_version FROM metadata WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?
+        } else {
+            0
+        };
+        // Read-only queries must still find literal postings in old indexes.
+        // Only an explicit write adds compatibility-normalized search text.
+        if version < 2 {
+            spelling = text.to_owned();
+        }
+    }
     let mut all = BTreeSet::new();
-    for token in text
+    for token in spelling
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
     {
-        // MATCH must see the indexed spelling. Ranking normalization decomposes
-        // Hangul and removes Greek accents that unicode61 keeps distinct.
+        // Ranking's accent stripping is deliberately separate from FTS spelling.
         let token = token.to_owned();
         let chars: Vec<_> = token.chars().collect();
         if chars.len() > 2 && chars.iter().all(|c| crate::store::cjk(*c)) {
@@ -1146,40 +1315,45 @@ fn search_terms(text: &str) -> Result<Vec<String>> {
     Ok(terms)
 }
 
-fn rank_seeds(
-    conn: &Connection,
-    text: &str,
-    options: &SearchOptions,
-    output: &mut SearchResult,
-) -> Result<Vec<Node>> {
+fn rank_seeds(conn: &Connection, text: &str, options: &SearchOptions) -> Result<Vec<Node>> {
     let exact = exact_filtered(conn, text, options, true)?;
     if !exact.is_empty() || text.contains("::") {
         return Ok(exact);
     }
-    let terms = search_terms(text)?;
+    let terms = search_terms(conn, text)?;
     let normalized_terms: Vec<_> = terms.iter().map(|term| normalize(term)).collect();
     let mut candidates: BTreeMap<String, (Node, Vec<f64>)> = BTreeMap::new();
+    let start = Instant::now();
+    let mut examined = 0;
+    let mut bytes = 0;
     for (index, literal) in terms.iter().enumerate() {
         let expression = format!("\"{literal}\"*");
         let term = &normalized_terms[index];
         let mut values: Vec<rusqlite::types::Value> = vec![expression.into()];
         let filters = filter_sql(options, &mut values);
-        // Rank only this capped rowid-ordered sample. FTS5's BM25 computes IDF
-        // by walking all phrase matches internally, outside the VM-step guard.
+        // Enumerate postings, not the snapshot, and rank only after the complete
+        // candidate set is known. Refuse an incomplete set: ranking a rowid
+        // sample can silently exclude the best hit and depend on insert order.
+        // FTS5 BM25 is unsuitable here: its IDF scan escapes the VM-step guard.
         let sql = format!(
-            "SELECT n.payload FROM node_search JOIN nodes n ON n.rowid=node_search.rowid WHERE node_search MATCH ?{filters} ORDER BY node_search.rowid LIMIT {}",
-            CANDIDATES_PER_TERM + 1
+            "SELECT n.payload FROM node_search CROSS JOIN nodes n ON n.rowid=node_search.rowid WHERE node_search MATCH ?{filters} ORDER BY node_search.rowid LIMIT {}",
+            MAX_RANK_POSTINGS - examined + 1
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-        let mut count = 0;
         while let Some(row) = rows.next()? {
-            if count == CANDIDATES_PER_TERM {
-                truncate(output, "candidate_limit");
-                break;
-            }
-            count += 1;
-            let node: Node = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            ensure!(
+                examined < MAX_RANK_POSTINGS && start.elapsed() < Duration::from_secs(2),
+                "search candidate enumeration exceeded its work/time budget; use a more specific query or a smaller file/kind scope"
+            );
+            examined += 1;
+            let payload = row.get_ref(0)?.as_str()?;
+            bytes += payload.len();
+            ensure!(
+                payload.len() <= MAX_SEARCH_BYTES && bytes <= MAX_RANK_BYTES,
+                "search candidate enumeration exceeded its byte budget; use a more specific query or a smaller file/kind scope"
+            );
+            let node: Node = serde_json::from_str(payload)?;
             let label = normalize(&node.label);
             let label = label.trim_end_matches("()");
             let tier = if label == term || normalize(&node.id) == *term {
@@ -1234,22 +1408,32 @@ fn rank_seeds(
             / terms.len() as f64;
         weights.iter().sum::<f64>() * (1.0 + coverage * coverage)
     };
-    let mut ranked: Vec<_> = candidates.into_values().collect();
-    ranked.sort_by(|(a, aw), (b, bw)| {
-        score(b, bw)
-            .total_cmp(&score(a, aw))
+    let mut ranked: Vec<_> = candidates
+        .into_values()
+        .map(|(node, weights)| {
+            let score = score(&node, &weights);
+            (node, weights, score)
+        })
+        .collect();
+    ranked.sort_by(|(a, _, a_score), (b, _, b_score)| {
+        b_score
+            .total_cmp(a_score)
             .then(a.label.len().cmp(&b.label.len()))
             .then(a.id.cmp(&b.id))
     });
-    let Some((top, weights)) = ranked.first() else {
+    ensure!(
+        start.elapsed() < Duration::from_secs(2),
+        "search ranking exceeded its time budget; use a more specific query or a smaller file/kind scope"
+    );
+    let Some((_, _, top_score)) = ranked.first() else {
         return Ok(Vec::new());
     };
-    let cutoff = score(top, weights) * 0.2;
+    let cutoff = top_score * 0.2;
     let mut chosen = BTreeSet::new();
     let mut labels = BTreeSet::new();
     let mut seeds = Vec::new();
-    for (node, weights) in &ranked {
-        if seeds.len() == 3 || score(node, weights) < cutoff {
+    for (node, _, score) in &ranked {
+        if seeds.len() == 3 || *score < cutoff {
             break;
         }
         if labels.insert(normalize(&node.label)) {
@@ -1260,11 +1444,11 @@ fn rank_seeds(
     // Distinct terms get a candidate even if a common exact label dominates
     // combined scores. This is still <= 3 + 8 seeds, below MAX_SEEDS.
     for index in 0..terms.len() {
-        if let Some((node, _)) =
+        if let Some((node, _, _)) =
             ranked
                 .iter()
-                .filter(|(_, w)| w[index] > 0.0)
-                .max_by(|(a, aw), (b, bw)| {
+                .filter(|(_, w, _)| w[index] > 0.0)
+                .max_by(|(a, aw, _), (b, bw, _)| {
                     aw[index]
                         .total_cmp(&bw[index])
                         .then_with(|| b.id.cmp(&a.id))
@@ -1339,7 +1523,7 @@ pub(crate) fn query_extended(
     options: &SearchOptions,
     exact_only: bool,
 ) -> Result<SearchResult> {
-    budgeted(conn, || {
+    catalog_budgeted(conn, || {
         validate_search(options)?;
         let text = validate_text(text)?;
         let tx = conn.unchecked_transaction()?;
@@ -1347,7 +1531,7 @@ pub(crate) fn query_extended(
         let seeds = if exact_only {
             vec![unique_filtered(&tx, text, options)?]
         } else {
-            rank_seeds(&tx, text, options, &mut output)?
+            rank_seeds(&tx, text, options)?
         };
         explore(&tx, seeds, options, &mut output)?;
         tx.commit()?;
@@ -1614,7 +1798,7 @@ pub(crate) fn path_extended(
     target: &str,
     options: &SearchOptions,
 ) -> Result<PathSearchResult> {
-    budgeted(conn, || {
+    catalog_budgeted(conn, || {
         validate_search(options)?;
         ensure!(
             options.traversal == Traversal::Bfs,
@@ -1790,12 +1974,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["n0000", "n0001"]
         );
-        assert!(
-            result
-                .truncation_reasons
-                .iter()
-                .any(|s| s == "candidate_limit")
-        );
+        assert!(result.truncation_reasons.iter().any(|s| s == "node_limit"));
         Ok(())
     }
 

@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use graf::{import, index, model::*, store::Store};
+use graf::{hook_guard, import, index, model::*, store::Store};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
     styles = clap::builder::Styles::plain(),
     version,
     about = "Navigate a persistent local code graph",
-    after_help = "Reads use the indexed snapshot; they do not check live worktree freshness. Run update explicitly to refresh native indexes."
+    after_help = "Reads use the indexed snapshot. Only explicit --memory-dir annotations check live source evidence. Run update explicitly to refresh native indexes."
 )]
 struct Cli {
     /// Database path. Otherwise discover the nearest ancestor .graf/index.db.
@@ -55,6 +55,8 @@ enum Command {
     Uninstall(agent_setup::SetupArgs),
     /// Explicitly manage optional Git refresh hooks.
     Hook(agent_setup::HookArgs),
+    /// Supply optional local graph context to an agent hook; never deny a tool.
+    HookGuard(hook_guard::HookGuardArgs),
     /// Import a Graphify snapshot and switch this project's MCP connection.
     Switch(switch::SwitchArgs),
     /// Index supported source code and documents into a persistent local graph.
@@ -125,7 +127,7 @@ enum Command {
     Query(QueryArgs),
     /// Show an exact ID or unique symbol and its immediate neighbors.
     #[command(alias = "explain")]
-    Show(SymbolArgs),
+    Show(ShowArgs),
     /// Show immediate incoming calls to a symbol.
     Callers(SymbolArgs),
     /// Show immediate outgoing calls from a symbol.
@@ -303,6 +305,16 @@ struct SymbolArgs {
     #[command(flatten)]
     #[serde(flatten)]
     navigation: NavigationArgs,
+}
+
+#[derive(Debug, Args)]
+struct ShowArgs {
+    #[command(flatten)]
+    symbol: SymbolArgs,
+    /// Read fresh learning evidence for returned nodes; never writes or changes selection.
+    /// Uses remaining --budget space, or at most 8 KiB of annotations without --budget.
+    #[arg(long)]
+    memory_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -687,6 +699,119 @@ fn print_value(value: &impl Serialize, json: bool) -> Result<()> {
     Ok(())
 }
 
+// Only explicit CLI/MCP memory configuration calls this helper. The full bounded
+// snapshot preserves citation ambiguity and source proofs; selection stays SQL.
+fn learning_annotations(
+    memory_dir: &Path,
+    graph: &GraphResult,
+    snapshot: Option<&GraphSnapshot>,
+    token_budget: Option<usize>,
+) -> serde_json::Value {
+    use graf::memory::{ReflectArgs, learning_overlay};
+    use serde_json::json;
+
+    let Some(snapshot) = snapshot else {
+        return json!({"learning_notice":"Learning omitted: bounded snapshot unavailable."});
+    };
+    if snapshot.generation != graph.generation {
+        return json!({"learning_notice":"Learning omitted: snapshot generation differs from query result."});
+    }
+    // Deliberately recompute: memory and live source files can change while the
+    // indexed generation remains unchanged. This API writes neither out nor a sidecar.
+    let args = ReflectArgs {
+        memory_dir: memory_dir.to_owned(),
+        out: PathBuf::new(),
+        half_life_days: 30.0,
+        min_corroboration: 2,
+        if_stale: false,
+    };
+    let Ok(overlay) = learning_overlay(&args, Some(snapshot)) else {
+        return json!({"learning_notice":"Learning omitted: memory could not be read or validated."});
+    };
+    let budget = token_budget.map_or(8 * 1024, |tokens| {
+        tokens
+            .saturating_mul(4)
+            .saturating_sub(serde_json::to_vec(graph).map_or(usize::MAX, |bytes| bytes.len()))
+    });
+    let selected: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            overlay
+                .nodes
+                .get(&node.id)
+                .map(|learning| (&node.id, learning))
+        })
+        .collect();
+    let mut annotation = json!({"learning":{
+        "schema_version":overlay.schema_version,
+        "snapshot_hash":overlay.snapshot_hash,
+        "generated_unix_secs":overlay.generated_unix_secs,
+        "status":"truncated", "omitted_nodes":selected.len(), "nodes":{}
+    }});
+    let fits = |value: &serde_json::Value| {
+        serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= budget)
+    };
+    if !fits(&annotation) {
+        return json!({"learning_notice":"Learning omitted: annotation budget exhausted."});
+    }
+    let total = selected.len();
+    let mut included = 0;
+    for (id, learning) in selected {
+        annotation["learning"]["nodes"][id] = json!(learning);
+        // Count the serialized envelope too. Keep whole entries and a stable
+        // prefix of the already selected nodes; never spend their graph budget.
+        if !fits(&annotation) {
+            annotation["learning"]["nodes"]
+                .as_object_mut()
+                .unwrap()
+                .remove(id);
+            break;
+        }
+        included += 1;
+    }
+    annotation["learning"]["omitted_nodes"] = json!(total - included);
+    if included == total {
+        annotation["learning"]["status"] = json!("complete");
+    } else {
+        // Notices are response metadata, outside the graph-payload estimate.
+        annotation["learning_notice"] = json!("Learning truncated: annotation budget exhausted.");
+    }
+    annotation
+}
+
+fn print_show_output(output: Output, annotation: serde_json::Value, json: bool) -> Result<()> {
+    if json {
+        let mut value = serde_json::to_value(output)?;
+        value
+            .as_object_mut()
+            .context("show response must be an object")?
+            .extend(annotation.as_object().unwrap().clone());
+        return print_value(&value, true);
+    }
+    print_output(output, false)?;
+    let mut out = io::stdout().lock();
+    if let Some(nodes) = annotation["learning"]["nodes"].as_object() {
+        for (id, learning) in nodes {
+            writeln!(
+                out,
+                "Lesson {}: {} (useful={}, negative={}, verified={}, unverified={}); {}",
+                human(id),
+                human(learning["status"].as_str().unwrap_or("unmarked")),
+                learning["useful"],
+                learning["negative"],
+                learning["verified_useful"],
+                learning["unverified"],
+                human(learning["reason"].as_str().unwrap_or(""))
+            )?;
+        }
+    }
+    if let Some(notice) = annotation["learning_notice"].as_str() {
+        writeln!(out, "{}", human(notice))?;
+    }
+    Ok(())
+}
+
 fn native_root(db: &Path) -> Result<PathBuf> {
     let stats = Store::open_read_only(db)?.stats()?;
     ensure!(
@@ -705,6 +830,19 @@ fn retryable_update(error: &anyhow::Error) -> bool {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Command::HookGuard(args) = &cli.command {
+        if let Some(value) = hook_guard::run(
+            args.platform,
+            args.project.as_deref(),
+            cli.db.as_deref(),
+            io::stdin().lock(),
+        ) {
+            // Hook output is independent of normal CLI formatting and notices.
+            // A closed host pipe must not turn optional context into a denial.
+            let _ = writeln!(io::stdout().lock(), "{value}");
+        }
+        return Ok(());
+    }
     if !matches!(
         cli.command,
         Command::Install(_) | Command::Uninstall(_) | Command::Hook(_) | Command::Serve(_)
@@ -902,11 +1040,19 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let db = database(&cli)?;
+    let show_learning = match &cli.command {
+        Command::Show(args) => args
+            .memory_dir
+            .as_ref()
+            .map(|dir| (dir.clone(), args.symbol.navigation.budget)),
+        _ => None,
+    };
     let command = match cli.command {
         Command::Switch(_)
         | Command::Install(_)
         | Command::Uninstall(_)
         | Command::Hook(_)
+        | Command::HookGuard(_)
         | Command::Extended(_)
         | Command::Connect(_)
         | Command::Provider(_)
@@ -1045,7 +1191,7 @@ fn run(cli: Cli) -> Result<()> {
                 .block_on(mcp::serve(db, args));
         }
         Command::Query(a) => ReadCommand::Query(a),
-        Command::Show(a) => ReadCommand::Show(a),
+        Command::Show(a) => ReadCommand::Show(a.symbol),
         Command::Callers(a) => ReadCommand::Callers(a),
         Command::Callees(a) => ReadCommand::Callees(a),
         Command::Impact(a) => ReadCommand::Impact(a),
@@ -1080,6 +1226,16 @@ fn run(cli: Cli) -> Result<()> {
         if append_query_log(path, &record).is_err() {
             eprintln!("graf: query log could not be written; query result is still available");
         }
+    }
+    if let Some((memory_dir, budget)) = show_learning {
+        let graph = match &output {
+            Output::Graph(graph) => graph,
+            Output::Search(result) => &result.graph,
+            _ => unreachable!("show returns a graph or search result"),
+        };
+        let snapshot = mcp::snapshot_for_learning(&db).ok();
+        let annotation = learning_annotations(&memory_dir, graph, snapshot.as_ref(), budget);
+        return print_show_output(output, annotation, cli.json);
     }
     print_output(output, cli.json)
 }
@@ -1145,5 +1301,45 @@ fn main() -> std::process::ExitCode {
             eprintln!("graf: {}", human(&format!("{error:#}")));
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod learning_tests {
+    use super::*;
+
+    #[test]
+    fn learning_omits_proof_from_a_snapshot_newer_than_the_selected_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("policy.py"), "def policy():\n    return 1\n").unwrap();
+        let db = dir.path().join("graph.db");
+        index::run(&root, &db).unwrap();
+        let initial = mcp::snapshot_for_learning(&db).unwrap();
+        let id = &initial
+            .nodes
+            .iter()
+            .find(|node| node.label == "policy" && node.kind == "function")
+            .unwrap()
+            .id;
+        let selected = Store::open_read_only(&db)
+            .unwrap()
+            .neighbors_resolved(id, &graf::query::SearchOptions::default())
+            .unwrap();
+        std::fs::write(root.join("policy.py"), "def policy():\n    return 2\n").unwrap();
+        index::run(&root, &db).unwrap();
+        let current = mcp::snapshot_for_learning(&db).unwrap();
+        assert_ne!(current.generation, selected.graph.generation);
+        let memory = dir.path().join("memory");
+        let annotated = learning_annotations(&memory, &selected.graph, Some(&current), None);
+        assert!(annotated.get("learning").is_none());
+        assert!(
+            annotated["learning_notice"]
+                .as_str()
+                .unwrap()
+                .contains("generation differs")
+        );
+        assert!(!memory.exists());
     }
 }

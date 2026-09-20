@@ -1246,8 +1246,10 @@ impl Javascript<'_> {
             }
         }
         facts.references.retain(|r| !remove.contains(&r.id));
+        let mut declarations = vec![];
         for reference in &mut facts.references {
             let mut replaced = false;
+            let mut declared_keys = vec![];
             reference.candidate_keys = reference
                 .candidate_keys
                 .iter()
@@ -1266,7 +1268,14 @@ impl Javascript<'_> {
                     };
                     match evidence {
                         Receiver::Written { .. } if !member.contains('.') => {
-                            method(receiver_types.get(marker).map(Vec::as_slice).unwrap_or(&[]))
+                            let types =
+                                receiver_types.get(marker).map(Vec::as_slice).unwrap_or(&[]);
+                            if reference.relation == "calls" {
+                                declared_keys.extend(
+                                    types.iter().map(|ty| format!("{ty}#declared.{member}")),
+                                );
+                            }
+                            method(types)
                         }
                         Receiver::Constructed(call) if !member.contains('.') => {
                             method(probes.get(call).map(Vec::as_slice).unwrap_or(&[]))
@@ -1303,7 +1312,17 @@ impl Javascript<'_> {
                 reference.reason =
                     "written receiver type; target is unavailable, private, or ambiguous".into();
             }
+            if !declared_keys.is_empty() {
+                let mut declaration = reference.clone();
+                declaration.id.push_str(":declared_member");
+                declaration.relation = "declared_member".into();
+                declaration.candidate_keys = declared_keys;
+                declaration.reason =
+                    "written interface member; runtime dispatch is unresolved".into();
+                declarations.push(declaration);
+            }
         }
+        facts.references.extend(declarations);
 
         for reference in &mut facts.references {
             if self.component_references.contains(&reference.id) {
@@ -1389,6 +1408,54 @@ impl Javascript<'_> {
                 keys.sort();
                 keys.dedup();
                 node.metadata["binding_aliases"] = serde_json::json!(keys);
+            }
+        }
+        // Contract signatures remain uncallable. Only typed-receiver declaration
+        // references use these aliases; static and constructed receivers do not.
+        let interfaces: HashMap<_, Vec<String>> = facts
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "interface" && n.binding_key.is_some())
+            .filter(|n| {
+                facts
+                    .nodes
+                    .iter()
+                    .filter(|other| other.binding_key == n.binding_key)
+                    .count()
+                    == 1
+            })
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    n.binding_key
+                        .iter()
+                        .cloned()
+                        .chain(
+                            n.metadata["binding_aliases"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(str::to_owned)),
+                        )
+                        .collect(),
+                )
+            })
+            .collect();
+        let parents: HashMap<_, _> = facts
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains")
+            .map(|e| (e.target.clone(), e.source.clone()))
+            .collect();
+        for node in &mut facts.nodes {
+            if node.metadata["interface_signature"] == true
+                && let Some(keys) = parents.get(&node.id).and_then(|id| interfaces.get(id))
+            {
+                node.metadata["binding_aliases"] = serde_json::json!(
+                    keys.iter()
+                        .map(|key| format!("{key}#declared.{}", identifier(&node.label)))
+                        .collect::<Vec<_>>()
+                );
             }
         }
         if forward && !self.cjs_forward.is_empty() {
@@ -1803,6 +1870,26 @@ impl Javascript<'_> {
                         None,
                         false,
                     );
+                    self.e.facts.nodes.last_mut().unwrap().metadata["interface_signature"] =
+                        (node.kind() == "method_signature"
+                            && name.kind() == "property_identifier"
+                            && !token(node, "static")
+                            && !token(node, "?")
+                            && !token(node, "get")
+                            && !token(node, "set")
+                            && node.parent().is_some_and(|body| {
+                                children(body)
+                                    .iter()
+                                    .filter(|member| {
+                                        member.child_by_field_name("name").is_some_and(|other| {
+                                            identifier(self.e.text(other))
+                                                == identifier(self.e.text(name))
+                                        })
+                                    })
+                                    .count()
+                                    == 1
+                            }))
+                        .into();
                     self.type_parameters(node, child);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         self.type_refs(params, child, "parameter_type");

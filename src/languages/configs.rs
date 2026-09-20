@@ -944,8 +944,46 @@ fn json_manifest(f: &mut Facts, source: &str) -> Result<()> {
                     | "require-dev"
             ) {
                 if let Some(deps) = value.as_object() {
-                    for name in deps.keys() {
+                    let npm_group = matches!(
+                        name.as_str(),
+                        "dependencies"
+                            | "devDependencies"
+                            | "peerDependencies"
+                            | "optionalDependencies"
+                    );
+                    for (name, specifier) in deps {
                         f.dependency(&owner, ecosystem, name, 1);
+                        // A manifest declaration is useful evidence even when the
+                        // package source is not part of this index. Keep it owned
+                        // by this manifest, distinct from an installed package.
+                        if depth == 0
+                            && basename(&f.0.path) == "package.json"
+                            && npm_group
+                            && specifier.is_string()
+                        {
+                            let binding = format!("npm:dependency:{}:{name}", f.0.path);
+                            if !f
+                                .0
+                                .nodes
+                                .iter()
+                                .any(|n| n.binding_key.as_deref() == Some(&binding))
+                            {
+                                f.node(
+                                    name,
+                                    "dependency",
+                                    Some(binding),
+                                    1,
+                                    json!({"ecosystem":"npm","declared":true}),
+                                );
+                                let dependency = format!(
+                                    "npm-dependency:{}:{}:{name}",
+                                    f.0.path.len(),
+                                    f.0.path
+                                );
+                                f.0.nodes.last_mut().unwrap().id = dependency.clone();
+                                f.edge(&owner, &dependency, "depends_on", 1);
+                            }
+                        }
                     }
                 }
                 for name in strings(value) {
@@ -1326,7 +1364,7 @@ impl TerraformContext {
         ensure!(root.is_dir(), "Terraform project root must be a directory");
         let mut context = Self::default();
         let mut hash = blake3::Hasher::new();
-        hash.update(b"terraform-context-1");
+        hash.update(b"terraform-context-3");
         let mut modules = vec![];
         let paths: BTreeSet<_> = paths
             .iter()
@@ -1514,8 +1552,234 @@ fn hcl_string(source: &str, mut node: Syntax<'_>) -> Option<String> {
     if node.kind() != "string_lit" {
         return None;
     }
-    let text: String = serde_json::from_str(&source[node.byte_range()]).ok()?;
+    // HCL adds eight-digit Unicode escapes to JSON's quoted-string syntax.
+    let raw = source[node.byte_range()]
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    let mut chars = raw.chars();
+    let mut text = String::new();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            text.push(c);
+            continue;
+        }
+        text.push(match chars.next()? {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '"' => '"',
+            '\\' => '\\',
+            escape @ ('u' | 'U') => {
+                let mut scalar = 0;
+                for _ in 0..if escape == 'u' { 4 } else { 8 } {
+                    scalar = scalar * 16 + chars.next()?.to_digit(16)?;
+                }
+                char::from_u32(scalar)?
+            }
+            _ => return None,
+        });
+    }
     Some(text.replace("$${", "${").replace("%%{", "%{"))
+}
+
+fn hcl_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "credential",
+        "connectionstring",
+        "auth",
+        "passphrase",
+    ]
+    .iter()
+    .any(|word| key.contains(word))
+}
+
+// Recognizable credentials in otherwise ordinary fields, including module sources.
+// This is intentionally not an entropy-based classifier for arbitrary strings.
+fn hcl_credential(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("private key-----")
+        || lower.contains("bearer ")
+        || lower.contains("basic ")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .any(|word| {
+                (word.len() >= 20
+                    && ["ghp_", "gho_", "github_pat_", "xoxb-", "xoxp-", "sk-"]
+                        .iter()
+                        .any(|prefix| word.starts_with(prefix)))
+                    || (word.len() == 20
+                        && (word.starts_with("akia") || word.starts_with("asia"))
+                        && word.bytes().all(|b| b.is_ascii_alphanumeric()))
+            })
+    {
+        return true;
+    }
+    if text.split("://").skip(1).any(|rest| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    }) {
+        return true;
+    }
+    // Find the separator before trimming whitespace so quoted keys and ordinary
+    // KEY = value assignments cannot lose their key/separator association.
+    lower.match_indices(['=', ':']).any(|(offset, _)| {
+        lower[..offset]
+            .trim_end()
+            .rsplit(|c: char| {
+                c.is_whitespace() || ['&', '?', ';', ',', '{', '}', '[', ']', '=', ':'].contains(&c)
+            })
+            .next()
+            .is_some_and(|key| hcl_sensitive_key(key.trim_matches(['"', '\'', '%'])))
+    })
+}
+
+fn hcl_unresolved(kind: &str) -> Value {
+    json!({"$hcl":"unresolved", "kind":kind})
+}
+
+fn hcl_value(source: &str, mut node: Syntax<'_>, depth: usize) -> Value {
+    if depth > 32 {
+        return hcl_unresolved("depth_limit");
+    }
+    while matches!(
+        node.kind(),
+        "expression" | "literal_value" | "collection_value"
+    ) {
+        let parts: Vec<_> = children(node)
+            .into_iter()
+            .filter(|n| n.kind() != "comment")
+            .collect();
+        let [child] = parts.as_slice() else { break };
+        node = *child;
+    }
+    let raw = &source[node.byte_range()];
+    match node.kind() {
+        "bool_lit" => json!(raw == "true"),
+        "null_lit" => Value::Null,
+        "numeric_lit" => {
+            // Do not silently round an integer beyond JSON's supported integer range.
+            if raw.bytes().all(|b| b.is_ascii_digit()) {
+                raw.parse::<u64>()
+                    .map(|n| json!(n))
+                    .unwrap_or_else(|_| hcl_unresolved("numeric_range"))
+            } else {
+                serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_number)
+                    .unwrap_or_else(|| hcl_unresolved("numeric_range"))
+            }
+        }
+        "operation" if raw.starts_with('-') => {
+            let number = raw[1..].trim();
+            let signed = format!("-{number}");
+            if number.bytes().all(|b| b.is_ascii_digit()) {
+                signed
+                    .parse::<i64>()
+                    .map(|n| json!(n))
+                    .unwrap_or_else(|_| hcl_unresolved("numeric_range"))
+            } else {
+                serde_json::from_str::<Value>(&signed)
+                    .ok()
+                    .filter(Value::is_number)
+                    .unwrap_or_else(|| hcl_unresolved("operation"))
+            }
+        }
+        "string_lit" => hcl_string(source, node)
+            .map(|text| {
+                if hcl_credential(&text) {
+                    json!("[redacted]")
+                } else {
+                    json!(text)
+                }
+            })
+            .unwrap_or_else(|| hcl_unresolved("string_escape")),
+        "tuple" => Value::Array(
+            children(node)
+                .into_iter()
+                .filter(|n| n.kind() == "expression")
+                .map(|n| hcl_value(source, n, depth + 1))
+                .collect(),
+        ),
+        "object" => {
+            let mut values = serde_json::Map::new();
+            for element in children(node)
+                .into_iter()
+                .filter(|n| n.kind() == "object_elem")
+            {
+                let (Some(key), Some(value)) = (
+                    element.child_by_field_name("key"),
+                    element.child_by_field_name("val"),
+                ) else {
+                    return hcl_unresolved("object_key");
+                };
+                // Only a bare identifier or quoted literal is a static object key.
+                let key_text = &source[key.byte_range()];
+                let key = if let Some(key) = hcl_string(source, key) {
+                    key
+                } else if key.named_child_count() == 1
+                    && key.named_child(0).is_some_and(|n| {
+                        n.kind() == "variable_expr" && &source[n.byte_range()] == key_text
+                    })
+                {
+                    key_text.to_owned()
+                } else {
+                    return hcl_unresolved("object_key");
+                };
+                if hcl_credential(&key) {
+                    return json!("[redacted]");
+                }
+                let value = if hcl_sensitive_key(&key) {
+                    json!("[redacted]")
+                } else {
+                    hcl_value(source, value, depth + 1)
+                };
+                if values.insert(key, value).is_some() {
+                    return hcl_unresolved("duplicate_key");
+                }
+            }
+            Value::Object(values)
+        }
+        // No source-text fallback: templates, function arguments and computed keys
+        // can contain secrets. References are collected independently by hcl_refs.
+        kind => hcl_unresolved(kind),
+    }
+}
+
+fn hcl_attributes(source: &str, body: Syntax<'_>, sensitive: bool) -> Value {
+    let mut values = serde_json::Map::new();
+    for attr in children(body)
+        .into_iter()
+        .filter(|n| n.kind() == "attribute")
+    {
+        let parts: Vec<_> = children(attr)
+            .into_iter()
+            .filter(|n| n.kind() != "comment")
+            .collect();
+        let [key, value] = parts.as_slice() else {
+            continue;
+        };
+        let key = &source[key.byte_range()];
+        let value = if hcl_sensitive_key(key) || (sensitive && matches!(key, "default" | "value")) {
+            json!("[redacted]")
+        } else {
+            hcl_value(source, *value, 0)
+        };
+        if values.contains_key(key) {
+            values.insert(key.into(), hcl_unresolved("duplicate_attribute"));
+        } else {
+            values.insert(key.into(), value);
+        }
+    }
+    Value::Object(values)
 }
 
 fn hcl(f: &mut Facts, source: &str) -> Result<()> {
@@ -1535,8 +1799,9 @@ fn hcl(f: &mut Facts, source: &str) -> Result<()> {
     for block in children(body).into_iter().filter(|n| n.kind() == "block") {
         let parts: Vec<_> = children(block)
             .into_iter()
+            .filter(|n| n.kind() != "comment")
             .take_while(|n| !matches!(n.kind(), "block_start" | "body" | "block_end"))
-            .map(|n| text(n).trim_matches('"').to_string())
+            .map(|n| hcl_string(source, n).unwrap_or_else(|| text(n).trim_matches('"').to_string()))
             .collect();
         let Some(kind) = parts.first() else {
             continue;
@@ -1566,6 +1831,22 @@ fn hcl(f: &mut Facts, source: &str) -> Result<()> {
         };
         let id = hcl_node(f, &root, &name, kind, line(block));
         if let Some(body) = body {
+            let sensitive = matches!(kind.as_str(), "variable" | "output")
+                && (parts.get(1).is_some_and(|name| hcl_sensitive_key(name))
+                    || children(body).into_iter().any(|attr| {
+                        let parts: Vec<_> = children(attr)
+                            .into_iter()
+                            .filter(|n| n.kind() != "comment")
+                            .collect();
+                        attr.kind() == "attribute"
+                            && parts.len() == 2
+                            && text(parts[0]) == "sensitive"
+                            && hcl_value(source, parts[1], 0) != Value::Bool(false)
+                    }));
+            let attributes = hcl_attributes(source, body, sensitive);
+            if let Some(n) = f.0.nodes.iter_mut().find(|n| n.id == id) {
+                n.metadata["attributes"] = attributes;
+            }
             if kind == "module" && f.0.path.ends_with(".tf") {
                 let sources: Vec<_> = children(body)
                     .into_iter()
@@ -1576,16 +1857,26 @@ fn hcl(f: &mut Facts, source: &str) -> Result<()> {
                     .collect();
                 if let [attr] = sources.as_slice() {
                     let attr = *attr;
-                    let parts = children(attr);
+                    let parts: Vec<_> = children(attr)
+                        .into_iter()
+                        .filter(|n| n.kind() != "comment")
+                        .collect();
                     if parts.len() >= 2
                         && text(parts[0]) == "source"
                         && let Some(module_source) = hcl_string(source, parts[1])
                     {
+                        let redacted = hcl_credential(&module_source);
                         if let Some(n) = f.0.nodes.iter_mut().find(|n| n.id == id) {
-                            n.metadata["module_source"] = json!(module_source);
+                            n.metadata["module_source"] = json!(if redacted {
+                                "[redacted]"
+                            } else {
+                                &module_source
+                            });
                             n.metadata["module_source_line"] = json!(line(attr));
                         }
-                        if module_source.starts_with("./") || module_source.starts_with("../") {
+                        if !redacted
+                            && (module_source.starts_with("./") || module_source.starts_with("../"))
+                        {
                             let keys = terraform_target(&f.0.path, &module_source)
                                 .map(|p| vec![format!("terraform:directory:{p}")])
                                 .unwrap_or_default();

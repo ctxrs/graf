@@ -1,6 +1,11 @@
 use std::fs;
 
-use graf::{index, model::*, parser::parse_python, store::Store};
+use graf::{
+    index,
+    model::*,
+    parser::{PythonContext, parse_python},
+    store::Store,
+};
 use tempfile::tempdir;
 
 fn parse(source: &str) -> FileFacts {
@@ -278,10 +283,9 @@ fn lexical_calls_have_one_owner_and_classes_are_not_closures() {
         call(&facts, "Service.run", "target").candidate_keys,
         ["python:pkg.code:target"]
     );
-    assert!(
-        call(&facts, "Service.run", "self.target")
-            .candidate_keys
-            .is_empty()
+    assert_eq!(
+        call(&facts, "Service.run", "self.target").candidate_keys,
+        ["python-receiver:pkg.code:Service.target"]
     );
     assert_eq!(
         call(&facts, "outer.inner", "target").candidate_keys,
@@ -306,6 +310,61 @@ fn lexical_calls_have_one_owner_and_classes_are_not_closures() {
     assert!(facts.nodes.iter().all(|n| !n.id.starts_with('/')));
     let again = parse_python(&facts.path, "def target():\n    pass\n", "another-hash").unwrap();
     assert_eq!(facts.nodes[1].id, again.nodes[1].id);
+
+    // Explicit receiver lookup and lexical lookup keep distinct declarations.
+    let context = PythonContext::from_facts(std::slice::from_ref(&facts));
+    let mut resolved = facts;
+    context.apply(&mut resolved);
+    assert_eq!(
+        call(&resolved, "Service.run", "target").candidate_keys,
+        ["python:pkg.code:target"]
+    );
+    assert_eq!(
+        call(&resolved, "Service.run", "self.target").candidate_keys,
+        ["python-member:pkg.code:Service.target"]
+    );
+}
+
+#[test]
+fn lexical_calls_do_not_infer_receivers_from_shadowed_or_static_parameters() {
+    for (body, owner) in [
+        (
+            "    async def run(self):\n        self = other\n        target()\n        self.target()\n",
+            "Service.run",
+        ),
+        (
+            "    @staticmethod\n    async def run(self):\n        target()\n        self.target()\n",
+            "Service.run",
+        ),
+        (
+            "    async def run(self):\n        def inner(self):\n            target()\n            self.target()\n",
+            "Service.run.inner",
+        ),
+    ] {
+        let mut facts = parse(&format!(
+            "def target():\n    pass\nclass Service:\n    def target(self):\n        pass\n{body}"
+        ));
+        assert!(facts.diagnostics.is_empty());
+        assert_eq!(
+            call(&facts, owner, "target").candidate_keys,
+            ["python:pkg.code:target"],
+            "{body}"
+        );
+        assert!(
+            call(&facts, owner, "self.target").candidate_keys.is_empty(),
+            "{body}"
+        );
+        PythonContext::from_facts(std::slice::from_ref(&facts)).apply(&mut facts);
+        assert_eq!(
+            call(&facts, owner, "target").candidate_keys,
+            ["python:pkg.code:target"],
+            "{body}"
+        );
+        assert!(
+            call(&facts, owner, "self.target").candidate_keys.is_empty(),
+            "{body}"
+        );
+    }
 }
 
 #[test]

@@ -2,6 +2,7 @@ use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use std::{collections::BTreeSet, fs, path::Path, time::Duration};
+use unicode_normalization::UnicodeNormalization;
 
 const APPLICATION_ID: i64 = 0x47524146;
 
@@ -133,7 +134,15 @@ impl Store {
     /// Open without write permission or migrations. Normal SQLite WAL locking
     /// remains enabled so later committed generations stay visible.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let conn = connect_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::open_read_only_with(path, |_| Ok(()))
+    }
+
+    /// Configure request limits before any validation or generation reads.
+    pub(crate) fn open_read_only_with(
+        path: &Path,
+        configure: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
+        let conn = connect_with_setup(path, OpenFlags::SQLITE_OPEN_READ_ONLY, configure)?;
         validate(&conn)?;
         let baseline_generation = generation(&conn)?;
         Ok(Self {
@@ -258,6 +267,22 @@ impl Store {
                     "snapshot payload exceeds byte limit"
                 );
             }
+            if kind == "native" {
+                // Charge a conservative JSON-escaped representation before
+                // loading source proof. Empty files without nodes add nothing.
+                let proof_bytes: i64 = tx.query_row(
+                    "SELECT COALESCE(SUM(length(CAST(path AS BLOB))*6+length(CAST(hash AS BLOB))+100),0) FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path)",
+                    [], |row| row.get(0),
+                )?;
+                total_bytes = total_bytes
+                    .checked_add(u64::try_from(proof_bytes)?)
+                    .and_then(|v| v.checked_add(64))
+                    .context("snapshot byte count overflow")?;
+                ensure!(
+                    total_bytes <= max_bytes as u64,
+                    "snapshot source proof exceeds byte limit"
+                );
+            }
         }
         let nodes = read_payloads(&tx, "SELECT payload FROM nodes ORDER BY id")?;
         let edges = read_payloads(&tx, "SELECT payload FROM edges ORDER BY id")?;
@@ -277,6 +302,24 @@ impl Store {
                     "graf_unresolved_references".into(),
                     serde_json::to_value(references)?,
                 );
+            let mut files = serde_json::Map::new();
+            let mut statement = tx.prepare(
+                "SELECT path,hash FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path) ORDER BY path",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let stamp: String = row.get(1)?;
+                if let Some(digest) = crate::index::indexed_source_digest(&stamp) {
+                    files.insert(path, serde_json::json!(digest));
+                }
+            }
+            // Replace any persisted claim: these rows share this snapshot's
+            // generation and node ownership. No source files are read here.
+            metadata.as_object_mut().unwrap().insert(
+                "graf_source_digests".into(),
+                serde_json::json!({"algorithm":"blake3","files":files}),
+            );
         }
         let snapshot = GraphSnapshot {
             schema_version: SCHEMA_VERSION,
@@ -575,6 +618,7 @@ impl Store {
             edges: stats.edges,
             diagnostics: stats.diagnostics,
             semantic_usage: None,
+            provider_usage: None,
             timings: None,
         };
         tx.commit()?;
@@ -681,9 +725,18 @@ fn connect(path: &Path) -> Result<Connection> {
 }
 
 fn connect_with_flags(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    connect_with_setup(path, flags, |_| Ok(()))
+}
+
+fn connect_with_setup(
+    path: &Path,
+    flags: OpenFlags,
+    configure: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("cannot open Graf database {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    configure(&conn)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     Ok(conn)
 }
@@ -816,10 +869,10 @@ fn ensure_search(tx: &Transaction<'_>) -> Result<bool> {
         |r| r.get(0),
     )?;
     ensure!(
-        version <= 1,
+        version <= 3,
         "unsupported Graf search index version {version}"
     );
-    if version == 1 {
+    if version == 3 {
         return Ok(false);
     }
     let mut changed = false;
@@ -845,7 +898,7 @@ fn ensure_search(tx: &Transaction<'_>) -> Result<bool> {
             [],
         )?;
     }
-    tx.execute("UPDATE metadata SET search_version=1 WHERE singleton=1", [])?;
+    tx.execute("UPDATE metadata SET search_version=3 WHERE singleton=1", [])?;
     Ok(changed)
 }
 
@@ -879,9 +932,39 @@ fn search_text(node: &Node) -> String {
             text.push_str(value);
         }
     }
-    let mut search = String::with_capacity(text.len() * 2);
+    // Extractors retain safe written attribute values here after redaction.
+    // Index the preserved JSON (keys as well as literal leaves), never source
+    // text or arbitrary metadata. Imported attributes use the same contract.
+    if let Some(attributes) = attrs.get("attributes").filter(|v| v.is_object()) {
+        let mut pending = vec![attributes];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (key, value) in fields {
+                        text.push(' ');
+                        text.push_str(key);
+                        pending.push(value);
+                    }
+                }
+                serde_json::Value::Array(values) => pending.extend(values),
+                serde_json::Value::String(value) => {
+                    text.push(' ');
+                    text.push_str(value);
+                }
+                value => {
+                    text.push(' ');
+                    text.push_str(&value.to_string());
+                }
+            }
+        }
+    }
+    // Compatibility forms (ligatures, full-width letters) share searchable
+    // tokens. NFKC retains composed Hangul and Greek spellings for unicode61;
+    // the original text below still serves literal callers of the older API.
+    let spelling: String = text.nfkc().collect();
+    let mut search = String::with_capacity(spelling.len() * 2);
     let mut previous_lower = false;
-    for c in text.chars() {
+    for c in spelling.chars() {
         if c.is_uppercase() && previous_lower {
             search.push(' ');
         }
@@ -891,7 +974,7 @@ fn search_text(node: &Node) -> String {
     // Useful CJK recall without a dictionary or a query-side scan: preserve
     // full strings and index individual ideographs plus adjacent bigrams.
     let mut previous = None;
-    for c in text.chars() {
+    for c in spelling.chars() {
         if cjk(c) {
             search.push(' ');
             search.push(c);
@@ -906,7 +989,7 @@ fn search_text(node: &Node) -> String {
         }
     }
     // Retain the original spelling as well as identifier components.
-    format!("{text} {search}")
+    format!("{text} {spelling} {search}")
 }
 
 fn insert_node(conn: &Connection, node: &Node, owner: Option<&str>) -> Result<()> {

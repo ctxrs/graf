@@ -1787,3 +1787,652 @@ fn razor_index_uses_loose_or_nearest_project_types_and_refreshes_on_removal() {
     }
     assert!(!graph.nodes.iter().any(|n| n.file == "Service.cs"));
 }
+
+fn swift_manifest(targets: &str) -> String {
+    format!(
+        "// swift-tools-version: 6.0\nimport PackageDescription\nlet package = Package(name: \"Example\", targets: [{targets}])\n"
+    )
+}
+
+#[test]
+fn swiftpm_default_sources_tests_and_declared_imports_need_no_configuration() {
+    let f = Fixture::new();
+    f.write(
+        "Package.swift",
+        &swift_manifest(
+            r#"
+        .target(name: "Core"),
+        .executableTarget(name: "App", dependencies: ["Core"]),
+        .testTarget(name: "CoreTests", dependencies: [.target(name: "Core")]),
+        .target(name: "Unrelated")
+    "#,
+        ),
+    );
+    f.write(
+        "Sources/Core/a.swift",
+        "public func work() {}\nfunc internalWork() {}\n",
+    );
+    f.write(
+        "Sources/Core/b.swift",
+        "func run() { work(); internalWork() }\n",
+    );
+    f.write(
+        "Sources/App/main.swift",
+        "import Core\nfunc main() { Core.work(); Core.internalWork() }\n",
+    );
+    f.write(
+        "Tests/CoreTests/check.swift",
+        "import Core\nfunc check() { Core.work() }\n",
+    );
+    f.write(
+        "Sources/Unrelated/other.swift",
+        "import Core\nfunc other() { Core.work() }\n",
+    );
+    f.write(
+        "Loose/tool.swift",
+        "import Core\nfunc loose() { Core.work() }\n",
+    );
+    let graph = f.index();
+    assert!(calls(
+        &graph,
+        ("Sources/Core/b.swift", "run"),
+        ("Sources/Core/a.swift", "internalWork")
+    ));
+    for caller in [
+        ("Sources/Core/b.swift", "run"),
+        ("Sources/App/main.swift", "main"),
+        ("Tests/CoreTests/check.swift", "check"),
+    ] {
+        assert!(calls(&graph, caller, ("Sources/Core/a.swift", "work")));
+    }
+    for caller in [
+        ("Sources/Unrelated/other.swift", "other"),
+        ("Loose/tool.swift", "loose"),
+    ] {
+        assert!(f.unresolved(node(&graph, caller.0, caller.1), "Core.work"));
+    }
+    assert!(f.unresolved(
+        node(&graph, "Sources/App/main.swift", "main"),
+        "Core.internalWork"
+    ));
+    assert!(
+        index::stored_options(&f.db())
+            .unwrap()
+            .swift_modules
+            .is_empty()
+    );
+    assert!(index::check_update(&f.root(), &f.db()).unwrap().fresh);
+}
+
+#[test]
+fn swiftpm_literal_paths_sources_excludes_and_products_are_not_name_guesses() {
+    let f = Fixture::new();
+    f.write("Package.swift", &swift_manifest(r#"
+        .target(name: "Core", path: "lib", exclude: ["keep/ignored.swift"], sources: ["keep", "one.swift"]),
+        .target(name: "App", dependencies: [.byName(name: "Core"), .product(name: "Remote", package: "remote")], path: "app"),
+        .target(name: "Remote", path: "remote")
+    "#));
+    f.write("lib/keep/a.swift", "public func work() {}\n");
+    f.write("lib/keep/ignored.swift", "public func work() {}\n");
+    f.write("lib/elsewhere.swift", "public func work() {}\n");
+    f.write("lib/one.swift", "func run() { work() }\n");
+    f.write("remote/remote.swift", "public func remoteWork() {}\n");
+    f.write(
+        "app/main.swift",
+        "import Core\nimport Remote\nfunc main() { Core.work(); Remote.remoteWork() }\n",
+    );
+    let graph = f.index();
+    for caller in [("lib/one.swift", "run"), ("app/main.swift", "main")] {
+        assert!(calls(&graph, caller, ("lib/keep/a.swift", "work")));
+        assert!(!calls(&graph, caller, ("lib/keep/ignored.swift", "work")));
+        assert!(!calls(&graph, caller, ("lib/elsewhere.swift", "work")));
+    }
+    assert!(f.unresolved(node(&graph, "app/main.swift", "main"), "Remote.remoteWork"));
+}
+
+#[test]
+fn swiftpm_computed_conditional_duplicate_and_overlapping_declarations_refuse_membership() {
+    let f = Fixture::new();
+    f.write("Sources/Core/a.swift", "public func work() {}\n");
+    f.write("Sources/Core/b.swift", "func run() { work() }\n");
+    for targets in [
+        r#".target(name: targetName)"#,
+        r#".target(name: "Core", path: sourcePath())"#,
+        r#".target(name: "Core", sources: files)"#,
+        r#".target(name: "Core", dependencies: dependencies())"#,
+        r#".target(name: "Core", dependencies: [.target(name: "Other", condition: .when(platforms: [.macOS]))])"#,
+        r#".target(name: "Core", swiftSettings: [.define("FEATURE")])"#,
+        r#".target(name: "Core", path: "../outside")"#,
+        r#".target(name: "Core"), .target(name: "Core", path: "Elsewhere")"#,
+        r#".target(name: "Core"), .target(name: "Other", path: "Sources/Core")"#,
+        r#".target(name: "Core"), .target(name: "Other", path: "Sources/Core/nested")"#,
+        r#".target(name: "Core", name: "Other")"#,
+        r#".target(name: "Core"), makeTarget()"#,
+    ] {
+        f.write("Package.swift", &swift_manifest(targets));
+        let graph = f.index();
+        assert!(
+            f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"),
+            "{targets}"
+        );
+    }
+    let literal = swift_manifest(r#".target(name: "Core")"#);
+    for manifest in [
+        format!("#if os(macOS)\n{literal}#endif\n"),
+        format!("{literal}\npackage.targets.append(.target(name: \"Other\"))\n"),
+        literal.replace("let package", "var package"),
+        literal.replace("name: \"Core\"", "name: #\"Core\"#"),
+        literal.replace("name: \"Core\"", "name: \"\\(targetName)\""),
+    ] {
+        f.write("Package.swift", &manifest);
+        let graph = f.index();
+        assert!(
+            f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"),
+            "{manifest}"
+        );
+    }
+    f.write("Package.swift", &literal);
+    let graph = f.index();
+    assert!(calls(
+        &graph,
+        ("Sources/Core/b.swift", "run"),
+        ("Sources/Core/a.swift", "work")
+    ));
+    f.write("Package@swift-6.0.swift", &literal);
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+}
+
+#[test]
+fn swiftpm_nested_invalid_packages_and_duplicate_module_names_do_not_leak() {
+    let f = Fixture::new();
+    let package =
+        swift_manifest(r#".target(name: "Core"), .target(name: "App", dependencies: ["Core"])"#);
+    for root in ["one", "two"] {
+        f.write(&format!("{root}/Package.swift"), &package);
+        f.write(
+            &format!("{root}/Sources/Core/a.swift"),
+            "public func work() {}\n",
+        );
+        f.write(
+            &format!("{root}/Sources/App/main.swift"),
+            "import Core\nfunc main() { Core.work() }\n",
+        );
+    }
+    f.write(
+        "one/Sources/Core/nested/Package.swift",
+        "import PackageDescription\nlet package = makePackage()\n",
+    );
+    f.write("one/Sources/Core/nested/a.swift", "public func work() {}\n");
+    f.write("one/Sources/Core/nested/b.swift", "func run() { work() }\n");
+    let graph = f.index();
+    for root in ["one", "two"] {
+        let caller = format!("{root}/Sources/App/main.swift");
+        let target = format!("{root}/Sources/Core/a.swift");
+        assert!(calls(&graph, (&caller, "main"), (&target, "work")));
+    }
+    assert!(!calls(
+        &graph,
+        ("one/Sources/App/main.swift", "main"),
+        ("two/Sources/Core/a.swift", "work")
+    ));
+    assert!(f.unresolved(
+        node(&graph, "one/Sources/Core/nested/b.swift", "run"),
+        "work"
+    ));
+    f.write(
+        "one/Sources/Core/nested/Package.swift",
+        &swift_manifest(r#".target(name: "Core", path: ".")"#),
+    );
+    let graph = f.index();
+    assert!(calls(
+        &graph,
+        ("one/Sources/Core/nested/b.swift", "run"),
+        ("one/Sources/Core/nested/a.swift", "work")
+    ));
+    assert!(!calls(
+        &graph,
+        ("one/Sources/App/main.swift", "main"),
+        ("one/Sources/Core/nested/a.swift", "work")
+    ));
+}
+
+#[test]
+fn swiftpm_manifest_changes_removals_and_explicit_override_invalidate_navigation() {
+    let f = Fixture::new();
+    let literal =
+        swift_manifest(r#".target(name: "Core"), .target(name: "App", dependencies: ["Core"])"#);
+    f.write("Package.swift", &literal);
+    f.write("Sources/Core/a.swift", "public func work() {}\n");
+    f.write("Sources/Core/b.swift", "func run() { work() }\n");
+    f.write(
+        "Sources/App/main.swift",
+        "import Core\nfunc main() { Core.work() }\n",
+    );
+    f.index();
+    f.write(
+        "Package.swift",
+        &literal.replace("dependencies: [\"Core\"]", "dependencies: []"),
+    );
+    assert!(
+        index::check_update(&f.root(), &f.db())
+            .unwrap()
+            .changed
+            .contains(&"Sources/App/main.swift".into())
+    );
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/App/main.swift", "main"), "Core.work"));
+    f.write("Package.swift", &literal);
+    f.index();
+    fs::remove_file(f.root().join("Sources/Core/a.swift")).unwrap();
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/App/main.swift", "main"), "Core.work"));
+    f.write("Sources/Core/a.swift", "public func work() {}\n");
+    f.index();
+    fs::remove_file(f.root().join("Package.swift")).unwrap();
+    assert!(
+        index::check_update(&f.root(), &f.db())
+            .unwrap()
+            .changed
+            .contains(&"Sources/Core/b.swift".into())
+    );
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+
+    f.write("Package.swift", &literal);
+    f.write("Elsewhere/a.swift", "public func work() {}\n");
+    let options = IndexOptions {
+        code_only: true,
+        swift_modules: BTreeMap::from([
+            ("Core".into(), "Elsewhere".into()),
+            ("App".into(), "Sources/App".into()),
+        ]),
+        ..Default::default()
+    };
+    let graph = f.index_with(&options);
+    assert!(calls(
+        &graph,
+        ("Sources/App/main.swift", "main"),
+        ("Elsewhere/a.swift", "work")
+    ));
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+}
+
+#[test]
+fn swiftpm_ignored_manifests_and_sources_are_not_discovered_indirectly() {
+    let f = Fixture::new();
+    f.write("Package.swift", &swift_manifest(r#".target(name: "Core")"#));
+    f.write("Sources/Core/a.swift", "public func work() {}\n");
+    f.write("Sources/Core/b.swift", "func run() { work() }\n");
+    f.write(".grafignore", "Package.swift\n");
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+    f.write(".grafignore", "Sources/Core/a.swift\n");
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+    assert!(!graph.nodes.iter().any(|n| n.file == "Sources/Core/a.swift"));
+}
+
+#[cfg(unix)]
+#[test]
+fn swiftpm_symlinked_manifests_and_sources_are_not_discovered_indirectly() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let outside = tempdir().unwrap();
+    fs::write(
+        outside.path().join("Package.swift"),
+        swift_manifest(r#".target(name: "Core")"#),
+    )
+    .unwrap();
+    fs::write(outside.path().join("a.swift"), "public func work() {}\n").unwrap();
+    f.write("Sources/Core/b.swift", "func run() { work() }\n");
+    f.write("Sources/Core/a.swift", "public func work() {}\n");
+    symlink(
+        outside.path().join("Package.swift"),
+        f.root().join("Package.swift"),
+    )
+    .unwrap();
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+    fs::remove_file(f.root().join("Package.swift")).unwrap();
+    f.write("Package.swift", &swift_manifest(r#".target(name: "Core")"#));
+    fs::remove_file(f.root().join("Sources/Core/a.swift")).unwrap();
+    symlink(outside.path(), f.root().join("Sources/Core/linked")).unwrap();
+    let graph = f.index();
+    assert!(f.unresolved(node(&graph, "Sources/Core/b.swift", "run"), "work"));
+    assert!(!graph.nodes.iter().any(|n| n.file.contains("linked")));
+}
+
+#[test]
+fn go_interface_owner_ambiguity_retracts_and_restores_unchanged_callers() {
+    // Distinct members cannot disambiguate the shared owning type. Include
+    // aliases and build alternatives: this index does not select a Go build.
+    for (duplicate_path, duplicate) in [
+        (
+            "b.go",
+            "package wire\ntype Channel interface { Receive() }\n",
+        ),
+        ("b.go", "package wire\ntype Channel struct {}\n"),
+        ("b.go", "package wire\ntype (Channel = int)\n"),
+        (
+            "b_test.go",
+            "package wire\ntype Channel interface { Receive() }\n",
+        ),
+        (
+            "b_linux.go",
+            "//go:build linux\n\npackage wire\ntype Channel interface { Receive() }\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.write("go.mod", "module example.org/navigation\n");
+        f.write("a.go", "package wire\ntype Channel interface { Send() }\n");
+        f.write(
+            "caller.go",
+            "package wire\nfunc invoke(value Channel) { value.Send() }\n",
+        );
+        f.write("consumer/main.go", "package consumer\nimport \"example.org/navigation\"\nfunc invoke(value wire.Channel) { value.Send() }\n");
+        f.write(
+            "implementation.go",
+            "package wire\ntype Concrete struct {}\nfunc (Concrete) Send() {}\n",
+        );
+        let check = |graph: &GraphSnapshot, expected: bool| {
+            let contract = node(graph, "a.go", "Channel");
+            let member = node(graph, "a.go", "Send");
+            assert!(member.binding_key.is_none());
+            assert!(graph.edges.iter().any(|e| e.source == contract.id
+                && e.target == member.id
+                && e.relation == "contains"));
+            for file in ["caller.go", "consumer/main.go"] {
+                let caller = node(graph, file, "invoke");
+                let edges: Vec<_> = graph
+                    .edges
+                    .iter()
+                    .filter(|e| {
+                        e.source == caller.id
+                            && matches!(e.relation.as_str(), "calls" | "declared_member")
+                    })
+                    .collect();
+                assert_eq!(
+                    edges.len(),
+                    usize::from(expected),
+                    "{duplicate_path}: {duplicate}: {file}: {edges:?}"
+                );
+                if expected {
+                    assert_eq!(edges[0].target, member.id);
+                    assert_eq!(edges[0].relation, "declared_member");
+                }
+            }
+        };
+        check(&f.index(), true);
+        f.write(duplicate_path, duplicate);
+        let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+        for path in ["a.go", "caller.go", "consumer/main.go"] {
+            assert!(
+                changed.iter().any(|p| p == path),
+                "{duplicate_path}: {changed:?}"
+            );
+        }
+        check(&f.index(), false);
+        fs::remove_file(f.root().join(duplicate_path)).unwrap();
+        let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+        for path in ["a.go", "caller.go", "consumer/main.go"] {
+            assert!(
+                changed.iter().any(|p| p == path),
+                "{duplicate_path}: {changed:?}"
+            );
+        }
+        check(&f.index(), true);
+    }
+}
+
+#[test]
+fn go_interface_owner_counts_respect_lexical_package_and_directory_boundaries() {
+    let f = Fixture::new();
+    f.write("go.mod", "module example.org/navigation\n");
+    f.write("a.go", "package wire\ntype Channel interface { Send() }\n");
+    f.write(
+        "caller.go",
+        "package wire\nfunc invoke(value Channel) { value.Send() }\n",
+    );
+    f.write(
+        "other/decoy.go",
+        "package wire\ntype Channel interface { Receive() }\n",
+    );
+    f.write(
+        "external_test.go",
+        "package wire_test\ntype Channel interface { Receive() }\n",
+    );
+    let local = "package wire\nfunc local() { type Channel interface { Receive() }; var value Channel; value.Receive() }\n";
+    f.write("local.go", local);
+    let graph = f.index();
+    for (file, caller, member_file, member) in [
+        ("caller.go", "invoke", "a.go", "Send"),
+        ("local.go", "local", "local.go", "Receive"),
+    ] {
+        let caller = node(&graph, file, caller);
+        let member = node(&graph, member_file, member);
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == caller.id && matches!(e.relation.as_str(), "calls" | "declared_member")
+            })
+            .collect();
+        assert_eq!(edges.len(), 1, "{file}: {edges:?}");
+        assert_eq!(edges[0].relation, "declared_member");
+        assert_eq!(edges[0].target, member.id);
+    }
+    // Formatting/body edits do not change owner proof or refresh other files.
+    f.write("local.go", &format!("{local}// a comment\n"));
+    let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+    assert!(changed.iter().any(|p| p == "local.go"));
+    assert!(
+        !changed.iter().any(|p| p == "a.go" || p == "caller.go"),
+        "{changed:?}"
+    );
+}
+
+#[test]
+fn rust_alpha_renamed_generic_impls_follow_exact_declared_cargo_modules() {
+    let f = Fixture::new();
+    f.write(
+        "Cargo.toml",
+        "[package]\nname = \"register-demo\"\nversion = \"0.1.0\"\n",
+    );
+    let root = "pub mod model; mod provider; mod consumer; mod unrelated;";
+    let model = "pub struct Register<A, B>(pub A, pub B);";
+    f.write("src/lib.rs", root);
+    f.write("src/model.rs", model);
+    f.write("src/provider.rs", "use crate::model::Register; impl<Key, Value> Register<Key, Value> { pub fn inspect(&self) {} pub fn empty() -> Option<Self> { None } }");
+    f.write("src/consumer.rs", "use crate::model::Register as Table; impl<Left, Right> Table<Left, Right> { pub fn by_value(&self) { self.inspect(); } pub fn by_type() { Self::empty(); } pub fn missing(&self) { self.orphan(); } }");
+    f.write("src/unrelated.rs", "pub struct Register<A, B>(A, B); impl<X, Y> Register<X, Y> { pub fn inspect(&self) {} pub fn empty() {} }");
+    f.write("src/orphan.rs", "use crate::model::Register; impl<A, B> Register<A, B> { pub fn orphan(&self) {} pub fn inspect(&self) {} }");
+    let check = |graph: &GraphSnapshot, present: bool| {
+        for (caller, target) in [("by_value", "inspect"), ("by_type", "empty")] {
+            let source = node(graph, "src/consumer.rs", caller);
+            let edges: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.source == source.id
+                        && matches!(e.relation.as_str(), "calls" | "declared_member")
+                })
+                .collect();
+            assert_eq!(edges.len(), usize::from(present), "{caller}: {edges:?}");
+            if present {
+                assert_eq!(edges[0].relation, "calls");
+                assert_eq!(edges[0].target, node(graph, "src/provider.rs", target).id);
+            }
+        }
+        let missing = node(graph, "src/consumer.rs", "missing");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == missing.id && e.relation == "calls")
+        );
+    };
+    check(&f.index(), true);
+    // Removing module membership retracts links without changing either impl.
+    f.write("src/lib.rs", "pub mod model; mod consumer; mod unrelated;");
+    assert!(
+        index::check_update(&f.root(), &f.db())
+            .unwrap()
+            .changed
+            .iter()
+            .any(|p| p == "src/consumer.rs")
+    );
+    check(&f.index(), false);
+    f.write("src/lib.rs", root);
+    check(&f.index(), true);
+    // Impls alone cannot prove a generic family, even with explicit imports.
+    f.write("src/model.rs", "pub struct Other;");
+    assert!(
+        index::check_update(&f.root(), &f.db())
+            .unwrap()
+            .changed
+            .iter()
+            .any(|p| p == "src/consumer.rs")
+    );
+    check(&f.index(), false);
+    f.write("src/model.rs", model);
+    check(&f.index(), true);
+}
+
+#[test]
+fn rust_generic_impl_family_rejects_unproven_headers_and_owner_declarations() {
+    for (declaration, provider, consumer) in [
+        (
+            "pub struct Register<T>(pub T);",
+            "impl<T: Copy> Register<T>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub struct Register<T>(pub T);",
+            "impl<T> Register<T>",
+            "impl<U: Copy> Register<U>",
+        ),
+        (
+            "pub struct Register<T>(pub T);",
+            "impl<T> Register<T> where T: Copy",
+            "impl<U> Register<U> where U: Copy",
+        ),
+        (
+            "pub struct Register<T>(pub T);",
+            "impl<T> Inspect for Register<T>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub struct Register<'a, T>(pub &'a T);",
+            "impl<'a, T> Register<'a, T>",
+            "impl<'b, U> Register<'b, U>",
+        ),
+        (
+            "pub struct Register<const N: usize>(pub [u8; N]);",
+            "impl<const N: usize> Register<N>",
+            "impl<const M: usize> Register<M>",
+        ),
+        (
+            "pub struct Register<T>(pub T);",
+            "impl<T> Register<Option<T>>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub struct Register<T>(pub T);",
+            "impl Register<u16>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub struct Register<A, B>(pub A, pub B);",
+            "impl<T> Register<T, T>",
+            "impl<X, Y> Register<X, Y>",
+        ),
+        (
+            "pub struct Register<A, B>(pub A, pub B);",
+            "impl<A, B> Register<B, A>",
+            "impl<X, Y> Register<X, Y>",
+        ),
+        ("", "impl<T> Register<T>", "impl<U> Register<U>"),
+        (
+            "pub struct Register<T>(pub T); pub struct Register<U>(pub U);",
+            "impl<T> Register<T>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub struct Register<A, B>(pub A, pub B);",
+            "impl<T> Register<T>",
+            "impl<U> Register<U>",
+        ),
+        (
+            "pub type Register<T> = Option<T>;",
+            "impl<T> Register<T>",
+            "impl<U> Register<U>",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.write(
+            "Cargo.toml",
+            "[package]\nname = \"register-demo\"\nversion = \"0.1.0\"\n",
+        );
+        f.write("src/lib.rs", "mod model; mod provider; mod consumer;");
+        f.write("src/model.rs", declaration);
+        f.write("src/provider.rs", &format!("use crate::model::Register; trait Inspect {{ fn inspect(&self); }} {provider} {{ pub fn inspect(&self) {{}} }}"));
+        f.write("src/consumer.rs", &format!("use crate::model::Register; fn helper() {{}} {consumer} {{ pub fn visit(&self) {{ self.inspect(); Self::inspect(self); helper(); }} }}"));
+        let graph = f.index();
+        let caller = node(&graph, "src/consumer.rs", "visit");
+        let helper = node(&graph, "src/consumer.rs", "helper");
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == caller.id && matches!(e.relation.as_str(), "calls" | "declared_member")
+            })
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "{declaration} / {provider} / {consumer}: {edges:?}"
+        );
+        assert_eq!(edges[0].target, helper.id);
+        assert_eq!(edges[0].relation, "calls");
+    }
+}
+
+#[test]
+fn rust_generic_impls_do_not_borrow_an_unrelated_owner_or_a_mixed_block() {
+    for (provider, consumer) in [
+        (
+            "use crate::model::Register; impl<T> Register<T> { pub fn inspect(&self) {} }",
+            "use crate::other::Register; impl<U> Register<U> { pub fn visit(&self) { self.inspect(); } }",
+        ),
+        (
+            "use crate::model::Register; impl<T> Register<T> { fn marker(&self) {} } impl<T: Copy> Register<T> { pub fn inspect(&self) {} }",
+            "use crate::model::Register; impl<U> Register<U> { fn marker2(&self) {} } impl<U: Copy> Register<U> { pub fn visit(&self) { self.inspect(); } }",
+        ),
+        (
+            "use crate::model::Register; impl<T: Copy> Register<T> { pub fn inspect(&self) {} } impl<T> Register<T> { fn marker(&self) {} }",
+            "use crate::model::Register; impl<U: Copy> Register<U> { pub fn visit(&self) { self.inspect(); } } impl<U> Register<U> { fn marker2(&self) {} }",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.write(
+            "Cargo.toml",
+            "[package]\nname = \"register-demo\"\nversion = \"0.1.0\"\n",
+        );
+        f.write(
+            "src/lib.rs",
+            "mod model; mod other; mod provider; mod consumer;",
+        );
+        f.write("src/model.rs", "pub struct Register<T>(pub T);");
+        f.write("src/other.rs", "pub struct Register<T>(pub T);");
+        f.write("src/provider.rs", provider);
+        f.write("src/consumer.rs", consumer);
+        let graph = f.index();
+        let caller = node(&graph, "src/consumer.rs", "visit");
+        assert!(
+            !graph.edges.iter().any(|e| e.source == caller.id
+                && matches!(e.relation.as_str(), "calls" | "declared_member")),
+            "{provider} / {consumer}"
+        );
+    }
+}
