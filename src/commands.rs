@@ -50,11 +50,11 @@ pub enum Command {
     /// Summarize explicitly saved outcomes into local lessons without model calls.
     Reflect(MemoryReflectArgs),
     /// Read GitHub pull requests and optionally map their files to the stored graph.
-    Prs(PrsArgs),
+    Prs(PrsCommandArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct PrsArgs {
+pub struct PrsCommandArgs {
     #[command(flatten)]
     pub input: graf::prs::PrsArgs,
     /// Use this Graf snapshot for changed-file impact instead of a database.
@@ -92,7 +92,7 @@ pub struct SourceArgs {
 #[derive(Debug, Args)]
 pub struct AnalysisArgs {
     /// Community detection backend. Leiden uses a deterministic seeded native implementation.
-    #[arg(long, value_enum, default_value = "louvain")]
+    #[arg(long, value_enum, default_value_t = analysis::CommunityAlgorithm::default())]
     pub community_algorithm: analysis::CommunityAlgorithm,
     /// Reproducible Leiden random seed.
     #[arg(long, default_value_t = 42)]
@@ -1209,7 +1209,7 @@ fn diagnose(args: &DiagnoseArgs, db: Option<&Path>, json_output: bool) -> Result
     let source = SourceArgs {
         snapshot: args.snapshot.clone(),
         analysis: AnalysisArgs {
-            community_algorithm: analysis::CommunityAlgorithm::Louvain,
+            community_algorithm: analysis::CommunityAlgorithm::default(),
             community_seed: 42,
             community_local_max_passes: 100,
             resolution: 1.0,

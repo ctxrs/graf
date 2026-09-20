@@ -1305,6 +1305,17 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+mod command_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn complete_cli_schema_has_no_conflicting_arguments_or_groups() {
+        Cli::command().debug_assert();
+    }
+}
+
+#[cfg(test)]
 mod learning_tests {
     use super::*;
 

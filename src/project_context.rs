@@ -252,6 +252,14 @@ impl ProjectContext {
     /// Compare the raw read_source hash before stamping or skipping unchanged files.
     /// These byte hashes protect one discovery snapshot; they are not cache stamps.
     pub fn validate_source(&self, path: &str, content_hash: &str) -> Result<()> {
+        self.javascript.validate_source(path, content_hash)?;
+        ensure!(
+            self.rust
+                .source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == content_hash),
+            "source changed during Rust context discovery; retry indexing: {path}"
+        );
         ensure!(
             self.compiled_source_hashes
                 .get(path)
@@ -262,6 +270,25 @@ impl ProjectContext {
         self.swift.validate_source(path, content_hash)?;
         self.extended.validate_source(path, content_hash)?;
         Ok(())
+    }
+
+    pub(crate) fn take_cached_facts(
+        &mut self,
+        path: &str,
+        content_hash: &str,
+    ) -> Result<Option<FileFacts>> {
+        self.javascript.validate_source(path, content_hash)?;
+        if let Some(facts) = self.javascript.raw_facts.remove(path) {
+            return Ok(Some(facts));
+        }
+        ensure!(
+            self.rust
+                .source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == content_hash),
+            "source changed during Rust context discovery; retry indexing: {path}"
+        );
+        Ok(self.rust.facts.remove(path))
     }
 
     pub fn fingerprint(&self, path: &str) -> String {
@@ -294,10 +321,20 @@ impl ProjectContext {
             return self.compiled.fingerprint().into();
         }
         if self.javascript.files.contains(path) {
-            return self.javascript.fingerprint.clone();
+            return self
+                .javascript
+                .fingerprints
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| "javascript-output-v1-empty".into());
         }
         if path.ends_with(".rs") {
-            return self.rust.fingerprint.clone();
+            return self
+                .rust
+                .fingerprints
+                .get(path)
+                .unwrap_or(&self.rust.fingerprint)
+                .clone();
         }
         if !path.ends_with(".go") {
             return String::new();
@@ -640,13 +677,12 @@ impl<'a> Inventory<'a> {
         self.configs.insert(relative.into(), value.clone());
         Ok(value)
     }
-    fn fingerprint(&self, extension: &str) -> String {
+    fn config_fingerprint(&self, extension: &str) -> String {
         let mut items = vec![extension];
         for (path, value) in &self.configs {
             items.push(path);
             items.push(value.as_deref().unwrap_or("<missing>"));
         }
-        items.extend(self.files.iter().map(String::as_str));
         digest(items)
     }
 }
@@ -1381,12 +1417,13 @@ fn typescript_config(
     path: &str,
     inventory: &mut Inventory<'_>,
     stack: &mut Vec<String>,
+    observations: &mut BTreeMap<String, Option<String>>,
 ) -> Result<TypescriptConfig> {
     ensure!(
         stack.len() < 32 && !stack.iter().any(|p| p == path),
         "cyclic or excessively nested TypeScript extends"
     );
-    let Some(source) = inventory.config(path)? else {
+    let Some(source) = javascript_config(inventory, path, observations)? else {
         return Ok(TypescriptConfig::default());
     };
     let value = jsonc_parser::parse_to_serde_value(&source, &Default::default())?
@@ -1423,7 +1460,7 @@ fn typescript_config(
         if !target.ends_with(".json") {
             target.push_str(".json");
         }
-        let inherited = typescript_config(&target, inventory, stack)?;
+        let inherited = typescript_config(&target, inventory, stack, observations)?;
         if inherited.base_url.is_some() || inherited.invalid_base_url {
             result.base_url = inherited.base_url;
             result.invalid_base_url = inherited.invalid_base_url;
@@ -1460,6 +1497,20 @@ fn typescript_config(
     stack.pop();
     Ok(result)
 }
+fn javascript_config(
+    inventory: &mut Inventory<'_>,
+    path: &str,
+    observations: &mut BTreeMap<String, Option<String>>,
+) -> Result<Option<String>> {
+    let source = inventory.config(path)?;
+    observations.insert(
+        path.into(),
+        source
+            .as_ref()
+            .map(|s| blake3::hash(s.as_bytes()).to_hex().to_string()),
+    );
+    Ok(source)
+}
 fn capture<'a>(pattern: &str, value: &'a str) -> Option<&'a str> {
     if let Some((prefix, suffix)) = pattern.split_once('*') {
         value.strip_prefix(prefix)?.strip_suffix(suffix)
@@ -1480,43 +1531,64 @@ struct JavascriptContext {
     configs: BTreeMap<String, TypescriptConfig>,
     packages: BTreeMap<String, Value>,
     workspaces: BTreeMap<String, Vec<String>>,
-    fingerprint: String,
+    raw_facts: BTreeMap<String, FileFacts>,
+    source_hashes: BTreeMap<String, String>,
+    config_hashes: BTreeMap<String, Option<String>>,
+    fingerprints: BTreeMap<String, String>,
+    // Some(key): one proven declaration; None: type-only or conflicting route.
+    // Absent entries retain ordinary function/class resolution.
+    imported_callees: BTreeMap<String, Option<String>>,
     star_aliases: BTreeMap<String, Vec<String>>,
     esm_files: BTreeSet<String>,
 }
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum JavascriptCallee {
+    Declaration { node: String, key: String },
+    Ordinary(String),
+    Unresolved,
+}
 impl JavascriptContext {
     fn discover(inventory: &mut Inventory<'_>) -> Result<Self> {
-        let mut result = Self {
-            files: inventory
-                .files
-                .iter()
-                .filter(|p| javascript_source(p))
-                .cloned()
-                .collect(),
-            ..Self::default()
-        };
+        let mut result = Self::default();
         for path in inventory
             .files
             .iter()
-            .filter(|p| Path::new(p).extension().is_none())
+            .filter(|p| javascript_source(p) || Path::new(p).extension().is_none())
         {
-            let (_, bytes) = crate::index::read_source(
+            let (hash, bytes) = crate::index::read_source(
                 &inventory.root.join(path),
                 crate::parser::MAX_SOURCE_BYTES as u64,
             )?;
-            if bytes
-                .as_deref()
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .and_then(crate::languages::scripted::shebang_language)
-                == Some("javascript")
+            // Negative shebang probes and diagnostic sources also participate in
+            // the raw-byte guard, before the main loop's unchanged shortcut.
+            result.source_hashes.insert(path.clone(), hash.clone());
+            let source = bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+            if !javascript_source(path)
+                && source.and_then(crate::languages::scripted::shebang_language)
+                    != Some("javascript")
             {
-                result.files.insert(path.clone());
+                continue;
+            }
+            result.files.insert(path.clone());
+            if let Some(source) = source
+                && let Some(facts) = crate::languages::parse(path, source, &hash)?
+            {
+                if facts
+                    .nodes
+                    .first()
+                    .is_some_and(|n| n.metadata["module_syntax"] == "esm")
+                {
+                    result.esm_files.insert(path.clone());
+                }
+                result.raw_facts.insert(path.clone(), facts);
             }
         }
         let directories: BTreeSet<_> = result.files.iter().flat_map(|p| ancestors(p)).collect();
         for dir in directories {
             let package_path = join(&dir, "package.json").unwrap();
-            if let Some(source) = inventory.config(&package_path)? {
+            if let Some(source) =
+                javascript_config(inventory, &package_path, &mut result.config_hashes)?
+            {
                 let package: Value =
                     serde_json::from_str(&source).context("invalid package.json")?;
                 let members = package
@@ -1537,18 +1609,58 @@ impl JavascriptContext {
             }
             for name in ["tsconfig.json", "jsconfig.json"] {
                 let path = join(&dir, name).unwrap();
-                if inventory.config(&path)?.is_some() {
+                if javascript_config(inventory, &path, &mut result.config_hashes)?.is_some() {
                     result.configs.insert(
                         dir.clone(),
-                        typescript_config(&path, inventory, &mut vec![])?,
+                        typescript_config(
+                            &path,
+                            inventory,
+                            &mut vec![],
+                            &mut result.config_hashes,
+                        )?,
                     );
                     break;
                 }
             }
         }
-        result.fingerprint = inventory.fingerprint("javascript-context-5");
-        result.exports(inventory)?;
+        result.exports();
+        for (path, raw) in &result.raw_facts {
+            let mut applied = raw.clone();
+            result.apply(&mut applied);
+            result
+                .fingerprints
+                .insert(path.clone(), Self::outcome_fingerprint(applied)?);
+        }
+        result.validate_configs(inventory)?;
         Ok(result)
+    }
+    fn validate_source(&self, path: &str, hash: &str) -> Result<()> {
+        ensure!(
+            self.source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == hash)
+                && self
+                    .config_hashes
+                    .get(path)
+                    .is_none_or(|expected| expected.as_deref() == Some(hash)),
+            "source changed during JavaScript context discovery; retry indexing: {path}"
+        );
+        Ok(())
+    }
+    fn validate_configs(&self, inventory: &Inventory<'_>) -> Result<()> {
+        for (path, expected) in &self.config_hashes {
+            let current = inventory
+                .read_bytes(path, 1024 * 1024)?
+                .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+            ensure!(
+                &current == expected,
+                "configuration changed during JavaScript context discovery; retry indexing: {path}"
+            );
+        }
+        Ok(())
+    }
+    fn outcome_fingerprint(facts: FileFacts) -> Result<String> {
+        outcome_fingerprint("javascript-output-v1", facts)
     }
     fn commonjs(&self, path: &str) -> bool {
         if path.ends_with(".mjs") || path.ends_with(".mts") {
@@ -1566,29 +1678,13 @@ impl JavascriptContext {
             .max_by_key(|(dir, _)| dir.len())
             .is_none_or(|(_, p)| p.get("type").and_then(Value::as_str) != Some("module"))
     }
-    fn exports(&mut self, inventory: &Inventory<'_>) -> Result<()> {
+    fn exports(&mut self) {
         let mut direct: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
         let mut edges = vec![];
-        for path in &self.files {
-            let (_, bytes) = crate::index::read_source(
-                &inventory.root.join(path),
-                crate::parser::MAX_SOURCE_BYTES as u64,
-            )?;
-            let Some(bytes) = bytes else {
-                continue;
-            };
-            let Ok(source) = std::str::from_utf8(&bytes) else {
-                continue;
-            };
-            let Some(facts) = crate::languages::parse(path, source, "context")? else {
-                continue;
-            };
+        for (path, facts) in &self.raw_facts {
             let Some(root) = facts.nodes.first() else {
                 continue;
             };
-            if root.metadata.get("module_syntax").and_then(Value::as_str) == Some("esm") {
-                self.esm_files.insert(path.clone());
-            }
             let module = if matches!(path.rsplit('.').next(), Some("vue" | "svelte" | "astro")) {
                 path.as_str()
             } else {
@@ -1683,6 +1779,7 @@ impl JavascriptContext {
                 }
             }
         }
+        self.callee_providers(&exports, &edges);
         for (module, names) in &exports {
             for (name, origins) in names {
                 if origins.len() != 1 || direct.get(module).is_some_and(|d| d.contains_key(name)) {
@@ -1700,11 +1797,200 @@ impl JavascriptContext {
                     .push(alias);
             }
         }
-        self.fingerprint = digest([
-            self.fingerprint.as_str(),
-            format!("{direct:?}{edges:?}{exports:?}").as_str(),
-        ]);
-        Ok(())
+    }
+    fn callee_providers(
+        &mut self,
+        exports: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+        star_edges: &[(String, String, String)],
+    ) {
+        const SUFFIX: &str = "#declared_callee";
+        let key = |path: &str, kind: &str, name: &str| {
+            format!(
+                "javascript:{}:{path}:{name}",
+                if kind == "cjs" { "cjs-file" } else { "file" }
+            )
+        };
+        let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut providers = BTreeMap::new();
+        for raw in self.raw_facts.values() {
+            let mut facts = raw.clone();
+            // Called before star aliases are installed: these are direct owners,
+            // not discovery-only names competing with their terminal targets.
+            self.apply_paths(&mut facts);
+            for node in &facts.nodes {
+                let keys: BTreeSet<_> = node
+                    .binding_key
+                    .iter()
+                    .map(String::as_str)
+                    .chain(
+                        node.metadata["binding_aliases"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .filter(|k| {
+                        k.starts_with(&format!("javascript:file:{}:", facts.path))
+                            || k.starts_with(&format!("javascript:cjs-file:{}:", facts.path))
+                    })
+                    .map(str::to_owned)
+                    .collect();
+                let declaration = (node.kind == "constant"
+                    && node.metadata["declared_callee_binding"] == true
+                    && node
+                        .binding_key
+                        .as_deref()
+                        .is_some_and(|k| k.ends_with(SUFFIX)))
+                .then(|| keys.iter().find(|k| k.ends_with(SUFFIX)).cloned())
+                .flatten();
+                let references: Vec<_> = if node.kind == "alias" {
+                    facts
+                        .references
+                        .iter()
+                        .filter(|r| r.source == node.id && r.relation == "aliases")
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let targets = if references.len() == 1 {
+                    references[0].candidate_keys.clone()
+                } else {
+                    vec![]
+                };
+                providers.insert(node.id.clone(), (node.kind.clone(), declaration, targets));
+                for key in keys {
+                    owners.entry(key).or_default().insert(node.id.clone());
+                }
+            }
+        }
+        let mut values: BTreeMap<String, BTreeSet<JavascriptCallee>> = BTreeMap::new();
+        let mut routes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut direct_values = BTreeSet::new();
+        for (published, ids) in owners {
+            if let Some(base) = published.strip_suffix(SUFFIX) {
+                let origin = if ids.len() == 1 {
+                    let node = ids.first().unwrap();
+                    providers[node]
+                        .1
+                        .as_ref()
+                        .map(|key| JavascriptCallee::Declaration {
+                            node: node.clone(),
+                            key: key.clone(),
+                        })
+                        .unwrap_or(JavascriptCallee::Unresolved)
+                } else {
+                    JavascriptCallee::Unresolved
+                };
+                values
+                    .entry(base.into())
+                    .or_default()
+                    .insert(origin.clone());
+                direct_values.insert(base.to_owned());
+                values.entry(published).or_default().insert(origin);
+                continue;
+            }
+            values.entry(published.clone()).or_default();
+            for id in ids {
+                let (kind, _, targets) = &providers[&id];
+                if matches!(kind.as_str(), "interface" | "type") {
+                    continue;
+                }
+                direct_values.insert(published.clone());
+                if kind == "alias" && !targets.is_empty() {
+                    routes
+                        .entry(published.clone())
+                        .or_default()
+                        .extend(targets.iter().cloned());
+                } else {
+                    values
+                        .entry(published.clone())
+                        .or_default()
+                        .insert(if kind == "alias" {
+                            JavascriptCallee::Unresolved
+                        } else {
+                            JavascriptCallee::Ordinary(id)
+                        });
+                }
+            }
+        }
+        // Join value exports by their actual published symbol. In particular an
+        // interface must not shadow a star-exported value, whereas a direct
+        // function must shadow it, even though the reserved suffix differs.
+        for (from, kind, target) in star_edges {
+            for name in exports
+                .get(target)
+                .into_iter()
+                .flat_map(|names| names.keys())
+            {
+                let Some(symbol) = name.strip_prefix(&format!("{kind}:")) else {
+                    continue;
+                };
+                if kind == "esm" && (symbol == "default" || symbol.starts_with("default#")) {
+                    continue;
+                }
+                let symbol = symbol.strip_suffix(SUFFIX).unwrap_or(symbol);
+                let from_key = key(from, kind, symbol);
+                if direct_values.contains(&from_key) {
+                    continue;
+                }
+                values.entry(from_key.clone()).or_default();
+                routes
+                    .entry(from_key)
+                    .or_default()
+                    .insert(key(target, kind, symbol));
+            }
+        }
+        let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (from, targets) in &routes {
+            for target in targets {
+                values.entry(target.clone()).or_default();
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(from.clone());
+            }
+        }
+        // A missing/type-only endpoint is negative evidence, not permission to
+        // select another candidate. Cycles are solved by the same bounded union
+        // as star exports; repeated routes to one declaration remain unique.
+        for (name, origins) in &mut values {
+            if origins.is_empty() && !routes.contains_key(name) {
+                origins.insert(JavascriptCallee::Unresolved);
+            }
+        }
+        let mut pending: VecDeque<_> = values.keys().cloned().collect();
+        let mut queued: BTreeSet<_> = values.keys().cloned().collect();
+        while let Some(target) = pending.pop_front() {
+            queued.remove(&target);
+            let origins = values[&target].clone();
+            for from in reverse.get(&target).into_iter().flatten() {
+                let current = values.entry(from.clone()).or_default();
+                let mut changed = false;
+                for origin in &origins {
+                    if current.len() < 2 {
+                        changed |= current.insert(origin.clone());
+                    }
+                }
+                if changed && queued.insert(from.clone()) {
+                    pending.push_back(from.clone());
+                }
+            }
+        }
+        self.imported_callees = values
+            .into_iter()
+            .filter_map(|(name, origins)| {
+                if origins.len() == 1 {
+                    match origins.into_iter().next().unwrap() {
+                        JavascriptCallee::Declaration { key, .. } => {
+                            return Some((name, Some(key)));
+                        }
+                        JavascriptCallee::Ordinary(_) => return None,
+                        JavascriptCallee::Unresolved => (),
+                    }
+                }
+                Some((name, None))
+            })
+            .collect();
     }
     fn file(&self, importer: &str, target: &str) -> Option<String> {
         let mut candidates = vec![target.to_owned()];
@@ -1894,6 +2180,58 @@ impl JavascriptContext {
         self.package_target(importer, specifier, require)
     }
     fn apply(&self, facts: &mut FileFacts) {
+        self.apply_paths(facts);
+        self.apply_imported_callees(facts);
+    }
+    fn apply_imported_callees(&self, facts: &mut FileFacts) {
+        let mut ids: BTreeSet<_> = facts.references.iter().map(|r| r.id.clone()).collect();
+        let mut siblings = vec![];
+        for reference in &mut facts.references {
+            if reference.relation != "calls"
+                || !reference.candidate_keys.iter().any(|key| {
+                    key.strip_prefix("javascript:file:")
+                        .or_else(|| key.strip_prefix("javascript:cjs-file:"))
+                        .and_then(|s| s.rsplit_once(':'))
+                        .is_some_and(|(path, _)| path != facts.path)
+                })
+            {
+                continue;
+            }
+            let decisions: Vec<_> = reference
+                .candidate_keys
+                .iter()
+                .map(|key| self.imported_callees.get(key))
+                .collect();
+            if decisions.iter().all(Option::is_none) {
+                continue;
+            }
+            let mut target = None;
+            let unique = decisions.iter().all(|decision| {
+                if let Some(Some(key)) = decision {
+                    if target.is_some_and(|previous| previous != key) {
+                        return false;
+                    }
+                    target = Some(key);
+                    true
+                } else {
+                    false
+                }
+            });
+            reference.candidate_keys.clear();
+            if unique && let Some(target) = target {
+                let mut sibling = reference.clone();
+                sibling.id.push_str(":declared_callee");
+                if ids.insert(sibling.id.clone()) {
+                    sibling.relation = "declared_callee".into();
+                    sibling.candidate_keys = vec![target.clone()];
+                    sibling.reason = "written immutable callee binding; factory result and runtime dispatch are unresolved".into();
+                    siblings.push(sibling);
+                }
+            }
+        }
+        facts.references.extend(siblings);
+    }
+    fn apply_paths(&self, facts: &mut FileFacts) {
         let commonjs = self.commonjs(&facts.path);
         let native_module = if matches!(
             facts.path.rsplit('.').next(),
@@ -2108,6 +2446,9 @@ struct RustContext {
     forwarding: BTreeMap<String, Vec<String>>,
     generic_owners: BTreeMap<(String, String), u64>,
     fingerprint: String,
+    fingerprints: BTreeMap<String, String>,
+    source_hashes: BTreeMap<String, String>,
+    facts: BTreeMap<String, FileFacts>,
 }
 struct RustCrate {
     name: String,
@@ -2116,6 +2457,7 @@ struct RustCrate {
     dependencies: BTreeMap<String, String>,
     modules: BTreeSet<String>,
     public_modules: BTreeSet<String>,
+    unavailable_modules: BTreeSet<String>,
 }
 #[derive(Debug)]
 struct RustModule {
@@ -2187,6 +2529,7 @@ impl RustContext {
                     dependencies: BTreeMap::new(),
                     modules: BTreeSet::new(),
                     public_modules: BTreeSet::new(),
+                    unavailable_modules: BTreeSet::new(),
                 },
             );
         }
@@ -2301,9 +2644,27 @@ impl RustContext {
             result.visit_module(inventory, &package, &root, "", true, 0)?;
         }
         let evidence = result.public_uses(inventory)?;
+        for (path, cached) in &result.facts {
+            let mut applied = cached.clone();
+            // Preview the same final pass used by indexing, including generic
+            // owner checks. Keep the cached input and enrichment order intact.
+            result.apply(&mut applied);
+            result.fingerprints.insert(
+                path.clone(),
+                outcome_fingerprint("rust-output-v1", applied)?,
+            );
+        }
         let structure = format!("{:?}{:?}", result.modules, result.forwarding);
+        // A repository without an explicit Rust module graph has no project
+        // context for an unrelated file to invalidate. Store already rebinds
+        // ordinary terminal keys from the changed/deleted file itself.
+        let inventory_fingerprint = if result.modules.is_empty() {
+            "rust-context-empty".to_owned()
+        } else {
+            inventory.config_fingerprint("rust-context-5")
+        };
         result.fingerprint = digest([
-            inventory.fingerprint("rust-context-3").as_str(),
+            inventory_fingerprint.as_str(),
             structure.as_str(),
             evidence.as_str(),
         ]);
@@ -2314,17 +2675,23 @@ impl RustContext {
         let mut origins: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut exports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut evidence = vec![];
-        for path in self.modules.keys() {
-            let (_, bytes) = crate::index::read_source(
-                &inventory.root.join(path),
+        let module_paths: Vec<_> = self.modules.keys().cloned().collect();
+        let mut parsed = BTreeMap::new();
+        for path in module_paths {
+            let (hash, bytes) = crate::index::read_source(
+                &inventory.root.join(&path),
                 crate::parser::MAX_SOURCE_BYTES as u64,
             )?;
+            ensure!(
+                self.source_hashes.get(&path) == Some(&hash),
+                "source changed during Rust context discovery; retry indexing: {path}"
+            );
             let Some(bytes) = bytes else { continue };
-            evidence.push(format!("{path}:{}", blake3::hash(&bytes)));
+            evidence.push(format!("{path}:{hash}"));
             let Ok(source) = std::str::from_utf8(&bytes) else {
                 continue;
             };
-            let Some(mut facts) = crate::languages::parse(path, source, "context")? else {
+            let Some(mut facts) = crate::languages::parse(&path, source, "context")? else {
                 continue;
             };
             // Reuse the existing public-module boundary rules for each explicit alias.
@@ -2335,7 +2702,11 @@ impl RustContext {
                     node.binding_key = Some(key.into());
                 }
             }
+            parsed.insert(path, facts);
+        }
+        for (path, mut facts) in parsed {
             self.apply_paths(&mut facts);
+            self.facts.insert(path, facts.clone());
             for node in facts.nodes {
                 let keys: Vec<_> = node
                     .binding_key
@@ -2452,6 +2823,24 @@ impl RustContext {
             aliases.sort();
             aliases.dedup();
         }
+        let cached_paths: Vec<_> = self.facts.keys().cloned().collect();
+        for path in cached_paths {
+            if let Some(mut facts) = self.facts.remove(&path) {
+                // Reexport keys are discovery inputs, not competing definitions.
+                // Only their verified terminal targets publish these aliases.
+                for node in &mut facts.nodes {
+                    if node.kind == "reexport" {
+                        node.binding_key = None;
+                        node.metadata
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("binding_aliases");
+                    }
+                }
+                self.apply_paths(&mut facts);
+                self.facts.insert(path, facts);
+            }
+        }
         Ok(digest(evidence.iter().map(String::as_str)))
     }
     fn visit_module(
@@ -2486,10 +2875,17 @@ impl RustContext {
                 .public_modules
                 .insert(module.into());
         }
-        let (_, bytes) = crate::index::read_source(
+        let (hash, bytes) = crate::index::read_source(
             &inventory.root.join(path),
             crate::parser::MAX_SOURCE_BYTES as u64,
         )?;
+        ensure!(
+            self.source_hashes
+                .get(path)
+                .is_none_or(|expected| expected == &hash),
+            "source changed during Rust context discovery; retry indexing: {path}"
+        );
+        self.source_hashes.entry(path.into()).or_insert(hash);
         let Some(bytes) = bytes else {
             return Ok(());
         };
@@ -2588,6 +2984,12 @@ impl RustContext {
                             public,
                             nesting + 1,
                         )?;
+                    } else {
+                        self.crates
+                            .get_mut(package)
+                            .unwrap()
+                            .unavailable_modules
+                            .insert(next_module);
                     }
                 }
             }
@@ -2692,6 +3094,24 @@ impl RustContext {
             }
         }
         for reference in &mut facts.references {
+            if library_source {
+                // A proven lexical module name still needs an actual source.
+                // Keep orphan definitions navigable, but do not bind through a
+                // declared child whose file choice discovery rejected.
+                reference.candidate_keys.retain(|key| {
+                    let suffix = key
+                        .strip_prefix(&native_prefix)
+                        .or_else(|| key.strip_prefix(&native_module_prefix));
+                    !suffix.is_some_and(|suffix| {
+                        self.crates[owner].unavailable_modules.iter().any(|module| {
+                            (key.starts_with(&native_module_prefix) && suffix == module)
+                                || suffix
+                                    .strip_prefix(module)
+                                    .is_some_and(|rest| rest.starts_with("::"))
+                        })
+                    })
+                });
+            }
             for key in &mut reference.candidate_keys {
                 let external = if let Some(path) = key.strip_prefix("rust:external:") {
                     Some(path)
@@ -2784,6 +3204,19 @@ impl RustContext {
         }
     }
 }
+fn outcome_fingerprint(discriminator: &str, mut facts: FileFacts) -> Result<String> {
+    facts.hash.clear();
+    facts.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    facts.edges.sort_by(|a, b| a.id.cmp(&b.id));
+    facts.references.sort_by(|a, b| a.id.cmp(&b.id));
+    facts
+        .diagnostics
+        .sort_by(|a, b| (&a.file, a.line, &a.message).cmp(&(&b.file, b.line, &b.message)));
+    Ok(format!(
+        "{discriminator}-{}",
+        blake3::hash(&serde_json::to_vec(&facts)?).to_hex()
+    ))
+}
 fn merge_aliases(node: &mut Node, mut aliases: Vec<String>) {
     if aliases.is_empty() {
         return;
@@ -2808,6 +3241,521 @@ fn merge_aliases(node: &mut Node, mut aliases: Vec<String>) {
 #[cfg(test)]
 mod source_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn rust_public_uses_requires_the_module_traversal_snapshot() {
+        let declared = "mod child; pub fn caller() { crate::child::grand::work(); }";
+        for changed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("src/child")).unwrap();
+            std::fs::write(
+                root.path().join("Cargo.toml"),
+                "[package]\nname='demo'\nversion='0.1.0'\n",
+            )
+            .unwrap();
+            let first = if changed {
+                "pub fn caller() {}"
+            } else {
+                declared
+            };
+            std::fs::write(root.path().join("src/lib.rs"), first).unwrap();
+            std::fs::write(root.path().join("src/child/grand.rs"), "pub fn work() {}").unwrap();
+            let mut paths: Vec<String> = ["Cargo.toml", "src/lib.rs", "src/child/grand.rs"]
+                .map(String::from)
+                .into();
+            if !changed {
+                std::fs::write(root.path().join("src/child.rs"), "pub mod grand;").unwrap();
+                paths.push("src/child.rs".into());
+            }
+            let inventory = Inventory::new(root.path(), &paths);
+            let mut context = RustContext {
+                crates: BTreeMap::from([(
+                    String::new(),
+                    RustCrate {
+                        name: "demo".into(),
+                        library: "demo".into(),
+                        root: Some("src/lib.rs".into()),
+                        dependencies: BTreeMap::new(),
+                        modules: BTreeSet::new(),
+                        public_modules: BTreeSet::new(),
+                        unavailable_modules: BTreeSet::new(),
+                    },
+                )]),
+                owners: paths
+                    .iter()
+                    .filter(|path| path.ends_with(".rs"))
+                    .map(|path| (path.clone(), String::new()))
+                    .collect(),
+                ..Default::default()
+            };
+            context
+                .visit_module(&inventory, "", "src/lib.rs", "", true, 0)
+                .unwrap();
+            let traversal_hashes = context.source_hashes.clone();
+            assert_eq!(
+                traversal_hashes["src/lib.rs"],
+                blake3::hash(first.as_bytes()).to_hex().as_str()
+            );
+            if changed {
+                // The new declaration rejects a missing parent, but traversal
+                // has already observed the earlier source without that module.
+                std::fs::write(root.path().join("src/lib.rs"), declared).unwrap();
+                let error = context.public_uses(&inventory).unwrap_err();
+                assert!(error.to_string().contains(
+                    "source changed during Rust context discovery; retry indexing: src/lib.rs"
+                ));
+                assert!(context.facts.is_empty());
+            } else {
+                context.public_uses(&inventory).unwrap();
+                assert_eq!(context.facts.len(), 3);
+                assert!(
+                    context.facts["src/lib.rs"]
+                        .references
+                        .iter()
+                        .any(|reference| {
+                            reference.relation == "calls" && !reference.candidate_keys.is_empty()
+                        })
+                );
+                assert!(
+                    context.facts["src/child/grand.rs"]
+                        .nodes
+                        .iter()
+                        .any(|node| { node.label == "work" && node.kind == "function" })
+                );
+            }
+            // Neither acceptance nor rejection may replace the traversal proof.
+            assert_eq!(context.source_hashes, traversal_hashes);
+        }
+    }
+
+    #[test]
+    fn rust_cached_tokens_include_final_impl_checks_and_preserve_source_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = [
+            ("Cargo.toml", "[package]\nname='demo'\nversion='0.1.0'\n"),
+            ("src/lib.rs", "mod model; mod provider;"),
+            ("src/model.rs", "pub struct Register<A>(pub A);"),
+            (
+                "src/provider.rs",
+                "use crate::model::Register; impl<A, B> Register<A, B> { pub fn work() {} } // a",
+            ),
+        ];
+        for (path, source) in sources {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let mut paths: Vec<String> = sources.iter().map(|(path, _)| (*path).into()).collect();
+        let mut context =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        paths.reverse();
+        let reordered =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        let path = "src/provider.rs";
+        let source = sources[3].1;
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let token = context.fingerprint(path);
+        assert_eq!(token, reordered.fingerprint(path));
+        let mut cached = context.take_cached_facts(path, &hash).unwrap().unwrap();
+        assert!(
+            cached
+                .nodes
+                .iter()
+                .find(|node| node.label == "work")
+                .unwrap()
+                .binding_key
+                .is_some()
+        );
+        assert_ne!(
+            token,
+            outcome_fingerprint("rust-output-v1", cached.clone()).unwrap()
+        );
+        context.apply(&mut cached);
+        assert!(
+            cached
+                .nodes
+                .iter()
+                .find(|node| node.label == "work")
+                .unwrap()
+                .binding_key
+                .is_none()
+        );
+        assert_eq!(
+            token,
+            outcome_fingerprint("rust-output-v1", cached).unwrap()
+        );
+        assert!(context.take_cached_facts(path, &hash).unwrap().is_none());
+        assert_eq!(token, context.fingerprint(path));
+
+        // Same-size, comment-only edits still invalidate the discovery snapshot,
+        // even after cached facts have been consumed.
+        std::fs::write(root.path().join(path), source.replace("// a", "// b")).unwrap();
+        let (changed_hash, _) = crate::index::read_source(
+            &root.path().join(path),
+            crate::parser::MAX_SOURCE_BYTES as u64,
+        )
+        .unwrap();
+        assert!(context.validate_source(path, &changed_hash).is_err());
+        assert!(context.take_cached_facts(path, &changed_hash).is_err());
+        let edited =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        assert_eq!(token, edited.fingerprint(path));
+        std::fs::write(root.path().join(path), source).unwrap();
+        let (restored_hash, _) = crate::index::read_source(
+            &root.path().join(path),
+            crate::parser::MAX_SOURCE_BYTES as u64,
+        )
+        .unwrap();
+        assert_eq!(restored_hash, hash);
+        assert!(context.validate_source(path, &restored_hash).is_ok());
+        assert!(edited.validate_source(path, &restored_hash).is_err());
+    }
+
+    #[test]
+    fn javascript_imported_declarations_require_unique_complete_provider_proof() {
+        let parse = |path: &str, source: &str| {
+            crate::languages::parse(path, source, "raw")
+                .unwrap()
+                .unwrap()
+        };
+        let provider = parse(
+            "provider.ts",
+            "export interface Shape {} export const Shape = factory(); export function ordinary() {}",
+        );
+        let other = parse("other.ts", "export const Shape = factory();");
+        let caller = parse(
+            "main.ts",
+            "import {Shape as Value} from './provider'; function use(v: Value): Value { Value(); return v; }",
+        );
+        for variation in [
+            "valid",
+            "missing marker",
+            "false marker",
+            "wrong kind",
+            "wrong key",
+            "competing owner",
+            "ordinary candidate",
+            "other declaration",
+            "unproven candidate",
+        ] {
+            let mut raw = provider.clone();
+            let constant = raw.nodes.iter().position(|n| n.kind == "constant").unwrap();
+            match variation {
+                "missing marker" => {
+                    raw.nodes[constant]
+                        .metadata
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("declared_callee_binding");
+                }
+                "false marker" => {
+                    raw.nodes[constant].metadata["declared_callee_binding"] = false.into()
+                }
+                "wrong kind" => raw.nodes[constant].kind = "function".into(),
+                "wrong key" => {
+                    raw.nodes[constant].binding_key = Some("javascript:provider:Shape".into())
+                }
+                "competing owner" => {
+                    let mut competitor = raw.nodes[constant].clone();
+                    competitor.id.push_str(":competitor");
+                    competitor.kind = "function".into();
+                    competitor.metadata["declared_callee_binding"] = false.into();
+                    raw.nodes.push(competitor);
+                }
+                _ => (),
+            }
+            let mut context = JavascriptContext {
+                files: ["provider.ts", "other.ts", "main.ts"]
+                    .map(String::from)
+                    .into(),
+                raw_facts: [
+                    ("provider.ts".into(), raw),
+                    ("other.ts".into(), other.clone()),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            context.exports();
+            let mut facts = caller.clone();
+            context.apply_paths(&mut facts);
+            let call = facts
+                .references
+                .iter_mut()
+                .find(|r| r.relation == "calls")
+                .unwrap();
+            match variation {
+                "ordinary candidate" => call
+                    .candidate_keys
+                    .push("javascript:file:provider.ts:ordinary".into()),
+                "other declaration" => call
+                    .candidate_keys
+                    .push("javascript:file:other.ts:Shape".into()),
+                "unproven candidate" => call
+                    .candidate_keys
+                    .push("javascript:file:absent.ts:Shape".into()),
+                _ => (),
+            }
+            let original = call.clone();
+            let types: Vec<_> = facts
+                .references
+                .iter()
+                .filter(|r| r.relation != "calls")
+                .map(|r| serde_json::to_value(r).unwrap())
+                .collect();
+            context.apply_imported_callees(&mut facts);
+            let calls: Vec<_> = facts
+                .references
+                .iter()
+                .filter(|r| r.relation == "calls")
+                .collect();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].candidate_keys.is_empty(), "{variation}");
+            let mut runtime = original.clone();
+            runtime.candidate_keys.clear();
+            assert_eq!(
+                serde_json::to_value(calls[0]).unwrap(),
+                serde_json::to_value(runtime).unwrap()
+            );
+            let siblings: Vec<_> = facts
+                .references
+                .iter()
+                .filter(|r| r.relation == "declared_callee")
+                .collect();
+            assert_eq!(
+                siblings.len(),
+                usize::from(variation == "valid"),
+                "{variation}"
+            );
+            if let Some(sibling) = siblings.first() {
+                assert_eq!(sibling.id, format!("{}:declared_callee", original.id));
+                assert_eq!(
+                    (&sibling.source, &sibling.label, &sibling.file, sibling.line),
+                    (
+                        &original.source,
+                        &original.label,
+                        &original.file,
+                        original.line
+                    )
+                );
+                assert_eq!(
+                    sibling.candidate_keys,
+                    ["javascript:file:provider.ts:Shape#declared_callee"]
+                );
+                assert_eq!(
+                    sibling.reason,
+                    "written immutable callee binding; factory result and runtime dispatch are unresolved"
+                );
+            }
+            assert_eq!(
+                types,
+                facts
+                    .references
+                    .iter()
+                    .filter(|r| !matches!(r.relation.as_str(), "calls" | "declared_callee"))
+                    .map(|r| serde_json::to_value(r).unwrap())
+                    .collect::<Vec<_>>()
+            );
+            let once = serde_json::to_value(&facts).unwrap();
+            context.apply_imported_callees(&mut facts);
+            assert_eq!(once, serde_json::to_value(facts).unwrap());
+        }
+    }
+
+    #[test]
+    fn javascript_cache_returns_raw_facts_once_and_retains_output_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = [
+            ("lib.cjs", "exports.work = function work() {};"),
+            (
+                "main.cjs",
+                "const lib = require('./lib.cjs'); function use() { lib.work(); }",
+            ),
+            (
+                "typed.ts",
+                "import {work} from './lib.cjs'; function use() { work(); }",
+            ),
+            ("broken.ts", "export function ("),
+        ];
+        for (path, source) in sources {
+            std::fs::write(root.path().join(path), source).unwrap();
+        }
+        let mut paths: Vec<String> = sources.iter().map(|(p, _)| (*p).into()).collect();
+        let mut context =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        paths.reverse();
+        let reordered =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        for (path, source) in sources {
+            let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+            let raw = crate::languages::parse(path, source, &hash)
+                .unwrap()
+                .unwrap();
+            let token = context.fingerprint(path);
+            assert_eq!(token, reordered.fingerprint(path));
+            let mut cached = context.take_cached_facts(path, &hash).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&cached).unwrap(),
+                serde_json::to_value(&raw).unwrap()
+            );
+            let mut expected = raw;
+            context.apply(&mut expected);
+            context.apply(&mut cached);
+            assert_eq!(
+                serde_json::to_value(&cached).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                token,
+                JavascriptContext::outcome_fingerprint(cached).unwrap()
+            );
+            assert!(context.take_cached_facts(path, &hash).unwrap().is_none());
+            assert_eq!(token, context.fingerprint(path));
+            assert!(context.validate_source(path, "different bytes").is_err());
+        }
+    }
+
+    #[test]
+    fn javascript_context_rejects_changed_bytes_and_configuration_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.ts");
+        let old = "export function old() {}";
+        let new = "export function new() {}";
+        std::fs::write(&path, new).unwrap();
+        std::fs::write(root.path().join("bad.js"), [255]).unwrap();
+        std::fs::write(
+            root.path().join("large.js"),
+            vec![b' '; crate::parser::MAX_SOURCE_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tool"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{"extends":"./base.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("base.json"), "{}").unwrap();
+        let paths = [
+            "lib.ts",
+            "bad.js",
+            "large.js",
+            "tool",
+            "tsconfig.json",
+            "base.json",
+        ]
+        .map(String::from);
+        let mut context =
+            ProjectContext::discover_with_swift_modules(root.path(), &paths, &BTreeMap::new())
+                .unwrap();
+        assert!(!context.javascript.files.contains("tool"));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, old).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        for (name, bytes) in [
+            ("lib.ts", old.as_bytes()),
+            ("bad.js", b"x".as_slice()),
+            ("large.js", b"export {};".as_slice()),
+            ("tool", b"#!/usr/bin/env node\nrun();".as_slice()),
+        ] {
+            if name != "lib.ts" {
+                std::fs::write(root.path().join(name), bytes).unwrap();
+            }
+            let (hash, _) = crate::index::read_source(
+                &root.path().join(name),
+                crate::parser::MAX_SOURCE_BYTES as u64,
+            )
+            .unwrap();
+            assert!(context.validate_source(name, &hash).is_err(), "{name}");
+            assert!(context.take_cached_facts(name, &hash).is_err(), "{name}");
+        }
+        assert!(context.javascript.raw_facts.contains_key("lib.ts"));
+        let inventory = Inventory::new(root.path(), &paths);
+        context.javascript.validate_configs(&inventory).unwrap();
+        for (name, contents) in [
+            ("base.json", "{ }"),
+            ("package.json", "{}"),
+            ("base.json", "{}"),
+        ] {
+            std::fs::write(root.path().join(name), contents).unwrap();
+            if name == "base.json" && contents == "{}" {
+                std::fs::remove_file(root.path().join("package.json")).unwrap();
+                context.javascript.validate_configs(&inventory).unwrap();
+            } else {
+                assert!(context.javascript.validate_configs(&inventory).is_err());
+                assert!(
+                    context
+                        .validate_source(name, blake3::hash(contents.as_bytes()).to_hex().as_ref())
+                        .is_err()
+                );
+            }
+        }
+        std::fs::remove_file(root.path().join("base.json")).unwrap();
+        assert!(context.javascript.validate_configs(&inventory).is_err());
+    }
+
+    #[test]
+    fn javascript_output_token_hashes_complete_facts_except_the_source_stamp() {
+        let raw = crate::languages::parse(
+            "main.ts",
+            "import {work} from './lib'; function use() { work(); }",
+            "raw",
+        )
+        .unwrap()
+        .unwrap();
+        let token = JavascriptContext::outcome_fingerprint(raw.clone()).unwrap();
+        let mut reordered = raw.clone();
+        reordered.hash = "final-stamp".into();
+        reordered.nodes.reverse();
+        reordered.edges.reverse();
+        reordered.references.reverse();
+        assert_eq!(
+            token,
+            JavascriptContext::outcome_fingerprint(reordered).unwrap()
+        );
+        let call = raw
+            .references
+            .iter()
+            .position(|r| r.relation == "calls")
+            .unwrap();
+        for field in ["candidate", "reason", "line", "metadata", "diagnostic"] {
+            let mut changed = raw.clone();
+            match field {
+                "candidate" => changed.references[call]
+                    .candidate_keys
+                    .push("another:target".into()),
+                "reason" => changed.references[call].reason.push('!'),
+                "line" => changed.references[call].line += 1,
+                "metadata" => changed.nodes[0].metadata["proof"] = true.into(),
+                _ => changed.diagnostics.push(crate::model::Diagnostic {
+                    file: "main.ts".into(),
+                    line: Some(1),
+                    message: "unsupported".into(),
+                }),
+            }
+            assert_ne!(
+                token,
+                JavascriptContext::outcome_fingerprint(changed).unwrap(),
+                "{field}"
+            );
+        }
+        let mut ordered = raw;
+        ordered.references[call].candidate_keys = vec!["first".into(), "second".into()];
+        let first = JavascriptContext::outcome_fingerprint(ordered.clone()).unwrap();
+        ordered.references[call].candidate_keys.reverse();
+        assert_ne!(
+            first,
+            JavascriptContext::outcome_fingerprint(ordered).unwrap()
+        );
+    }
 
     #[test]
     fn swiftpm_literal_ast_comments_and_raw_snapshot_validation() {

@@ -1,4 +1,7 @@
-use crate::{model::*, store::generation};
+use crate::{
+    model::*,
+    store::{StorageLayout, generation, storage_layout},
+};
 use anyhow::{Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
@@ -12,6 +15,11 @@ const MAX_EXAMINED: usize = 5_000;
 // Separate budgets keep a common word or a late endpoint discoverable.
 const MAX_RANK_POSTINGS: usize = 250_000;
 const MAX_RANK_BYTES: usize = 64 * 1024 * 1024;
+// FTS prefix expansion happens before node filters or Rust row budgets. Limit
+// its global logical input, including prose, separately from endpoint fields.
+// These are source-byte/node caps, not SQLite allocation or wall-clock limits.
+const MAX_ENDPOINT_FTS_NODES: usize = 50_000;
+const MAX_ENDPOINT_FTS_BYTES: usize = 8 * 1024 * 1024;
 
 // The handler belongs to this request, not the Store: stats and writes must
 // not inherit a query's exhausted budget, including after an error.
@@ -86,13 +94,34 @@ fn validate(options: &QueryOptions) -> Result<()> {
 }
 
 fn empty(conn: &Connection) -> Result<GraphResult> {
+    let generation = generation(conn)?;
+    // Generation pins the read snapshot before selecting physical-format SQL.
+    // A Store handle may observe an upgrade in its next transaction.
+    storage_layout(conn)?;
     Ok(GraphResult {
         schema_version: SCHEMA_VERSION,
-        generation: generation(conn)?,
+        generation,
         nodes: Vec::new(),
         edges: Vec::new(),
         unresolved: Vec::new(),
         truncated: false,
+    })
+}
+
+// Resolve once before bounded relationship streams, never across transactions
+// or write phases. Payloads and ordering continue to use public string IDs.
+fn node_identity(
+    conn: &Connection,
+    layout: StorageLayout,
+    id: &str,
+) -> Result<rusqlite::types::Value> {
+    Ok(match layout {
+        StorageLayout::Legacy => id.to_owned().into(),
+        StorageLayout::Compact => conn
+            .query_row("SELECT nkey FROM nodes WHERE id=?1", [id], |r| {
+                r.get::<_, i64>(0)
+            })?
+            .into(),
     })
 }
 
@@ -224,6 +253,8 @@ fn adjacency_filtered(
     budget: usize,
     relations: &[String],
 ) -> Result<Vec<Edge>> {
+    let layout = storage_layout(conn)?;
+    let identity = node_identity(conn, layout, id)?;
     let mut edges = Vec::new();
     let streams = if options.direction == Direction::Incoming {
         [false, true]
@@ -235,13 +266,18 @@ fn adjacency_filtered(
         if remaining == 0 {
             break;
         }
-        let column = if outgoing { "source" } else { "target" };
+        let column = match (layout, outgoing) {
+            (StorageLayout::Legacy, true) => "source",
+            (StorageLayout::Legacy, false) => "target",
+            (StorageLayout::Compact, true) => "source_key",
+            (StorageLayout::Compact, false) => "target_key",
+        };
         let undirected_only = matches!(
             (options.direction, outgoing),
             (Direction::Incoming, true) | (Direction::Outgoing, false)
         );
         let mut sql = format!("SELECT payload FROM edges WHERE {column}=?");
-        let mut values: Vec<rusqlite::types::Value> = vec![id.to_owned().into()];
+        let mut values = vec![identity.clone()];
         if undirected_only {
             sql.push_str(" AND directed=0");
         }
@@ -293,9 +329,12 @@ fn unresolved(
         return Ok(());
     }
     let remaining = options.limit - result.unresolved.len();
-    let mut sql =
-        "SELECT payload,resolution_reason FROM refs WHERE source=?1 AND resolved_target IS NULL"
-            .to_owned();
+    let layout = storage_layout(conn)?;
+    let identity = node_identity(conn, layout, id)?;
+    let mut sql = match layout {
+        StorageLayout::Legacy => "SELECT payload,resolution_reason FROM refs WHERE source=?1 AND resolved_target IS NULL",
+        StorageLayout::Compact => "SELECT payload,resolution_reason FROM refs WHERE source_key=?1 AND resolved_target_key IS NULL",
+    }.to_owned();
     if options.relation.is_some() {
         sql.push_str(" AND relation=?2 ORDER BY id LIMIT ?3");
     } else {
@@ -303,9 +342,9 @@ fn unresolved(
     }
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = if let Some(relation) = &options.relation {
-        stmt.query(params![id, relation, (remaining + 1) as i64])?
+        stmt.query(params![identity, relation, (remaining + 1) as i64])?
     } else {
-        stmt.query(params![id, (remaining + 1) as i64])?
+        stmt.query(params![identity, (remaining + 1) as i64])?
     };
     let mut seen = 0;
     while let Some(row) = rows.next()? {
@@ -508,6 +547,8 @@ pub struct PathSearchResult {
 pub const DEFAULT_IMPACT_RELATIONS: &[&str] = &[
     "calls",
     "indirect_call",
+    "declared_member",
+    "declared_callee",
     "references",
     "imports",
     "imports_from",
@@ -582,6 +623,8 @@ impl crate::store::Store {
         catalog_budgeted(&self.conn, || {
             validate_search(options)?;
             let tx = self.conn.unchecked_transaction()?;
+            generation(&tx)?;
+            storage_layout(&tx)?;
             let node = resolve_endpoint_in(&tx, validate_text(text)?, options)?;
             tx.commit()?;
             Ok(node)
@@ -779,6 +822,130 @@ fn filter_sql(options: &SearchOptions, values: &mut Vec<rusqlite::types::Value>)
     sql
 }
 
+fn enriched_search_index(conn: &Connection) -> Result<bool> {
+    let has_version: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='search_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_version {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        // Only v5 promises the explicit NFKD/accent-folded companion. Older
+        // unicode61 postings miss compound diacritics; future formats need review.
+        "SELECT search_version = 5 FROM metadata WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn within_endpoint_fts_bounds(conn: &Connection) -> Result<bool> {
+    // nodes.search is the complete input maintained in node_search by writes.
+    // Do not apply endpoint filters: prefix setup visits global postings, and
+    // named prose/attributes can dwarf the ID/label/qualified-name fields.
+    // Read lengths only and stop at the first exceeded cap. A large SQLite
+    // value or historical FTS segments can still cost I/O outside these caps.
+    let mut stmt = conn.prepare("SELECT length(CAST(search AS BLOB)) FROM nodes LIMIT ?")?;
+    let mut rows = stmt.query([(MAX_ENDPOINT_FTS_NODES + 1) as i64])?;
+    let mut remaining = MAX_ENDPOINT_FTS_BYTES;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
+        if count == MAX_ENDPOINT_FTS_NODES || bytes > remaining {
+            return Ok(false);
+        }
+        count += 1;
+        remaining -= bytes;
+    }
+    Ok(true)
+}
+
+fn within_endpoint_bounds(
+    conn: &Connection,
+    filters: &str,
+    values: &[rusqlite::types::Value],
+) -> Result<bool> {
+    let record_bytes = "length(CAST(n.id AS BLOB)) + length(CAST(n.label AS BLOB)) + COALESCE(length(CAST(n.qualified_name AS BLOB)), 0)";
+    let sql = format!(
+        "SELECT COUNT(*) <= {MAX_RANK_POSTINGS}
+                AND COALESCE(SUM({record_bytes}), 0) <= {MAX_RANK_BYTES}
+                AND COALESCE(MAX({record_bytes}), 0) <= {MAX_SEARCH_BYTES}
+         FROM nodes n WHERE 1=1{filters}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    Ok(
+        stmt.query_row(rusqlite::params_from_iter(values.iter().cloned()), |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+fn endpoint_tier(
+    id: &str,
+    label: &str,
+    qualified: Option<&str>,
+    term: &str,
+    callable: &str,
+) -> Option<usize> {
+    let normalized = [
+        normalize(id),
+        normalize(label),
+        normalize(qualified.unwrap_or("")),
+    ];
+    if normalized.iter().any(|value| value == term) || normalized[1] == callable {
+        Some(0)
+    } else if normalized.iter().any(|value| value.starts_with(term)) {
+        Some(1)
+    } else if normalized.iter().any(|value| value.contains(term)) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn scan_endpoint_rows(
+    conn: &Connection,
+    sql: &str,
+    values: &[rusqlite::types::Value],
+    term: &str,
+    callable: &str,
+) -> Result<[Vec<String>; 3]> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(values.iter().cloned()))?;
+    let mut tiers: [Vec<String>; 3] = Default::default();
+    let start = Instant::now();
+    let mut bytes = 0;
+    let mut examined = 0;
+    while let Some(row) = rows.next()? {
+        ensure!(
+            examined < MAX_RANK_POSTINGS && start.elapsed() < Duration::from_secs(2),
+            "endpoint lookup exceeded its work/time budget; use an exact ID or a smaller file/kind scope"
+        );
+        examined += 1;
+        let id: &str = row.get_ref(0)?.as_str()?;
+        let label: &str = row.get_ref(1)?.as_str()?;
+        let qualified: Option<&str> = row.get_ref(2)?.as_str_or_null()?;
+        // Normalization runs outside SQLite's VM guard. Bound its input too,
+        // before allocating strings for arbitrarily long imported identifiers.
+        let record_bytes = id.len() + label.len() + qualified.map_or(0, str::len);
+        bytes += record_bytes;
+        ensure!(
+            record_bytes <= MAX_SEARCH_BYTES && bytes <= MAX_RANK_BYTES,
+            "endpoint lookup exceeded its normalization byte budget; use an exact ID or a smaller file/kind scope"
+        );
+        if let Some(tier) = endpoint_tier(id, label, qualified, term, callable)
+            && tiers[tier].len() < 2
+        {
+            tiers[tier].push(id.to_owned());
+        }
+        if tiers[0].len() == 2 {
+            break;
+        }
+    }
+    Ok(tiers)
+}
+
 fn exact_filtered(
     conn: &Connection,
     text: &str,
@@ -878,8 +1045,14 @@ fn resolve_relation(
     text: &str,
     options: &QueryOptions,
 ) -> Result<String> {
+    let layout = storage_layout(conn)?;
+    let identity = node_identity(conn, layout, id)?;
     let mut streams = Vec::new();
-    for (column, outgoing) in [("source", true), ("target", false)] {
+    let columns = match layout {
+        StorageLayout::Legacy => ["source", "target"],
+        StorageLayout::Compact => ["source_key", "target_key"],
+    };
+    for (column, outgoing) in [(columns[0], true), (columns[1], false)] {
         let undirected_only = matches!(
             (options.direction, outgoing),
             (Direction::Incoming, true) | (Direction::Outgoing, false)
@@ -894,13 +1067,21 @@ fn resolve_relation(
         ));
     }
     if options.direction != Direction::Incoming {
-        streams.push("refs WHERE source=?1 AND resolved_target IS NULL".into());
+        streams.push(
+            match layout {
+                StorageLayout::Legacy => "refs WHERE source=?1 AND resolved_target IS NULL",
+                StorageLayout::Compact => {
+                    "refs WHERE source_key=?1 AND resolved_target_key IS NULL"
+                }
+            }
+            .into(),
+        );
     }
     // Exact relation probes use directional relation indexes even for huge hubs.
     for stream in &streams {
         if conn.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM {stream} AND relation=?2)"),
-            params![id, text],
+            params![identity, text],
             |r| r.get::<_, bool>(0),
         )? {
             return Ok(text.to_owned());
@@ -924,7 +1105,7 @@ fn resolve_relation(
         let mut next = conn.prepare(&format!(
             "SELECT relation FROM {stream} AND relation>?2 ORDER BY relation LIMIT 1"
         ))?;
-        let mut relation: Option<String> = first.query_row([id], |r| r.get(0)).optional()?;
+        let mut relation: Option<String> = first.query_row([&identity], |r| r.get(0)).optional()?;
         while let Some(name) = relation {
             ensure!(
                 examined < MAX_EXAMINED && start.elapsed() < Duration::from_secs(2),
@@ -953,7 +1134,9 @@ fn resolve_relation(
                     tiers[tier].pop_last();
                 }
             }
-            relation = next.query_row(params![id, name], |r| r.get(0)).optional()?;
+            relation = next
+                .query_row(params![identity, name], |r| r.get(0))
+                .optional()?;
         }
     }
     let matches = tiers
@@ -1067,62 +1250,41 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
         filters.push_str(" AND n.file=?");
         values.push(source_path(conn, file)?.into());
     }
-    // FTS token candidates cannot prove completeness for literal substrings,
-    // punctuation or Unicode normalization. Stream only endpoint fields, keep
-    // two IDs per tier, and never claim uniqueness from an incomplete scan.
-    // The catalog budget is independent of the number of traversed edges.
-    let sql = format!(
-        "SELECT n.id,n.label,n.qualified_name FROM nodes n WHERE 1=1{filters}
-        ORDER BY n.id LIMIT {}",
-        MAX_RANK_POSTINGS + 1
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-    let mut tiers: [Vec<String>; 3] = Default::default();
-    let start = Instant::now();
-    let mut bytes = 0;
-    let mut examined = 0;
-    while let Some(row) = rows.next()? {
-        ensure!(
-            examined < MAX_RANK_POSTINGS && start.elapsed() < Duration::from_secs(2),
-            "endpoint lookup exceeded its work/time budget; use an exact ID or a smaller file/kind scope"
+    // V5 stores NFKC spellings plus an explicit NFKD/accent-folded companion,
+    // making ASCII exact/prefix candidates complete. First bound the global
+    // FTS input, then keep the independent filtered endpoint-field budget.
+    let fts_safe = term.len() >= 3
+        && term.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && enriched_search_index(conn)?
+        && within_endpoint_fts_bounds(conn)?
+        && within_endpoint_bounds(conn, &filters, &values)?;
+    let mut tiers = if fts_safe {
+        let expression = format!("\"{term}\"*");
+        let mut fts_values = vec![expression.into()];
+        fts_values.extend(values.iter().cloned());
+        let fts_sql = format!(
+            "SELECT n.id,n.label,n.qualified_name
+             FROM node_search CROSS JOIN nodes n ON n.rowid=node_search.rowid
+             WHERE node_search MATCH ?{filters} ORDER BY n.id"
         );
-        examined += 1;
-        let id: &str = row.get_ref(0)?.as_str()?;
-        let label: &str = row.get_ref(1)?.as_str()?;
-        let qualified: Option<&str> = row.get_ref(2)?.as_str_or_null()?;
-        // Normalization runs outside SQLite's VM guard. Bound its input too,
-        // before allocating strings for arbitrarily long imported identifiers.
-        let record_bytes = id.len() + label.len() + qualified.map_or(0, str::len);
-        bytes += record_bytes;
-        ensure!(
-            record_bytes <= MAX_SEARCH_BYTES && bytes <= MAX_RANK_BYTES,
-            "endpoint lookup exceeded its normalization byte budget; use an exact ID or a smaller file/kind scope"
-        );
-        let normalized = [
-            normalize(id),
-            normalize(label),
-            normalize(qualified.unwrap_or("")),
-        ];
-        let tier = if normalized.iter().any(|s| s == &term) || normalized[1] == callable {
-            Some(0)
-        } else if normalized.iter().any(|s| s.starts_with(&term)) {
-            Some(1)
-        } else if normalized.iter().any(|s| s.contains(&term)) {
-            Some(2)
+        let fts_tiers = scan_endpoint_rows(conn, &fts_sql, &fts_values, &term, &callable)?;
+        if fts_tiers[0].is_empty() && fts_tiers[1].is_empty() {
+            // Tokenization cannot prove arbitrary literal substrings, so keep
+            // the complete endpoint scan when no exact/prefix tier was found.
+            [Vec::new(), Vec::new(), Vec::new()]
         } else {
-            None
-        };
-        if let Some(tier) = tier
-            && tiers[tier].len() < 2
-        {
-            tiers[tier].push(id.to_owned());
+            fts_tiers
         }
-        // Two best-tier matches already prove ambiguity. Lower tiers must wait
-        // for the complete scan because a better match may occur later.
-        if tiers[0].len() == 2 {
-            break;
-        }
+    } else {
+        [Vec::new(), Vec::new(), Vec::new()]
+    };
+    if tiers[0].is_empty() && tiers[1].is_empty() {
+        let sql = format!(
+            "SELECT n.id,n.label,n.qualified_name FROM nodes n WHERE 1=1{filters}
+            ORDER BY n.id LIMIT {}",
+            MAX_RANK_POSTINGS + 1
+        );
+        tiers = scan_endpoint_rows(conn, &sql, &values, &term, &callable)?;
     }
     let ids = tiers
         .into_iter()
@@ -1172,14 +1334,18 @@ fn impact_seeds(
     }
     let mut seen: BTreeSet<_> = seeds.iter().map(|n| n.id.clone()).collect();
     let mut cursor = 0;
+    let layout = storage_layout(conn)?;
     // Only descendants of the original seeds are added here. Dependencies
     // discovered by the later reverse walk never expand their own members.
     'members: while cursor < seeds.len() && examined < MAX_EXAMINED {
-        let mut stmt = conn.prepare(
-            "SELECT target FROM edges WHERE source=?1
-            AND relation IN ('contains','method','defines') ORDER BY id LIMIT ?2",
-        )?;
-        let mut rows = stmt.query(params![seeds[cursor].id, (MAX_EXAMINED - examined) as i64])?;
+        let identity = node_identity(conn, layout, &seeds[cursor].id)?;
+        let mut stmt = conn.prepare(match layout {
+            StorageLayout::Legacy => "SELECT target FROM edges WHERE source=?1
+                AND relation IN ('contains','method','defines') ORDER BY id LIMIT ?2",
+            StorageLayout::Compact => "SELECT n.id FROM edges e JOIN nodes n ON n.nkey=e.target_key
+                WHERE e.source_key=?1 AND e.relation IN ('contains','method','defines') ORDER BY e.id LIMIT ?2",
+        })?;
+        let mut rows = stmt.query(params![identity, (MAX_EXAMINED - examined) as i64])?;
         cursor += 1;
         while let Some(row) = rows.next()? {
             examined += 1;
@@ -1693,6 +1859,7 @@ fn close_edges(
 ) -> Result<()> {
     let ids: BTreeSet<_> = output.graph.nodes.iter().map(|n| n.id.clone()).collect();
     let mut edge_ids: BTreeSet<_> = output.graph.edges.iter().map(|e| e.id.clone()).collect();
+    let layout = storage_layout(conn)?;
     for id in &ids {
         if *examined == MAX_EXAMINED {
             truncate(output, "work_limit");
@@ -1700,8 +1867,12 @@ fn close_edges(
         }
         // Outgoing storage stream visits every induced edge only once, including
         // undirected edges, mutual arcs, parallel relations and self loops.
-        let mut sql = "SELECT payload FROM edges WHERE source=?".to_owned();
-        let mut values: Vec<rusqlite::types::Value> = vec![id.clone().into()];
+        let mut sql = match layout {
+            StorageLayout::Legacy => "SELECT payload FROM edges WHERE source=?",
+            StorageLayout::Compact => "SELECT payload FROM edges WHERE source_key=?",
+        }
+        .to_owned();
+        let mut values = vec![node_identity(conn, layout, id)?];
         if let Some(relation) = &options.graph.relation {
             sql.push_str(" AND relation=?");
             values.push(relation.clone().into());
@@ -1741,15 +1912,17 @@ fn collect_unresolved(
         return Ok(());
     }
     let ids: Vec<_> = output.graph.nodes.iter().map(|n| n.id.clone()).collect();
+    let layout = storage_layout(conn)?;
     for id in ids {
         if *examined == MAX_EXAMINED {
             truncate(output, "work_limit");
             break;
         }
-        let mut sql =
-            "SELECT payload,resolution_reason FROM refs WHERE source=? AND resolved_target IS NULL"
-                .to_owned();
-        let mut values: Vec<rusqlite::types::Value> = vec![id.into()];
+        let mut sql = match layout {
+            StorageLayout::Legacy => "SELECT payload,resolution_reason FROM refs WHERE source=? AND resolved_target IS NULL",
+            StorageLayout::Compact => "SELECT payload,resolution_reason FROM refs WHERE source_key=? AND resolved_target_key IS NULL",
+        }.to_owned();
+        let mut values = vec![node_identity(conn, layout, &id)?];
         if let Some(relation) = &options.graph.relation {
             sql.push_str(" AND relation=?");
             values.push(relation.clone().into());
@@ -1904,6 +2077,108 @@ pub(crate) fn path_extended(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_fts_requires_bounded_global_prose_and_known_projection() -> Result<()> {
+        use crate::store::Store;
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        // Same endpoint and scope: small/just-under-cap input uses FTS, while
+        // excess prose must bypass it even when the prose belongs to another file.
+        for (version, repetitions, prose_file, fast) in [
+            (5, 0, "near.rs", true),
+            (5, 838_840, "near.rs", true),
+            (5, 840_000, "near.rs", false),
+            (5, 840_000, "far.rs", false),
+            (6, 0, "near.rs", false),
+        ] {
+            let make_node = |id: &str, label: &str, file: &str, metadata| Node {
+                id: id.into(),
+                label: label.into(),
+                kind: "function".into(),
+                file: file.into(),
+                line: None,
+                end_line: None,
+                qualified_name: None,
+                binding_key: None,
+                metadata,
+            };
+            let dir = tempfile::tempdir()?;
+            let mut store = Store::create(&dir.path().join("graph.db"))?;
+            store.import_graph(ImportedGraph {
+                nodes: vec![
+                    make_node("a", "Coder", "near.rs", serde_json::Value::Null),
+                    make_node(
+                        "b",
+                        "Other",
+                        prose_file,
+                        serde_json::json!({"description": "code ".repeat(repetitions)}),
+                    ),
+                ],
+                edges: vec![],
+                metadata: serde_json::Value::Null,
+            })?;
+            store
+                .conn
+                .execute("UPDATE metadata SET search_version=?", [version])?;
+            let source_bytes: i64 = store.conn.query_row(
+                "SELECT sum(length(CAST(search AS BLOB))) FROM nodes",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(source_bytes <= 8 * 1024 * 1024, repetitions < 840_000);
+            let accessed = Arc::new(AtomicBool::new(false));
+            let observed = accessed.clone();
+            store
+                .conn
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Read {
+                            table_name: "node_search",
+                            ..
+                        }
+                    ) {
+                        observed.store(true, Ordering::Relaxed);
+                        if !fast {
+                            return Authorization::Deny;
+                        }
+                    }
+                    Authorization::Allow
+                }))?;
+            assert_eq!(
+                store
+                    .resolve_endpoint("near.rs::cod", &SearchOptions::default())?
+                    .id,
+                "a"
+            );
+            assert_eq!(accessed.load(Ordering::Relaxed), fast);
+            assert_eq!(
+                store.resolve_endpoint("a", &SearchOptions::default())?.id,
+                "a"
+            );
+            assert_eq!(store.stats()?.nodes, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_fts_global_node_cap_includes_every_record() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE nodes(search TEXT NOT NULL);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50000)
+             INSERT INTO nodes SELECT 'x' FROM n;",
+        )?;
+        assert!(within_endpoint_fts_bounds(&conn)?);
+        conn.execute("INSERT INTO nodes VALUES('x')", [])?;
+        assert!(!within_endpoint_fts_bounds(&conn)?);
+        Ok(())
+    }
 
     #[test]
     fn common_term_search_does_not_invoke_corpus_ranking() -> Result<()> {

@@ -693,6 +693,114 @@ fn index_updates_forwarded_targets_removal_and_body_only_edits() {
 }
 
 #[test]
+fn incremental_submodule_fallback_eligibility_matches_fresh_index() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join(".graf/index.db");
+    let fresh_db = dir.path().join(".graf/fresh.db");
+    fs::create_dir(dir.path().join("pkg")).unwrap();
+    let package = dir.path().join("pkg/__init__.py");
+    let child = dir.path().join("pkg/child.py");
+    fs::write(dir.path().join("helper.py"), "def marker(): pass\n").unwrap();
+    fs::write(&package, "from helper import marker\n").unwrap();
+    fs::write(dir.path().join("consumer.py"), "from pkg import child\n").unwrap();
+    fs::write(dir.path().join("unrelated.py"), "def keep(): return 1\n").unwrap();
+    index::run(dir.path(), &db).unwrap();
+    let unrelated = || {
+        let graph = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+        serde_json::to_value(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.file == "unrelated.py")
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let original_unrelated = unrelated();
+    let graph_facts = |db: &std::path::Path| {
+        let mut graph = Store::open_read_only(db).unwrap().snapshot().unwrap();
+        graph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        graph.edges.sort_by(|a, b| a.id.cmp(&b.id));
+        serde_json::to_value((graph.nodes, graph.edges)).unwrap()
+    };
+    let mut previous_target = None;
+    for (package_source, child_present, target) in [
+        ("child = None\n", true, None),
+        (
+            "from helper import marker as child\n",
+            true,
+            Some(("helper.py", "function")),
+        ),
+        ("", true, Some(("pkg/child.py", "module"))),
+        ("child = None\n", true, None),
+        (
+            "from helper import marker as child\n",
+            true,
+            Some(("helper.py", "function")),
+        ),
+        ("", false, None),
+        ("", true, Some(("pkg/child.py", "module"))),
+    ] {
+        fs::write(&package, package_source).unwrap();
+        if child_present {
+            fs::write(&child, "pass\n").unwrap();
+        } else {
+            fs::remove_file(&child).unwrap();
+        }
+        assert_eq!(
+            index::check_update(dir.path(), &db)
+                .unwrap()
+                .changed
+                .contains(&"consumer.py".into()),
+            target != previous_target,
+            "consumer invalidation: {package_source:?}, child={child_present}"
+        );
+        index::run(dir.path(), &db).unwrap();
+        index::run_with_options(
+            dir.path(),
+            &fresh_db,
+            &index::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            graph_facts(&db),
+            graph_facts(&fresh_db),
+            "{package_source:?}, child={child_present}"
+        );
+        for database in [&db, &fresh_db] {
+            let imports = Store::open_read_only(database)
+                .unwrap()
+                .neighbors(
+                    "python:consumer.py:module",
+                    &QueryOptions {
+                        direction: Direction::Outgoing,
+                        relation: Some("imports".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(imports.edges.len(), usize::from(target.is_some()));
+            assert_eq!(imports.unresolved.len(), usize::from(target.is_none()));
+            if let Some((file, kind)) = target {
+                let edge = &imports.edges[0];
+                assert!(
+                    imports.nodes.iter().any(|node| node.id == edge.target
+                        && node.file == file
+                        && node.kind == kind)
+                );
+            }
+        }
+        assert_eq!(unrelated(), original_unrelated);
+        assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
+        assert!(index::check_update(dir.path(), &db).unwrap().fresh);
+        previous_target = target;
+    }
+}
+
+#[test]
 fn configured_source_roots_reject_ambiguous_forwarding_and_restore_after_removal() {
     let dir = tempdir().unwrap();
     fs::create_dir_all(dir.path().join("one/pkg")).unwrap();
@@ -2047,6 +2155,18 @@ fn receiver_missing_member_collision_refreshes_only_on_binding_changes() {
     fs::write(dir.path().join("unrelated.py"), unrelated).unwrap();
     let db = dir.path().join(".graf/index.db");
     index::run(dir.path(), &db).unwrap();
+    let unrelated_nodes = || {
+        let graph = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+        serde_json::to_value(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.file == "unrelated.py")
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let original_unrelated = unrelated_nodes();
     assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
     assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
     let baseline = PythonContext::from_facts(&inventory(&[
@@ -2055,7 +2175,7 @@ fn receiver_missing_member_collision_refreshes_only_on_binding_changes() {
     ]));
     let mut collision_fingerprint = None;
     for (source, parsed, unchanged) in [
-        ("def work(): return 9\n", 3, 0),
+        ("def work(): return 9\n", 2, 1),
         ("def work(): return 10\n", 1, 2),
     ] {
         fs::write(&decoy, source).unwrap();
@@ -2076,15 +2196,18 @@ fn receiver_missing_member_collision_refreshes_only_on_binding_changes() {
         let update = index::run(dir.path(), &db).unwrap();
         assert_eq!(update.parsed_files, parsed);
         assert_eq!(update.unchanged_files, unchanged);
+        assert_eq!(unrelated_nodes(), original_unrelated);
         assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
         assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
     }
     fs::remove_file(&decoy).unwrap();
     let update = index::run(dir.path(), &db).unwrap();
     assert_eq!(
-        update.parsed_files, 2,
+        update.parsed_files, 1,
         "removing the collision restores the terminal lookup"
     );
+    assert_eq!(update.unchanged_files, 1);
+    assert_eq!(unrelated_nodes(), original_unrelated);
     assert!(receiver_call_pairs(&Store::open(&db).unwrap().snapshot().unwrap()).is_empty());
     assert_eq!(index::run(dir.path(), &db).unwrap().parsed_files, 0);
     fs::write(&model, actual).unwrap();

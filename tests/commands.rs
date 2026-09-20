@@ -105,6 +105,19 @@ fn leiden_cli_flags_report_their_budget_and_leave_the_store_unchanged() {
     let s = Sandbox::new();
     let db = s.db("source", "example");
     let before = fs::read(&db).unwrap();
+    let defaults = s.ok(&["--json", "--db", string(&db), "analyze"]);
+    assert_eq!(defaults["community_pass_unit"], "leiden_iterations");
+    assert_eq!(defaults["community_convergence_known"], false);
+    let legacy = s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-algorithm",
+        "louvain",
+    ]);
+    assert_eq!(legacy["community_pass_unit"], "louvain_sweeps");
+    assert_eq!(legacy["community_convergence_known"], true);
     let report = s.ok(&[
         "--json",
         "--db",

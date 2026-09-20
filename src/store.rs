@@ -1,10 +1,28 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 use unicode_normalization::UnicodeNormalization;
 
 const APPLICATION_ID: i64 = 0x47524146;
+const SEARCH_VERSION: i64 = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageLayout {
+    Legacy,
+    Compact,
+}
+
+// Physical layout is independent of the public graph/snapshot schema. Call
+// inside the operation's transaction so an existing reader keeps its layout.
+pub(crate) fn storage_layout(conn: &Connection) -> Result<StorageLayout> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        1 => Ok(StorageLayout::Legacy),
+        2 => Ok(StorageLayout::Compact),
+        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1 or 2"),
+    }
+}
 
 pub struct Store {
     pub(crate) conn: Connection,
@@ -19,61 +37,113 @@ CREATE TABLE metadata (
 );
 INSERT INTO metadata VALUES (1, 0, 'empty', NULL,
  '{"supported_files":0,"unsupported_files":0,"unchanged_files":0}', 'null');
-CREATE TABLE files (
-    path TEXT PRIMARY KEY, hash TEXT NOT NULL, module TEXT NOT NULL, diagnostics TEXT NOT NULL
+"#;
+
+// The same tables serve fresh stores and transactional upgrades. Temporary
+// names let the old parents and their children coexist while foreign keys stay on.
+const COMPACT_TABLES: &str = r#"
+CREATE TABLE compact_files (
+    fkey INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+    hash TEXT NOT NULL, module TEXT NOT NULL, diagnostics TEXT NOT NULL
 );
-CREATE TABLE nodes (
-    id TEXT PRIMARY KEY, label TEXT NOT NULL, qualified_name TEXT, binding_key TEXT,
-    file TEXT NOT NULL, owner_file TEXT REFERENCES files(path) ON DELETE CASCADE,
+CREATE TABLE compact_nodes (
+    nkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL, qualified_name TEXT, binding_key TEXT,
+    file TEXT NOT NULL, owner_key INTEGER REFERENCES compact_files(fkey) ON DELETE CASCADE,
     payload TEXT NOT NULL, search TEXT NOT NULL
 );
-CREATE INDEX nodes_label ON nodes(label, id);
-CREATE INDEX nodes_qualified ON nodes(qualified_name, id);
-CREATE INDEX nodes_binding ON nodes(binding_key, id);
-CREATE INDEX nodes_file ON nodes(file, id);
-CREATE INDEX nodes_owner ON nodes(owner_file);
-CREATE VIRTUAL TABLE node_search USING fts5(text);
-CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
-    INSERT INTO node_search(rowid, text) VALUES(new.rowid, new.search);
-END;
-CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
-    DELETE FROM node_search WHERE rowid = old.rowid;
-END;
-CREATE TABLE refs (
-    id TEXT PRIMARY KEY, source TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    owner_file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+CREATE TABLE compact_refs (
+    rkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    source_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
+    owner_key INTEGER NOT NULL REFERENCES compact_files(fkey) ON DELETE CASCADE,
     relation TEXT NOT NULL, payload TEXT NOT NULL,
-    resolved_target TEXT, resolution_reason TEXT NOT NULL
+    resolved_target_key INTEGER, resolution_reason TEXT NOT NULL
 );
-CREATE INDEX refs_source ON refs(source, id);
-CREATE INDEX refs_owner ON refs(owner_file);
-CREATE INDEX refs_unresolved_source ON refs(source, id) WHERE resolved_target IS NULL;
-CREATE INDEX refs_unresolved_relation ON refs(source, relation, id) WHERE resolved_target IS NULL;
-CREATE TABLE ref_keys (
-    ref_id TEXT NOT NULL REFERENCES refs(id) ON DELETE CASCADE,
+CREATE TABLE compact_ref_keys (
+    ref_key INTEGER NOT NULL REFERENCES compact_refs(rkey) ON DELETE CASCADE,
     priority INTEGER NOT NULL, binding_key TEXT NOT NULL,
-    PRIMARY KEY(ref_id, priority)
-);
-CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_id);
-CREATE TABLE edges (
+    PRIMARY KEY(ref_key, priority)
+) WITHOUT ROWID;
+CREATE TABLE compact_node_aliases (
+    node_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
+    binding_key TEXT NOT NULL, PRIMARY KEY(node_key, binding_key)
+) WITHOUT ROWID;
+CREATE TABLE compact_edges (
     id TEXT PRIMARY KEY,
-    source TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    target TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    source_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
+    target_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
     relation TEXT NOT NULL, directed INTEGER NOT NULL CHECK(directed IN (0, 1)),
-    owner_file TEXT REFERENCES files(path) ON DELETE CASCADE,
-    ref_id TEXT UNIQUE REFERENCES refs(id) ON DELETE CASCADE,
+    owner_key INTEGER REFERENCES compact_files(fkey) ON DELETE CASCADE,
+    ref_key INTEGER UNIQUE REFERENCES compact_refs(rkey) ON DELETE CASCADE,
     payload TEXT NOT NULL
 );
-CREATE INDEX edges_source ON edges(source, id);
-CREATE INDEX edges_target ON edges(target, id);
-CREATE INDEX edges_source_relation ON edges(source, relation, id);
-CREATE INDEX edges_target_relation ON edges(target, relation, id);
-CREATE INDEX edges_source_direction ON edges(source, directed, id);
-CREATE INDEX edges_target_direction ON edges(target, directed, id);
-CREATE INDEX edges_source_direction_relation ON edges(source, directed, relation, id);
-CREATE INDEX edges_target_direction_relation ON edges(target, directed, relation, id);
-CREATE INDEX edges_owner ON edges(owner_file);
 "#;
+
+const COMPACT_PUBLISH: &str = r#"
+ALTER TABLE compact_files RENAME TO files;
+ALTER TABLE compact_nodes RENAME TO nodes;
+ALTER TABLE compact_refs RENAME TO refs;
+ALTER TABLE compact_ref_keys RENAME TO ref_keys;
+ALTER TABLE compact_node_aliases RENAME TO node_aliases;
+ALTER TABLE compact_edges RENAME TO edges;
+CREATE INDEX nodes_label ON nodes(label, id);
+CREATE INDEX nodes_file ON nodes(file, id);
+CREATE INDEX refs_source ON refs(source_key, id);
+CREATE INDEX refs_owner ON refs(owner_key);
+CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
+CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
+CREATE INDEX edges_source ON edges(source_key, id);
+CREATE INDEX edges_target ON edges(target_key, id);
+CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
+CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
+CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
+INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
+CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
+    INSERT INTO node_search(rowid,text) VALUES(new.nkey,new.search);
+END;
+CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
+    DELETE FROM node_search WHERE rowid=old.nkey;
+END;
+"#;
+
+// Shared by fresh databases and explicit-write migration; these indexes do
+// not change graph identity, payloads, or schema-1 snapshot compatibility.
+const STORAGE_INDICES: &[(&str, &str)] = &[
+    (
+        "nodes_qualified",
+        "CREATE INDEX nodes_qualified ON nodes(qualified_name, id) WHERE qualified_name IS NOT NULL",
+    ),
+    (
+        "nodes_binding",
+        "CREATE INDEX nodes_binding ON nodes(binding_key, id) WHERE binding_key IS NOT NULL",
+    ),
+    (
+        "nodes_owner",
+        "CREATE INDEX nodes_owner ON nodes(owner_key) WHERE owner_key IS NOT NULL",
+    ),
+    (
+        "edges_source_direction",
+        "CREATE INDEX edges_source_direction ON edges(source_key, id) WHERE directed=0",
+    ),
+    (
+        "edges_target_direction",
+        "CREATE INDEX edges_target_direction ON edges(target_key, id) WHERE directed=0",
+    ),
+    (
+        "edges_source_direction_relation",
+        "CREATE INDEX edges_source_direction_relation ON edges(source_key, relation, id) WHERE directed=0",
+    ),
+    (
+        "edges_target_direction_relation",
+        "CREATE INDEX edges_target_direction_relation ON edges(target_key, relation, id) WHERE directed=0",
+    ),
+    (
+        "edges_owner",
+        "CREATE INDEX edges_owner ON edges(owner_key) WHERE owner_key IS NOT NULL",
+    ),
+];
 
 /// A concurrent writer committed after this handle captured its baseline.
 #[derive(Debug)]
@@ -109,8 +179,11 @@ impl Store {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(COMPACT_TABLES)?;
+            tx.execute_batch(COMPACT_PUBLISH)?;
+            ensure_storage_indices(&tx)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
         validate(&conn)?;
@@ -184,13 +257,22 @@ impl Store {
 
     /// Short saved-graph topic labels for an explicitly configured transcription adapter.
     pub fn transcription_topics(&self) -> Result<Vec<String>> {
-        let mut statement = self.conn.prepare(
-            "WITH incidents AS (SELECT source AS id FROM edges UNION ALL SELECT target FROM edges),
-             degrees AS (SELECT id,count(*) AS degree FROM incidents GROUP BY id)
-             SELECT n.label FROM degrees d JOIN nodes n ON n.id=d.id
-             WHERE json_extract(n.payload,'$.kind') NOT IN ('file','module','document','group','rationale')
-             ORDER BY d.degree DESC,n.id LIMIT 64",
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        let sql = match storage_layout(&tx)? {
+            StorageLayout::Legacy =>
+                "WITH incidents AS (SELECT source AS id FROM edges UNION ALL SELECT target FROM edges),
+                 degrees AS (SELECT id,count(*) AS degree FROM incidents GROUP BY id)
+                 SELECT n.label FROM degrees d JOIN nodes n ON n.id=d.id
+                 WHERE json_extract(n.payload,'$.kind') NOT IN ('file','module','document','group','rationale')
+                 ORDER BY d.degree DESC,n.id LIMIT 64",
+            StorageLayout::Compact =>
+                "WITH incidents AS (SELECT source_key AS nkey FROM edges UNION ALL SELECT target_key FROM edges),
+                 degrees AS (SELECT nkey,count(*) AS degree FROM incidents GROUP BY nkey)
+                 SELECT n.label FROM degrees d JOIN nodes n ON n.nkey=d.nkey
+                 WHERE json_extract(n.payload,'$.kind') NOT IN ('file','module','document','group','rationale')
+                 ORDER BY d.degree DESC,n.id LIMIT 64",
+        };
+        let mut statement = tx.prepare(sql)?;
         let mut topics = Vec::new();
         let mut seen = BTreeSet::new();
         for label in statement.query_map([], |row| row.get::<_, String>(0))? {
@@ -207,6 +289,8 @@ impl Store {
                 }
             }
         }
+        drop(statement);
+        tx.commit()?;
         Ok(topics)
     }
 
@@ -239,6 +323,7 @@ impl Store {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
+        let layout = storage_layout(&tx)?;
         if let Some((max_nodes, max_edges, max_refs, max_bytes)) = limits {
             let mut total_bytes = metadata.len() as u64;
             for (sql, limit) in [
@@ -251,7 +336,14 @@ impl Store {
                     max_edges,
                 ),
                 (
-                    "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM refs WHERE resolved_target IS NULL",
+                    match layout {
+                        StorageLayout::Legacy => {
+                            "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM refs WHERE resolved_target IS NULL"
+                        }
+                        StorageLayout::Compact => {
+                            "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM refs WHERE resolved_target_key IS NULL"
+                        }
+                    },
                     max_refs,
                 ),
             ] {
@@ -271,7 +363,7 @@ impl Store {
                 // Charge a conservative JSON-escaped representation before
                 // loading source proof. Empty files without nodes add nothing.
                 let proof_bytes: i64 = tx.query_row(
-                    "SELECT COALESCE(SUM(length(CAST(path AS BLOB))*6+length(CAST(hash AS BLOB))+100),0) FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path)",
+                    match layout { StorageLayout::Legacy => "SELECT COALESCE(SUM(length(CAST(path AS BLOB))*6+length(CAST(hash AS BLOB))+100),0) FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path)", StorageLayout::Compact => "SELECT COALESCE(SUM(length(CAST(path AS BLOB))*6+length(CAST(hash AS BLOB))+100),0) FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_key=files.fkey)" },
                     [], |row| row.get(0),
                 )?;
                 total_bytes = total_bytes
@@ -290,7 +382,14 @@ impl Store {
         if kind == "native" {
             let references: Vec<Reference> = read_payloads(
                 &tx,
-                "SELECT payload FROM refs WHERE resolved_target IS NULL ORDER BY id",
+                match layout {
+                    StorageLayout::Legacy => {
+                        "SELECT payload FROM refs WHERE resolved_target IS NULL ORDER BY id"
+                    }
+                    StorageLayout::Compact => {
+                        "SELECT payload FROM refs WHERE resolved_target_key IS NULL ORDER BY id"
+                    }
+                },
             )?;
             if metadata.is_null() {
                 metadata = serde_json::json!({});
@@ -304,7 +403,7 @@ impl Store {
                 );
             let mut files = serde_json::Map::new();
             let mut statement = tx.prepare(
-                "SELECT path,hash FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path) ORDER BY path",
+                match layout { StorageLayout::Legacy => "SELECT path,hash FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_file=files.path) ORDER BY path", StorageLayout::Compact => "SELECT path,hash FROM files WHERE EXISTS(SELECT 1 FROM nodes WHERE owner_key=files.fkey) ORDER BY path" },
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -336,6 +435,7 @@ impl Store {
 
     pub(crate) fn semantic_losses(&self, changed: &[FileFacts]) -> Result<Vec<String>> {
         let tx = self.conn.unchecked_transaction()?;
+        let layout = storage_layout(&tx)?;
         let mut losses = Vec::new();
         for facts in changed {
             // A managed source's capture key stays stable when its display name changes.
@@ -348,11 +448,25 @@ impl Store {
             let mut old_edges = 0;
             for (query, count) in [
                 (
-                    "SELECT payload FROM nodes WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)",
+                    match layout {
+                        StorageLayout::Legacy => {
+                            "SELECT payload FROM nodes WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)"
+                        }
+                        StorageLayout::Compact => {
+                            "SELECT payload FROM nodes WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) OR owner_key IN (SELECT fkey FROM files WHERE path GLOB ?2)"
+                        }
+                    },
                     &mut old_nodes,
                 ),
                 (
-                    "SELECT payload FROM edges WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)",
+                    match layout {
+                        StorageLayout::Legacy => {
+                            "SELECT payload FROM edges WHERE owner_file=?1 OR owner_file IN (SELECT path FROM files WHERE path GLOB ?2)"
+                        }
+                        StorageLayout::Compact => {
+                            "SELECT payload FROM edges WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) OR owner_key IN (SELECT fkey FROM files WHERE path GLOB ?2)"
+                        }
+                    },
                     &mut old_edges,
                 ),
             ] {
@@ -428,9 +542,8 @@ impl Store {
             );
         }
         let mut keys = BTreeSet::new();
-        ensure_aliases(&tx, &mut keys)?;
+        let search_migrated = ensure_compact_storage(&tx, &mut keys)?;
         let aliases_migrated = !keys.is_empty();
-        let search_migrated = ensure_search(&tx)?;
         let mut metadata: serde_json::Value = serde_json::from_str(&tx.query_row(
             "SELECT graph_metadata FROM metadata WHERE singleton=1",
             [],
@@ -464,7 +577,7 @@ impl Store {
         if !ruby_changed {
             for path in &replaced {
                 ruby_changed = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_file=?1 AND json_extract(payload,'$.metadata.language')='ruby')",
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) AND json_extract(payload,'$.metadata.language')='ruby')",
                     [path], |row| row.get(0),
                 )?;
                 if ruby_changed {
@@ -475,8 +588,9 @@ impl Store {
         let mut incoming = Vec::new();
         for facts in &changed {
             let mut stmt = tx.prepare(
-                "SELECT e.payload,e.owner_file FROM nodes n JOIN edges e ON e.target=n.id
-                 WHERE n.owner_file=?1 AND e.ref_id IS NULL AND e.owner_file IS NOT NULL",
+                "SELECT e.payload,f.path FROM nodes n JOIN edges e ON e.target_key=n.nkey
+                 JOIN files f ON f.fkey=e.owner_key
+                 WHERE n.owner_key=(SELECT fkey FROM files WHERE path=?1) AND e.ref_key IS NULL",
             )?;
             for row in stmt.query_map([&facts.path], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -490,8 +604,8 @@ impl Store {
         let mut removed = 0;
         for path in deleted.iter().chain(changed.iter().map(|f| &f.path)) {
             let mut stmt = tx.prepare(
-                "SELECT binding_key FROM nodes WHERE owner_file=?1 AND binding_key IS NOT NULL
-                 UNION SELECT a.binding_key FROM node_aliases a JOIN nodes n ON n.id=a.node_id WHERE n.owner_file=?1",
+                "SELECT binding_key FROM nodes WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) AND binding_key IS NOT NULL
+                 UNION SELECT a.binding_key FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key WHERE n.owner_key=(SELECT fkey FROM files WHERE path=?1)",
             )?;
             for key in stmt.query_map([path], |r| r.get::<_, String>(0))? {
                 keys.insert(key?);
@@ -521,7 +635,7 @@ impl Store {
                 for alias in binding_aliases(node)? {
                     keys.insert(alias.to_owned());
                     tx.execute(
-                        "INSERT OR IGNORE INTO node_aliases(node_id,binding_key) VALUES(?1,?2)",
+                        "INSERT INTO node_aliases(node_key,binding_key) VALUES((SELECT nkey FROM nodes WHERE id=?1),?2) ON CONFLICT(node_key,binding_key) DO NOTHING",
                         params![node.id, alias],
                     )?;
                 }
@@ -543,11 +657,11 @@ impl Store {
                 insert_edge(&tx, edge, Some(&facts.path), None)?;
             }
             for reference in &facts.references {
-                tx.execute("INSERT INTO refs(id,source,owner_file,relation,payload,resolved_target,resolution_reason) VALUES(?1,?2,?3,?4,?5,NULL,?6)",
+                tx.execute("INSERT INTO refs(id,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason) VALUES(?1,(SELECT nkey FROM nodes WHERE id=?2),(SELECT fkey FROM files WHERE path=?3),?4,?5,NULL,?6)",
                     params![reference.id, reference.source, facts.path, reference.relation, serde_json::to_string(reference)?, reference.reason])?;
                 for (priority, key) in reference.candidate_keys.iter().enumerate() {
                     tx.execute(
-                        "INSERT INTO ref_keys(ref_id,priority,binding_key) VALUES(?1,?2,?3)",
+                        "INSERT INTO ref_keys(ref_key,priority,binding_key) VALUES((SELECT rkey FROM refs WHERE id=?1),?2,?3)",
                         params![reference.id, priority as i64, key],
                     )?;
                 }
@@ -555,7 +669,7 @@ impl Store {
             }
         }
         for key in keys {
-            let mut stmt = tx.prepare("SELECT ref_id FROM ref_keys WHERE binding_key=?1")?;
+            let mut stmt = tx.prepare("SELECT r.id FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key WHERE k.binding_key=?1")?;
             for id in stmt.query_map([key], |r| r.get::<_, String>(0))? {
                 affected.insert(id?);
             }
@@ -568,16 +682,19 @@ impl Store {
             let context = crate::languages::scripted::RubyContext::from_nodes(&nodes);
             let references: Vec<Reference> = read_payloads(
                 &tx,
-                "SELECT r.payload FROM refs r JOIN nodes n ON n.id=r.source WHERE json_extract(n.payload,'$.metadata.language')='ruby' ORDER BY r.id",
+                "SELECT r.payload FROM refs r JOIN nodes n ON n.nkey=r.source_key WHERE json_extract(n.payload,'$.metadata.language')='ruby' ORDER BY r.id",
             )?;
             for reference in references {
                 let keys = context
                     .inherited_keys(&reference)
                     .unwrap_or_else(|| reference.candidate_keys.clone());
-                tx.execute("DELETE FROM ref_keys WHERE ref_id=?1", [&reference.id])?;
+                tx.execute(
+                    "DELETE FROM ref_keys WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1)",
+                    [&reference.id],
+                )?;
                 for (priority, key) in keys.iter().enumerate() {
                     tx.execute(
-                        "INSERT INTO ref_keys(ref_id,priority,binding_key) VALUES(?1,?2,?3)",
+                        "INSERT INTO ref_keys(ref_key,priority,binding_key) VALUES((SELECT rkey FROM refs WHERE id=?1),?2,?3)",
                         params![reference.id, priority as i64, key],
                     )?;
                 }
@@ -593,7 +710,8 @@ impl Store {
             |r| r.get::<_, String>(0),
         )?)?;
         // The unchanged count describes this scan, not a change in stored facts.
-        // Keep no-op scans read-only; coverage changes still publish a generation.
+        // Physical upgrades may write on a no-op scan; only logical changes
+        // (including coverage) publish a graph generation.
         let coverage_changed = previous_coverage.supported_files != coverage.supported_files
             || previous_coverage.unsupported_files != coverage.unsupported_files;
         let changed_generation = kind == "empty"
@@ -654,15 +772,17 @@ impl Store {
                 kind == "imported" && root.is_none(),
                 "refresh requires an imported snapshot without an index root"
             );
-            tx.execute("DELETE FROM edges", [])?;
-            tx.execute("DELETE FROM nodes", [])?;
         } else {
             ensure!(
                 kind == "empty" && root.is_none(),
                 "import requires an empty Graf database"
             );
         }
-        ensure_search(&tx)?;
+        ensure_compact_storage(&tx, &mut BTreeSet::new())?;
+        if refresh {
+            tx.execute("DELETE FROM edges", [])?;
+            tx.execute("DELETE FROM nodes", [])?;
+        }
         // Deletes, inserts, search triggers and generation advance commit as
         // one transaction. Any validation or SQL failure retains the old graph.
         for node in &graph.nodes {
@@ -742,16 +862,14 @@ fn connect_with_setup(
 }
 
 fn validate(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let conn = &tx;
     let app: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
     ensure!(
         app == APPLICATION_ID,
         "not a Graf database; refusing unrelated database"
     );
-    let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        version == SCHEMA_VERSION,
-        "unsupported Graf schema version {version}; expected {SCHEMA_VERSION}"
-    );
+    let layout = storage_layout(conn)?;
     let kind: String = conn.query_row("SELECT kind FROM metadata WHERE singleton=1", [], |r| {
         r.get(0)
     })?;
@@ -760,8 +878,12 @@ fn validate(conn: &Connection) -> Result<()> {
         "invalid Graf database kind"
     );
     // Prepare without scanning or writing. An incomplete schema is not usable.
-    conn.prepare("SELECT n.payload,e.payload,r.payload,k.priority,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0")?;
+    conn.prepare(match layout {
+        StorageLayout::Legacy => "SELECT n.payload,n.owner_file,e.payload,e.source,e.target,e.owner_file,e.ref_id,r.payload,r.source,r.owner_file,r.resolved_target,k.ref_id,k.priority,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
+        StorageLayout::Compact => "SELECT n.nkey,n.payload,n.owner_key,e.payload,e.source_key,e.target_key,e.owner_key,e.ref_key,r.rkey,r.payload,r.source_key,r.owner_key,r.resolved_target_key,k.ref_key,k.priority,f.fkey,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
+    })?;
     conn.prepare("SELECT rowid FROM node_search LIMIT 0")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -819,30 +941,148 @@ fn binding_aliases(node: &Node) -> Result<Vec<&str>> {
         .collect()
 }
 
-// Additive schema-1 extension: opening/querying old stores never migrates them.
-// Explicit indexing installs and backfills this derived index transactionally.
+// Only called inside an explicit write transaction, after its generation/kind
+// checks (or during creation). Index replacement rolls back with the graph on
+// failure and does not advance the logical graph generation on its own.
+fn ensure_storage_indices(tx: &Transaction<'_>) -> Result<()> {
+    for &(name, sql) in STORAGE_INDICES {
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(sql) {
+            // Names and definitions are static, never user-provided SQL.
+            tx.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {sql};"))?;
+        }
+    }
+    Ok(())
+}
+
+// Called only after the immediate transaction's baseline/kind/root checks.
+// Return projection changes separately: physical-only upgrades do not publish
+// a new graph generation. Backfilled aliases must reach the caller's rebind set.
+fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<bool> {
+    let layout = storage_layout(tx)?;
+    // Legacy replacement builds FTS once, after the copied nodes are published.
+    let search_changed = ensure_search(tx, layout == StorageLayout::Compact)?;
+    if layout == StorageLayout::Legacy {
+        let aliases: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_aliases')",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute_batch(COMPACT_TABLES)?;
+        tx.execute_batch(
+            "INSERT INTO compact_files(fkey,path,hash,module,diagnostics)
+                 SELECT rowid,path,hash,module,diagnostics FROM files;
+             INSERT INTO compact_nodes(nkey,id,label,qualified_name,binding_key,file,owner_key,payload,search)
+                 SELECT rowid,id,label,qualified_name,binding_key,file,
+                     (SELECT fkey FROM compact_files WHERE path=nodes.owner_file),payload,search FROM nodes;
+             INSERT INTO compact_refs(rkey,id,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason)
+                 SELECT rowid,id,(SELECT nkey FROM compact_nodes WHERE id=refs.source),
+                     (SELECT fkey FROM compact_files WHERE path=refs.owner_file),relation,payload,
+                     (SELECT nkey FROM compact_nodes WHERE id=refs.resolved_target),resolution_reason FROM refs;
+             INSERT INTO compact_ref_keys(ref_key,priority,binding_key)
+                 SELECT (SELECT rkey FROM compact_refs WHERE id=ref_keys.ref_id),priority,binding_key FROM ref_keys;
+             INSERT INTO compact_edges(id,source_key,target_key,relation,directed,owner_key,ref_key,payload)
+                 SELECT id,(SELECT nkey FROM compact_nodes WHERE id=edges.source),
+                     (SELECT nkey FROM compact_nodes WHERE id=edges.target),relation,directed,
+                     (SELECT fkey FROM compact_files WHERE path=edges.owner_file),
+                     (SELECT rkey FROM compact_refs WHERE id=edges.ref_id),payload FROM edges;",
+        )?;
+        if aliases {
+            tx.execute_batch(
+                "INSERT INTO compact_node_aliases(node_key,binding_key)
+                     SELECT (SELECT nkey FROM compact_nodes WHERE id=node_aliases.node_id),binding_key FROM node_aliases;",
+            )?;
+        }
+        for table in [
+            "files",
+            "nodes",
+            "refs",
+            "ref_keys",
+            "edges",
+            "node_aliases",
+        ] {
+            if table == "node_aliases" && !aliases {
+                continue;
+            }
+            let equal: bool = tx.query_row(
+                &format!(
+                    "SELECT (SELECT count(*) FROM {table})=(SELECT count(*) FROM compact_{table})"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            ensure!(equal, "storage upgrade row count mismatch for {table}");
+        }
+        // NOT NULL/FK constraints reject missing mandatory links. Optional
+        // links must distinguish a legitimate NULL from a failed lookup too.
+        for sql in [
+            "SELECT EXISTS(SELECT 1 FROM nodes o JOIN compact_nodes n ON n.nkey=o.rowid WHERE o.owner_file IS NOT NULL AND n.owner_key IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM refs o JOIN compact_refs r ON r.rkey=o.rowid WHERE o.resolved_target IS NOT NULL AND r.resolved_target_key IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM edges o JOIN compact_edges e ON e.id=o.id WHERE (o.owner_file IS NOT NULL AND e.owner_key IS NULL) OR (o.ref_id IS NOT NULL AND e.ref_key IS NULL))",
+        ] {
+            let missing: bool = tx.query_row(sql, [], |row| row.get(0))?;
+            ensure!(!missing, "storage upgrade cannot map an existing identity");
+        }
+        tx.execute_batch(
+            "DROP TRIGGER nodes_insert;
+             DROP TRIGGER nodes_delete;
+             DROP TABLE node_search;
+             DROP TABLE edges;
+             DROP TABLE ref_keys;
+             DROP TABLE IF EXISTS node_aliases;
+             DROP TABLE refs;
+             DROP TABLE nodes;
+             DROP TABLE files;",
+        )?;
+        tx.execute_batch(COMPACT_PUBLISH)?;
+        if !aliases {
+            backfill_aliases(tx, keys)?;
+        }
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        ensure!(violations == 0, "storage upgrade foreign key check failed");
+        tx.pragma_update(None, "user_version", 2)?;
+    }
+    ensure_aliases(tx, keys)?;
+    ensure_storage_indices(tx)?;
+    Ok(search_changed)
+}
+
 fn ensure_aliases(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<()> {
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_aliases')",
         [],
-        |r| r.get(0),
+        |row| row.get(0),
     )?;
-    if exists {
-        return Ok(());
+    if !exists {
+        tx.execute_batch(
+            "CREATE TABLE node_aliases (
+                node_key INTEGER NOT NULL REFERENCES nodes(nkey) ON DELETE CASCADE,
+                binding_key TEXT NOT NULL, PRIMARY KEY(node_key,binding_key)
+             ) WITHOUT ROWID;
+             CREATE INDEX node_aliases_binding ON node_aliases(binding_key,node_key);",
+        )?;
+        backfill_aliases(tx, keys)?;
     }
-    tx.execute_batch(
-        "CREATE TABLE node_aliases (
-        node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-        binding_key TEXT NOT NULL, PRIMARY KEY(node_id,binding_key)
-    ); CREATE INDEX node_aliases_binding ON node_aliases(binding_key,node_id);",
-    )?;
-    let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE owner_file IS NOT NULL")?;
-    for payload in stmt.query_map([], |r| r.get::<_, String>(0))? {
+    Ok(())
+}
+
+fn backfill_aliases(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<()> {
+    let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE owner_key IS NOT NULL")?;
+    for payload in stmt.query_map([], |row| row.get::<_, String>(0))? {
         let node: Node = serde_json::from_str(&payload?)?;
         for alias in binding_aliases(&node)? {
             keys.insert(alias.to_owned());
             tx.execute(
-                "INSERT OR IGNORE INTO node_aliases(node_id,binding_key) VALUES(?1,?2)",
+                "INSERT INTO node_aliases(node_key,binding_key) VALUES((SELECT nkey FROM nodes WHERE id=?1),?2) ON CONFLICT(node_key,binding_key) DO NOTHING",
                 params![node.id, alias],
             )?;
         }
@@ -852,7 +1092,7 @@ fn ensure_aliases(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<(
 
 // Search enrichment is another additive schema-1 extension. Migration runs
 // only during an explicit write, under the same transaction/generation check.
-fn ensure_search(tx: &Transaction<'_>) -> Result<bool> {
+fn ensure_search(tx: &Transaction<'_>, rebuild_fts: bool) -> Result<bool> {
     let has_version: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='search_version')",
         [],
@@ -869,36 +1109,64 @@ fn ensure_search(tx: &Transaction<'_>) -> Result<bool> {
         |r| r.get(0),
     )?;
     ensure!(
-        version <= 3,
+        version <= SEARCH_VERSION,
         "unsupported Graf search index version {version}"
     );
-    if version == 3 {
+    let packed: bool = tx.query_row(
+        "SELECT instr(sql,'contentless_delete=1')>0 FROM sqlite_master
+         WHERE type='table' AND name='node_search'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version == SEARCH_VERSION && (!rebuild_fts || packed) {
         return Ok(false);
     }
     let mut changed = false;
-    let mut stmt = tx.prepare("SELECT id,payload,search FROM nodes ORDER BY id")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let node: Node = serde_json::from_str(&row.get::<_, String>(1)?)?;
-        let search = search_text(&node);
-        if search != row.get::<_, String>(2)? {
-            tx.execute(
-                "UPDATE nodes SET search=?1 WHERE id=?2",
-                params![search, node.id],
-            )?;
-            changed = true;
+    if version != SEARCH_VERSION {
+        let mut stmt = tx.prepare("SELECT id,payload,search FROM nodes ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let node: Node = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            let search = search_text(&node);
+            if search != row.get::<_, String>(2)? {
+                tx.execute(
+                    "UPDATE nodes SET search=?1 WHERE id=?2",
+                    params![search, node.id],
+                )?;
+                changed = true;
+            }
         }
     }
-    drop(rows);
-    drop(stmt);
-    if changed {
-        tx.execute("DELETE FROM node_search", [])?;
+    if rebuild_fts && !packed {
+        // Contentless-delete FTS5 retains ordinary DELETE/INSERT semantics and
+        // positions/docsize, without another copy of nodes.search. Queries read
+        // only rowid/MATCH and fetch all public data from nodes.
+        tx.execute_batch(
+            "DROP TRIGGER nodes_insert;
+             DROP TRIGGER nodes_delete;
+             DROP TABLE node_search;
+             CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
+             CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
+                 INSERT INTO node_search(rowid,text) VALUES(new.rowid,new.search);
+             END;
+             CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
+                 DELETE FROM node_search WHERE rowid=old.rowid;
+             END;",
+        )?;
+    }
+    if rebuild_fts && (changed || !packed) {
+        if packed {
+            tx.execute("DELETE FROM node_search", [])?;
+        }
         tx.execute(
             "INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes",
             [],
         )?;
     }
-    tx.execute("UPDATE metadata SET search_version=3 WHERE singleton=1", [])?;
+    tx.execute(
+        "UPDATE metadata SET search_version=?1 WHERE singleton=1",
+        [SEARCH_VERSION],
+    )?;
     Ok(changed)
 }
 
@@ -971,6 +1239,18 @@ fn search_text(node: &Node) -> String {
         previous_lower = c.is_lowercase() || c.is_numeric();
         search.push(if c == '_' { ' ' } else { c });
     }
+    if spelling
+        .nfkd()
+        .any(unicode_normalization::char::is_combining_mark)
+    {
+        let folded: String = spelling
+            .nfkd()
+            .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+            .flat_map(char::to_lowercase)
+            .collect();
+        search.push(' ');
+        search.push_str(&folded);
+    }
     // Useful CJK recall without a dictionary or a query-side scan: preserve
     // full strings and index individual ideographs plus adjacent bigrams.
     let mut previous = None;
@@ -988,13 +1268,28 @@ fn search_text(node: &Node) -> String {
             previous = None;
         }
     }
-    // Retain the original spelling as well as identifier components.
-    format!("{text} {spelling} {search}")
+    // Retain the normalized spelling for exact identifier tokens, then the
+    // transformed form for camel-case and CJK recall. Literal callers of the
+    // original query API still need compatibility-form tokens when NFKC
+    // changes their spelling; ordinary text needs no duplicate raw copy.
+    if text == spelling {
+        format!("{spelling} {search}")
+    } else {
+        format!("{text} {spelling} {search}")
+    }
 }
 
 fn insert_node(conn: &Connection, node: &Node, owner: Option<&str>) -> Result<()> {
     ensure!(!node.id.is_empty(), "node ID cannot be empty");
-    conn.execute("INSERT INTO nodes(id,label,qualified_name,binding_key,file,owner_file,payload,search) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    let owner = owner
+        .map(|path| {
+            conn.query_row("SELECT fkey FROM files WHERE path=?1", [path], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .transpose()
+        .context("missing node owner")?;
+    conn.execute("INSERT INTO nodes(id,label,qualified_name,binding_key,file,owner_key,payload,search) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         params![node.id,node.label,node.qualified_name,node.binding_key,node.file,owner,serde_json::to_string(node)?,search_text(node)])?;
     Ok(())
 }
@@ -1006,7 +1301,23 @@ fn insert_edge(
     reference: Option<&str>,
 ) -> Result<()> {
     ensure!(!edge.id.is_empty(), "edge ID cannot be empty");
-    conn.execute("INSERT INTO edges(id,source,target,relation,directed,owner_file,ref_id,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    let owner = owner
+        .map(|path| {
+            conn.query_row("SELECT fkey FROM files WHERE path=?1", [path], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .transpose()
+        .context("missing edge owner")?;
+    let reference = reference
+        .map(|id| {
+            conn.query_row("SELECT rkey FROM refs WHERE id=?1", [id], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .transpose()
+        .context("missing edge reference")?;
+    conn.execute("INSERT INTO edges(id,source_key,target_key,relation,directed,owner_key,ref_key,payload) VALUES(?1,(SELECT nkey FROM nodes WHERE id=?2),(SELECT nkey FROM nodes WHERE id=?3),?4,?5,?6,?7,?8)",
         params![edge.id,edge.source,edge.target,edge.relation,edge.directed,owner,reference,serde_json::to_string(edge)?])?;
     Ok(())
 }
@@ -1015,7 +1326,10 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
     let payload: String =
         tx.query_row("SELECT payload FROM refs WHERE id=?1", [id], |r| r.get(0))?;
     let reference: Reference = serde_json::from_str(&payload)?;
-    tx.execute("DELETE FROM edges WHERE ref_id=?1", [id])?;
+    tx.execute(
+        "DELETE FROM edges WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1)",
+        [id],
+    )?;
     let mut target = None;
     let mut reason = if reference.reason.is_empty() {
         "no matching binding".to_owned()
@@ -1023,13 +1337,13 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
         reference.reason.clone()
     };
     let keys = tx
-        .prepare("SELECT binding_key FROM ref_keys WHERE ref_id=?1 ORDER BY priority")?
+        .prepare("SELECT binding_key FROM ref_keys WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1) ORDER BY priority")?
         .query_map([id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for key in &keys {
         let mut stmt = tx.prepare(
             "SELECT id FROM nodes WHERE binding_key=?1
-                        UNION SELECT node_id FROM node_aliases WHERE binding_key=?1
+                        UNION SELECT n.id FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key WHERE a.binding_key=?1
                         ORDER BY 1 LIMIT 2",
         )?;
         let ids = stmt
@@ -1049,7 +1363,7 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
         }
     }
     tx.execute(
-        "UPDATE refs SET resolved_target=?1,resolution_reason=?2 WHERE id=?3",
+        "UPDATE refs SET resolved_target_key=(SELECT nkey FROM nodes WHERE id=?1),resolution_reason=?2 WHERE id=?3",
         params![target, reason, id],
     )?;
     if let Some(target) = target {
@@ -1103,6 +1417,7 @@ fn read_stats(conn: &Connection) -> Result<Stats> {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
+    let layout = storage_layout(conn)?;
     let mut diagnostics = Vec::new();
     let mut stmt = conn.prepare("SELECT diagnostics FROM files ORDER BY path")?;
     for json in stmt.query_map([], |r| r.get::<_, String>(0))? {
@@ -1123,7 +1438,10 @@ fn read_stats(conn: &Connection) -> Result<Stats> {
         } else {
             count("SELECT count(*) FROM files")?
         },
-        unresolved_references: count("SELECT count(*) FROM refs WHERE resolved_target IS NULL")?,
+        unresolved_references: count(match layout {
+            StorageLayout::Legacy => "SELECT count(*) FROM refs WHERE resolved_target IS NULL",
+            StorageLayout::Compact => "SELECT count(*) FROM refs WHERE resolved_target_key IS NULL",
+        })?,
         kind,
         coverage: serde_json::from_str(&coverage)?,
         diagnostics,

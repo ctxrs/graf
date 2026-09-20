@@ -1500,10 +1500,13 @@ fn cli_family(
             supported
         };
         if schema {
-            adapter.args.extend([
-                "--json-schema".into(),
-                serde_json::to_string(&schemars::schema_for!(Graph))?,
-            ]);
+            // Native Claude's structured-output validator expects JSON Schema Draft 7.
+            let schema = schemars::generate::SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<Graph>();
+            adapter
+                .args
+                .extend(["--json-schema".into(), serde_json::to_string(&schema)?]);
         }
     }
     let (bytes, success) = super::convert::run_provider_until(
