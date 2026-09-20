@@ -1266,6 +1266,94 @@ fn transient_retry_is_bounded_by_call_and_token_budget() {
 }
 
 #[test]
+fn default_semantic_identity_keeps_same_label_evidence_and_independent_source_deletion() {
+    use graf::{model::Coverage, store::Store};
+    let text = "The east Riverside Gateway sends stock to the west Riverside Gateway.";
+    let fragment = json!({
+        "nodes":[
+            {"id":"east","label":"Riverside Gateway","kind":"entity","evidence":"east Riverside Gateway"},
+            {"id":"west","label":"Riverside Gateway","kind":"entity","evidence":"west Riverside Gateway"}
+        ],
+        "edges":[{"source":"east","target":"west","relation":"sends_to","confidence":0.9,"evidence":text}]
+    });
+    let mut files = Vec::new();
+    for path in ["first.txt", "second.txt"] {
+        let (endpoint, server) = mock(json!({"choices":[{
+            "finish_reason":"stop","message":{"content":fragment.to_string()}
+        }]}));
+        let options = semantic(Provider::OpenAi, endpoint);
+        assert!(!options.semantic.as_ref().unwrap().deduplicate);
+        let facts = ingest::extract_text(path, text, "h", &options).unwrap();
+        server.join().unwrap();
+        let entities: Vec<_> = facts.nodes.iter().filter(|n| n.kind == "entity").collect();
+        assert_eq!(entities.len(), 2);
+        assert_ne!(entities[0].id, entities[1].id);
+        assert_ne!(
+            entities[0].metadata["evidence"],
+            entities[1].metadata["evidence"]
+        );
+        let edge = facts
+            .edges
+            .iter()
+            .find(|e| e.relation == "sends_to")
+            .unwrap();
+        assert_ne!(edge.source, edge.target);
+        files.push(facts);
+    }
+    let retained_nodes = serde_json::to_value(&files[0].nodes).unwrap();
+    let retained_edges = serde_json::to_value(&files[0].edges).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&temp.path().join("index.db")).unwrap();
+    store
+        .apply_native("/identity-fixture", files, vec![], Coverage::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .snapshot()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "entity")
+            .count(),
+        4
+    );
+    store
+        .apply_native(
+            "/identity-fixture",
+            vec![],
+            vec!["second.txt".into()],
+            Coverage::default(),
+        )
+        .unwrap();
+    let remaining = store.snapshot().unwrap();
+    // IDs, evidence and directed relations from the untouched source survive exactly.
+    for record in retained_nodes.as_array().unwrap() {
+        assert!(
+            remaining
+                .nodes
+                .iter()
+                .any(|n| serde_json::to_value(n).unwrap() == *record)
+        );
+    }
+    for record in retained_edges.as_array().unwrap() {
+        assert!(
+            remaining
+                .edges
+                .iter()
+                .any(|e| serde_json::to_value(e).unwrap() == *record)
+        );
+    }
+    assert_eq!(
+        remaining.nodes.len(),
+        retained_nodes.as_array().unwrap().len()
+    );
+    assert_eq!(
+        remaining.edges.len(),
+        retained_edges.as_array().unwrap().len()
+    );
+}
+
+#[test]
 fn opt_in_exact_entity_dedup_and_hyperedges_preserve_evidence() {
     let fragment = json!({"nodes":[{"id":"a","label":"Queue","kind":"concept","evidence":"Queue"},
         {"id":"b","label":"Queue","kind":"concept","evidence":"durability"},{"id":"c","label":"Durability","kind":"concept","evidence":"durability"}],
@@ -1334,7 +1422,7 @@ fn explicit_remote_media_recipe_downloads_then_transcribes() {
 fn bedrock_and_claude_cli_use_native_envelopes_and_bounded_settings() {
     let temp = tempfile::tempdir().unwrap();
     let script = temp.path().join("native.py");
-    let response = json!({"stopReason":"end_turn","output":{"message":{"content":[{"text":graph().to_string()}]}}});
+    let response = json!({"stopReason":"end_turn","output":{"message":{"content":[{"text":graph().to_string()}]}},"usage":{"inputTokens":13,"outputTokens":7,"totalTokens":20,"cacheReadInputTokens":5,"cacheWriteInputTokens":3}});
     std::fs::write(&script,format!("import sys,json,pathlib\nassert sys.argv[1:3]==['bedrock-runtime','converse']\np=pathlib.Path(sys.argv[sys.argv.index('--cli-input-json')+1].removeprefix('file://'))\nr=json.loads(p.read_text())\nassert r['modelId']=='explicit-bedrock-model'\nassert r['inferenceConfig']['maxTokens']==2048\nassert r['inferenceConfig']['temperature']==1.0\nassert r['inferenceConfig']['topP']==0.9\nassert r['additionalModelRequestFields']['thinking']['budget_tokens']==1024\nassert r['messages'][0]['content'][0]['text']=='Queue provides durability'\nprint({:?})\n",response.to_string())).unwrap();
     let mut adapter = CommandAdapter::bedrock();
     adapter.program = "python3".into();
@@ -1349,6 +1437,8 @@ fn bedrock_and_claude_cli_use_native_envelopes_and_bounded_settings() {
         command: Some(adapter),
         ..Default::default()
     });
+    let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+    o.semantic.as_mut().unwrap().runtime_usage = Some(usage.clone());
     assert!(
         ingest::extract_text("doc.txt", "Queue provides durability", "h", &o)
             .unwrap()
@@ -1356,15 +1446,26 @@ fn bedrock_and_claude_cli_use_native_envelopes_and_bounded_settings() {
             .iter()
             .any(|e| e.relation == "supports")
     );
+    let receipts = usage.snapshot().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].input_tokens, Some(13));
+    assert_eq!(receipts[0].output_tokens, Some(7));
+    assert_eq!(receipts[0].total_tokens, Some(20));
+    assert_eq!(receipts[0].cache_read_input_tokens, Some(5));
+    assert_eq!(receipts[0].cache_creation_input_tokens, Some(3));
     let response = json!([{"type":"system"},{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":graph().to_string()}]);
-    std::fs::write(&script,format!("import os,sys\nassert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='2048'\nassert sys.argv[sys.argv.index('--tools')+1]==''\nassert '--no-session-persistence' in sys.argv\nassert sys.argv[sys.argv.index('--model')+1]=='explicit-claude-model'\nassert 'Queue provides durability' in sys.stdin.read()\nprint({:?})\n",response.to_string())).unwrap();
+    std::fs::write(&script,format!("import os,sys\nassert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='2048'\nassert sys.argv[sys.argv.index('--tools')+1]==''\nassert sys.argv[sys.argv.index('--max-turns')+1]=='1'\nassert '--no-session-persistence' in sys.argv\nassert sys.argv[sys.argv.index('--model')+1]=='explicit-claude-model'\nassert 'Queue provides durability' in sys.stdin.read()\nprint({:?})\n",response.to_string())).unwrap();
     let mut adapter = CommandAdapter::claude_cli();
     adapter.program = "python3".into();
     adapter.args.insert(0, script.to_string_lossy().into());
+    let reservations = std::sync::Arc::new(ingest::SemanticBudget::new(Some(1), Some(2048)));
     o.semantic = Some(SemanticOptions {
         provider: Provider::ClaudeCli,
         model: "explicit-claude-model".into(),
         command: Some(adapter),
+        max_calls: 1,
+        max_total_output_tokens: 2048,
+        runtime_budget: Some(reservations.clone()),
         ..Default::default()
     });
     assert!(
@@ -1374,6 +1475,8 @@ fn bedrock_and_claude_cli_use_native_envelopes_and_bounded_settings() {
             .iter()
             .any(|e| e.relation == "supports")
     );
+    assert_eq!(reservations.usage().unwrap().calls, 1);
+    assert_eq!(reservations.usage().unwrap().reserved_output_tokens, 2048);
 }
 
 fn raw_mock(mime: &str, body: Vec<u8>) -> (String, thread::JoinHandle<String>) {
@@ -2492,4 +2595,475 @@ fn generic_cli_receives_controls_and_claude_cli_rejects_unsupported_controls() {
             .to_string()
             .contains("Claude CLI")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_cli_images_use_exact_read_rule_structured_output_and_cleanup() {
+    for fail in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("input.png");
+        std::fs::write(&source, b"synthetic image fixture").unwrap();
+        let record = temp.path().join("record.json");
+        let script = temp.path().join("claude.py");
+        let response = json!([{"type":"system"}, {"type":"result", "subtype":if fail {"error_during_execution"} else {"success"}, "is_error":fail, "stop_reason":"end_turn", "result":"This prose must not replace structured output", "structured_output":graph(), "usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":13,"cache_creation_input_tokens":17},"total_cost_usd":0.125,"modelUsage":{"fixture-model":{}}}]);
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, os, pathlib, sys
+if sys.argv[-1] == '--help':
+    print('--json-schema <schema>')
+    sys.exit(0)
+a = sys.argv
+assert a[a.index('--tools') + 1] == 'Read'
+assert a[a.index('--permission-mode') + 1] == 'dontAsk'
+assert a[a.index('--setting-sources') + 1] == ''
+assert a[a.index('--mcp-config') + 1] == '{{"mcpServers":{{}}}}'
+assert '--strict-mcp-config' in a and '--no-session-persistence' in a
+assert a[a.index('--max-turns') + 1] == '3'
+assert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] == '2048'
+assert not any('skip-permissions' in v for v in a)
+rule = a[a.index('--allowedTools') + 1]
+assert rule.startswith('Read(//') and rule.endswith(')')
+p = pathlib.Path(rule[len('Read(/'):-1])
+assert p.read_bytes() == b'synthetic image fixture'
+assert p != pathlib.Path({source:?})
+assert p.parent == pathlib.Path(a[a.index('--add-dir') + 1])
+assert list(p.parent.iterdir()) == [p]
+assert p.stat().st_mode & 0o077 == 0
+assert p.parent.stat().st_mode & 0o077 == 0
+assert pathlib.Path.cwd().stat().st_mode & 0o077 == 0
+assert p.as_posix() in sys.stdin.read()
+schema = json.loads(a[a.index('--json-schema') + 1])
+assert schema['type'] == 'object'
+assert set(schema['required']) == {{'nodes', 'edges'}}
+pathlib.Path({record:?}).write_text(json.dumps({{'image':str(p), 'cwd':str(pathlib.Path.cwd())}}))
+print({response:?})
+sys.exit({exit})
+"#,
+                source = source.to_str().unwrap(),
+                record = record.to_str().unwrap(),
+                response = response.to_string(),
+                exit = if fail { 1 } else { 0 }
+            ),
+        )
+        .unwrap();
+        let mut adapter = CommandAdapter::claude_cli();
+        adapter.program = "python3".into();
+        adapter.args.insert(0, script.to_string_lossy().into());
+        let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        let reservations = std::sync::Arc::new(ingest::SemanticBudget::new(Some(3), Some(6144)));
+        let mut o = semantic(Provider::ClaudeCli, String::new());
+        let s = o.semantic.as_mut().unwrap();
+        s.command = Some(adapter);
+        s.max_calls = 3;
+        s.max_total_output_tokens = 6144;
+        s.cache_dir = Some(temp.path().join("cache"));
+        s.runtime_usage = Some(usage.clone());
+        s.runtime_budget = Some(reservations.clone());
+        ingest::extract(&source, "input.png", "h", &o).unwrap();
+        assert!(!record.exists());
+        assert!(usage.snapshot().unwrap().is_empty());
+        o.semantic.as_mut().unwrap().vision = true;
+        let result = ingest::extract(&source, "input.png", "h", &o);
+        if fail {
+            assert!(result.is_err());
+        } else {
+            let facts = result.unwrap();
+            // A complete warm graph consumes neither another turn reservation
+            // nor another aggregate provider receipt, even at exhausted limits.
+            ingest::extract(&source, "input.png", "h", &o).unwrap();
+            assert!(facts.nodes.iter().any(|n| n.label == "Queue"
+                && n.line.is_none()
+                && n.metadata["provenance"] == "visual_inference"));
+        }
+        let paths: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+        let image = Path::new(paths["image"].as_str().unwrap());
+        assert!(!image.exists() && !image.parent().unwrap().exists());
+        assert!(!Path::new(paths["cwd"].as_str().unwrap()).exists());
+        assert!(source.exists());
+        let receipts = usage.snapshot().unwrap();
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.input_tokens, Some(11));
+        assert_eq!(receipt.output_tokens, Some(7));
+        assert_eq!(receipt.cache_read_input_tokens, Some(13));
+        assert_eq!(receipt.cache_creation_input_tokens, Some(17));
+        assert_eq!(receipt.total_tokens, None);
+        assert_eq!(receipt.cost_usd, Some(0.125));
+        assert_eq!(receipt.reported_model.as_deref(), Some("fixture-model"));
+        assert_eq!(reservations.usage().unwrap().calls, 3);
+        assert_eq!(reservations.usage().unwrap().reserved_output_tokens, 6144);
+        let adapter = o.semantic.as_mut().unwrap().command.as_mut().unwrap();
+        let tools = adapter.args.iter().position(|a| a == "--tools").unwrap();
+        adapter.args[tools + 1] = "Bash,Read".into();
+        let error = ingest::extract(&source, "input.png", "h", &o).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native restricted command recipe")
+        );
+        assert_eq!(reservations.usage().unwrap().calls, 3);
+        assert_eq!(usage.snapshot().unwrap().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_cli_old_help_falls_back_and_invalid_structured_output_is_terminal() {
+    for structured in [Value::Null, json!("invalid"), json!({"nodes":[]})] {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("claude.py");
+        let response = json!({"subtype":"success","is_error":false,"result":graph().to_string(),"structured_output":structured});
+        std::fs::write(
+            &script,
+            format!(
+                r#"import sys
+if sys.argv[-1] == '--help':
+    print('--print --output-format')
+    sys.exit(0)
+assert '--json-schema' not in sys.argv
+assert sys.argv[sys.argv.index('--tools')+1] == ''
+assert '--allowedTools' not in sys.argv
+print({:?})
+"#,
+                response.to_string()
+            ),
+        )
+        .unwrap();
+        let mut adapter = CommandAdapter::claude_cli();
+        adapter.program = "python3".into();
+        adapter.args.insert(0, script.to_string_lossy().into());
+        let mut o = semantic(Provider::ClaudeCli, String::new());
+        let s = o.semantic.as_mut().unwrap();
+        s.command = Some(adapter);
+        s.max_retries = 3;
+        s.max_split_depth = 3;
+        let budget = std::sync::Arc::new(ingest::SemanticBudget::new(Some(4), None));
+        s.runtime_budget = Some(budget.clone());
+        let result = ingest::extract_text("doc.txt", "Queue provides durability", "h", &o);
+        assert_eq!(result.is_ok(), structured.is_null());
+        assert_eq!(budget.usage().unwrap().calls, 1);
+    }
+}
+
+#[test]
+fn provider_usage_preserves_native_counts_and_unknown_fields() {
+    for (provider, response, expected) in [
+        (
+            Provider::OpenAi,
+            json!({"choices":[{"finish_reason":"stop","message":{"content":graph().to_string()}}],"model":"reported","usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":9}}}),
+            (Some(10), Some(20), Some(30), Some(5), None, Some(9)),
+        ),
+        (
+            Provider::Azure,
+            json!({"choices":[{"finish_reason":"stop","message":{"content":graph().to_string()}}],"usage":{"prompt_tokens":0,"completion_tokens":-1,"total_tokens":"123"}}),
+            (Some(0), None, None, None, None, None),
+        ),
+        (
+            Provider::Anthropic,
+            json!({"stop_reason":"end_turn","content":[{"type":"text","text":graph().to_string()}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":7}}),
+            (Some(10), Some(20), None, Some(5), Some(7), None),
+        ),
+        (
+            Provider::Gemini,
+            json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":graph().to_string()}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"totalTokenCount":39,"cachedContentTokenCount":5,"thoughtsTokenCount":9}}),
+            (Some(10), Some(20), Some(39), Some(5), None, Some(9)),
+        ),
+        (
+            Provider::Ollama,
+            json!({"done":true,"done_reason":"stop","message":{"content":graph().to_string()},"prompt_eval_count":10,"eval_count":20}),
+            (Some(10), Some(20), None, None, None, None),
+        ),
+    ] {
+        let (endpoint, server) = mock(response);
+        let mut o = semantic(provider, endpoint);
+        let fingerprint = ingest::config_fingerprint(&o).unwrap();
+        let recorder = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        o.semantic.as_mut().unwrap().runtime_usage = Some(recorder.clone());
+        assert_eq!(fingerprint, ingest::config_fingerprint(&o).unwrap());
+        ingest::extract_text("doc.txt", "Queue provides durability", "h", &o).unwrap();
+        server.join().unwrap();
+        let receipts = recorder.snapshot().unwrap();
+        assert_eq!(receipts.len(), 1);
+        let u = &receipts[0];
+        assert_eq!(u.provider, provider);
+        assert_eq!(u.requested_model, "gpt-6-astra");
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.total_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+                u.reasoning_tokens
+            ),
+            expected
+        );
+        assert_eq!(u.cost_usd, None);
+    }
+}
+
+#[test]
+fn hollow_retry_records_every_attempt_without_charging_cache_hits() {
+    let success = json!({"choices":[{"finish_reason":"stop","message":{"content":graph().to_string()}}],"usage":{"prompt_tokens":8,"completion_tokens":4}});
+    let (endpoint, server) = semantic_responses(vec![
+        json!({"choices":[{"finish_reason":"stop","message":{"content":" \n "}}],"usage":{"prompt_tokens":6,"completion_tokens":2}}),
+        success,
+    ]);
+    let cache = tempfile::tempdir().unwrap();
+    let mut o = semantic(Provider::OpenAi, endpoint);
+    let recorder = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+    let budget = std::sync::Arc::new(ingest::SemanticBudget::new(Some(2), Some(4096)));
+    let s = o.semantic.as_mut().unwrap();
+    s.max_retries = 1;
+    s.retry_delay_ms = 0;
+    s.max_split_depth = 3;
+    s.cache_dir = Some(cache.path().into());
+    s.runtime_usage = Some(recorder.clone());
+    s.runtime_budget = Some(budget.clone());
+    let facts = ingest::extract_text("doc.txt", "Queue provides durability", "h", &o).unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(facts.edges.iter().any(|e| e.relation == "supports"));
+    let receipts = recorder.snapshot().unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].output_tokens, Some(2));
+    assert_eq!(receipts[1].output_tokens, Some(4));
+    ingest::extract_text("other.txt", "Queue provides durability", "h", &o).unwrap();
+    assert_eq!(recorder.snapshot().unwrap().len(), 2);
+    assert_eq!(budget.usage().unwrap().calls, 2);
+    assert_eq!(budget.usage().unwrap().reserved_output_tokens, 4096);
+}
+
+#[test]
+fn empty_graph_is_valid_but_hollow_responses_stop_at_shared_limits() {
+    for (content, retry, calls, tokens, expected_calls, succeeds) in [
+        (Some("{\"nodes\":[],\"edges\":[]}"), 3, 4, 8192, 1, true),
+        (None, 0, 4, 8192, 1, false),
+        (Some(" "), 3, 1, 8192, 1, false),
+        (Some(" "), 3, 4, 2048, 1, false),
+        (Some(" "), 1, 4, 8192, 2, false),
+    ] {
+        let response = json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]});
+        let (endpoint, server) = semantic_responses(vec![response; expected_calls]);
+        let mut o = semantic(Provider::OpenAi, endpoint);
+        let s = o.semantic.as_mut().unwrap();
+        s.max_retries = retry;
+        s.retry_delay_ms = 0;
+        s.max_calls = calls;
+        s.max_total_output_tokens = tokens;
+        s.max_split_depth = 3;
+        let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        s.runtime_usage = Some(usage.clone());
+        assert_eq!(
+            ingest::extract_text("doc.txt", "Queue provides durability", "h", &o).is_ok(),
+            succeeds
+        );
+        assert_eq!(server.join().unwrap().len(), expected_calls);
+        assert_eq!(usage.snapshot().unwrap().len(), expected_calls);
+    }
+}
+
+#[test]
+fn context_codes_split_text_but_never_guess_from_error_prose() {
+    let complete = |label: &str| json!({"choices":[{"finish_reason":"stop","message":{"content":json!({"nodes":[{"id":"n","label":label,"kind":"concept","evidence":label}],"edges":[]}).to_string()}}]});
+    for fail_right in [false, true] {
+        let (endpoint, server) = semantic_status_responses(vec![
+            (
+                400,
+                json!({"error":{"code":"context_length_exceeded"},"usage":{"prompt_tokens":11}}),
+            ),
+            (200, complete("Alpha")),
+            (
+                200,
+                if fail_right {
+                    json!({"choices":[{"finish_reason":"stop","message":{"content":"{invalid"}}]})
+                } else {
+                    complete("Bravo")
+                },
+            ),
+        ]);
+        let mut facts = ingest::extract_text("doc.txt", "Alpha\nBravo", "h", &options()).unwrap();
+        let before = serde_json::to_value(&facts).unwrap();
+        let mut o = semantic(Provider::OpenAi, endpoint);
+        let s = o.semantic.as_mut().unwrap();
+        s.max_split_depth = 1;
+        let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        s.runtime_usage = Some(usage.clone());
+        let result = ingest::enrich_facts(&mut facts, "Alpha\nBravo", &o);
+        assert_eq!(result.is_err(), fail_right);
+        if fail_right {
+            assert_eq!(serde_json::to_value(&facts).unwrap(), before);
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests[1]["messages"][1]["content"], "Alpha\n");
+        assert_eq!(requests[2]["messages"][1]["content"], "Bravo");
+        assert_eq!(usage.snapshot().unwrap()[0].input_tokens, Some(11));
+    }
+    for (status, error) in [
+        (
+            400,
+            json!({"error":{"message":"context_length_exceeded: prompt is too long"}}),
+        ),
+        (401, json!({"error":{"code":"context_length_exceeded"}})),
+        (
+            400,
+            json!({"error":{"code":"invalid_request_error","message":"context size"}}),
+        ),
+    ] {
+        let (endpoint, server) = semantic_status_responses(vec![(status, error)]);
+        let mut o = semantic(Provider::OpenAi, endpoint);
+        let s = o.semantic.as_mut().unwrap();
+        s.max_split_depth = 3;
+        s.max_retries = 3;
+        assert!(ingest::extract_text("doc.txt", "Alpha\nBravo", "h", &o).is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_cli_timeout_bisects_with_original_attempt_budget() {
+    for calls in [1, 3] {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = python_adapter(
+            temp.path(),
+            r#"import json, sys, time
+text = json.load(sys.stdin)['input']
+if len(text) > 6:
+    time.sleep(3)
+text = text.strip()
+print(json.dumps({'nodes':[{'id':'n','label':text,'kind':'concept','evidence':text}],'edges':[]}))
+"#,
+        );
+        let mut o = semantic(Provider::Cli, String::new());
+        let s = o.semantic.as_mut().unwrap();
+        s.command = Some(adapter);
+        s.timeout_secs = 1;
+        s.max_calls = calls;
+        s.max_split_depth = 1;
+        let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        s.runtime_usage = Some(usage.clone());
+        let result = ingest::extract_text("doc.txt", "Alpha\nBravo", "h", &o);
+        assert_eq!(result.is_ok(), calls == 3);
+        let receipts = usage.snapshot().unwrap();
+        assert_eq!(receipts.len(), calls);
+        assert!(
+            receipts
+                .iter()
+                .all(|u| u.input_tokens.is_none() && u.output_tokens.is_none())
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_cli_empty_failure_reports_exit_without_exposing_stderr() {
+    for provider in [Provider::ClaudeCli, Provider::Bedrock] {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = python_adapter(
+            temp.path(),
+            r#"import sys
+sys.stderr.write('synthetic-private-diagnostic')
+sys.exit(1)
+"#,
+        );
+        let recorder = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        let mut o = semantic(provider, String::new());
+        let s = o.semantic.as_mut().unwrap();
+        s.command = Some(adapter);
+        s.runtime_usage = Some(recorder.clone());
+        s.max_retries = 3;
+        s.max_split_depth = 3;
+        let error =
+            ingest::extract_text("doc.txt", "Queue provides durability", "h", &o).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("exited unsuccessfully without a JSON response"));
+        assert!(!message.contains("synthetic-private-diagnostic"));
+        assert!(!message.contains("EOF while parsing"));
+        let receipts = recorder.snapshot().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].input_tokens, None);
+        assert_eq!(receipts[0].output_tokens, None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_claude_vision_reserves_all_turns_before_any_process_starts() {
+    for (file_calls, file_tokens, shared_calls, shared_tokens) in [
+        (1, 2048, 1, 2048),
+        (2, 6144, 3, 6144),
+        (3, 4096, 3, 6144),
+        (3, 6144, 2, 6144),
+        (3, 6144, 3, 4096),
+        (3, 6144, 3, 6144),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("image.png");
+        std::fs::write(&source, b"synthetic image fixture").unwrap();
+        let marker = temp.path().join("started");
+        let script = temp.path().join("claude.py");
+        let response = json!({"type":"result","subtype":"success","is_error":false,"structured_output":graph()});
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, os, pathlib, sys
+pathlib.Path({marker:?}).write_text('started')
+if sys.argv[-1] == '--help':
+    print('--json-schema <schema>')
+    sys.exit(0)
+assert sys.argv[sys.argv.index('--max-turns') + 1] == '3'
+assert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] == '2048'
+print({response:?})
+"#,
+                marker = marker.to_str().unwrap(),
+                response = response.to_string()
+            ),
+        )
+        .unwrap();
+        let mut adapter = CommandAdapter::claude_cli();
+        adapter.program = "python3".into();
+        adapter.args.insert(0, script.to_string_lossy().into());
+        let shared = std::sync::Arc::new(ingest::SemanticBudget::new(
+            Some(shared_calls),
+            Some(shared_tokens),
+        ));
+        let usage = std::sync::Arc::new(ingest::SemanticUsageRecorder::default());
+        let mut o = semantic(Provider::ClaudeCli, String::new());
+        let s = o.semantic.as_mut().unwrap();
+        s.command = Some(adapter);
+        s.vision = true;
+        s.max_calls = file_calls;
+        s.max_total_output_tokens = file_tokens;
+        s.runtime_budget = Some(shared.clone());
+        s.runtime_usage = Some(usage.clone());
+        let result = ingest::extract(&source, "image.png", "h", &o);
+        let admitted =
+            file_calls == 3 && file_tokens == 6144 && shared_calls == 3 && shared_tokens == 6144;
+        assert_eq!(result.is_ok(), admitted);
+        assert_eq!(
+            marker.exists(),
+            admitted,
+            "even the help probe must wait for admission"
+        );
+        let reservations = shared.usage().unwrap();
+        assert_eq!(reservations.calls, if admitted { 3 } else { 0 });
+        assert_eq!(
+            reservations.reserved_output_tokens,
+            if admitted { 6144 } else { 0 }
+        );
+        let receipts = usage.snapshot().unwrap();
+        assert_eq!(receipts.len(), usize::from(admitted));
+        if admitted {
+            // The whole three-turn allowance is reserved even when no actual
+            // usage was returned; missing counters remain unknown, not zero.
+            assert_eq!(receipts[0].input_tokens, None);
+            assert_eq!(receipts[0].output_tokens, None);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("budget"));
+        }
+    }
 }

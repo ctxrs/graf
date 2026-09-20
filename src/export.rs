@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{
     analysis::{self, AnalysisOptions, AnalysisReport},
+    memory::{LearningNode, LearningOverlay},
     model::{GraphSnapshot, Node},
 };
 
@@ -39,9 +40,15 @@ pub struct ExportOptions {
     /// Display labels keyed by BLAKE3 of sorted JSON member IDs, matching the
     /// Graf label file. Stale signatures are ignored; topology is never changed.
     pub community_labels: BTreeMap<String, String>,
-    /// Maximum detailed/aggregate nodes per interactive page.
+    /// Explicit, read-only work-memory annotations for this exact snapshot.
+    /// Supported by HTML, Markdown and wiki exports only; never changes topology.
+    pub learning: Option<LearningOverlay>,
+    /// Maximum detailed/aggregate nodes per interactive page. Topology layout
+    /// uses only the bounded drawn graph; search retains the complete snapshot.
     pub node_limit: usize,
     /// Maximum drawn edges per interactive page. Full data stays downloadable.
+    /// Neighbor traversal pages retain every recorded relation, showing at most
+    /// min(50, node_limit, edge_limit) records at once regardless of view filters.
     pub edge_limit: usize,
 }
 
@@ -50,6 +57,7 @@ impl Default for ExportOptions {
         Self {
             analysis: AnalysisOptions::default(),
             community_labels: BTreeMap::new(),
+            learning: None,
             node_limit: 300,
             edge_limit: 1000,
         }
@@ -102,6 +110,11 @@ pub fn render_with_options(
 ) -> Result<String> {
     analysis::validate(snapshot)?;
     ensure!(
+        options.learning.is_none() || matches!(format, ExportFormat::Html | ExportFormat::Markdown),
+        "learning annotations are supported only by HTML, Markdown and wiki exports"
+    );
+    validate_learning(snapshot, options)?;
+    ensure!(
         options.node_limit > 0 && options.edge_limit > 0,
         "viewer node and edge limits must be positive"
     );
@@ -118,6 +131,56 @@ pub fn render_with_options(
         ExportFormat::CallflowHtml => callflow_html(snapshot, options),
         ExportFormat::TreeHtml => tree_html(snapshot),
     }
+}
+
+fn validate_learning(snapshot: &GraphSnapshot, options: &ExportOptions) -> Result<()> {
+    if let Some(learning) = &options.learning {
+        ensure!(
+            learning.schema_version == 1,
+            "unsupported learning overlay schema"
+        );
+        let mut hasher = blake3::Hasher::new();
+        serde_json::to_writer(&mut hasher, snapshot)?;
+        let hash = hasher.finalize().to_hex().to_string();
+        ensure!(
+            learning.snapshot_hash.as_deref() == Some(hash.as_str()),
+            "learning overlay does not match this exact snapshot; regenerate it"
+        );
+        ensure!(
+            learning.nodes.values().all(|node| node.score.is_finite()),
+            "learning scores must be finite"
+        );
+    }
+    Ok(())
+}
+
+/// Display membership comes only from actual incidence edges. Ordinary group
+/// relations and every original node/edge remain in the snapshot and analysis.
+fn display_groups(snapshot: &GraphSnapshot) -> Vec<Value> {
+    let mut groups: BTreeMap<_, (BTreeSet<&str>, Vec<&str>)> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind.as_str(), "group" | "hyperedge"))
+        .map(|node| (node.id.as_str(), (BTreeSet::new(), Vec::new())))
+        .collect();
+    for edge in &snapshot.edges {
+        if edge.relation != "member_of" || edge.source == edge.target {
+            continue;
+        }
+        if let Some((members, incidences)) = groups.get_mut(edge.target.as_str()) {
+            members.insert(&edge.source);
+            incidences.push(&edge.id);
+        }
+        if !edge.directed
+            && let Some((members, incidences)) = groups.get_mut(edge.source.as_str())
+        {
+            members.insert(&edge.target);
+            incidences.push(&edge.id);
+        }
+    }
+    groups.into_iter().map(|(id, (members, incidences))| {
+        json!({"id": id, "members": members, "incidences": incidences})
+    }).collect()
 }
 
 fn location(node: &Node) -> String {
@@ -599,7 +662,7 @@ fn svg(snapshot: &GraphSnapshot, options: &ExportOptions) -> Result<String> {
 
 fn html(snapshot: &GraphSnapshot, options: &ExportOptions) -> Result<String> {
     let report = export_analysis(snapshot, options)?;
-    let data = serde_json::to_string(&json!({"snapshot":snapshot,"analysis":report,"viewer":{"node_limit":options.node_limit,"edge_limit":options.edge_limit}}))?
+    let data = serde_json::to_string(&json!({"snapshot":snapshot,"analysis":report,"groups":display_groups(snapshot),"learning":options.learning,"viewer":{"node_limit":options.node_limit,"edge_limit":options.edge_limit}}))?
         .replace('&', "\\u0026")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
@@ -624,10 +687,67 @@ fn md(text: &str) -> String {
 
 fn markdown(snapshot: &GraphSnapshot, options: &ExportOptions) -> Result<String> {
     let report = export_analysis(snapshot, options)?;
-    report_markdown(snapshot, &report)
+    report_markdown(snapshot, &report, options.learning.as_ref())
 }
 
-fn report_markdown(snapshot: &GraphSnapshot, report: &AnalysisReport) -> Result<String> {
+fn learning_node_markdown(node: &LearningNode) -> String {
+    format!(
+        "Status: {} · score {:.9} · useful {} · negative {} · verified useful {} · unverified {}\n\n{}\n",
+        md(&node.status),
+        node.score,
+        node.useful,
+        node.negative,
+        node.verified_useful,
+        node.unverified,
+        md(&node.reason)
+    )
+}
+
+fn learning_markdown(snapshot: &GraphSnapshot, learning: &LearningOverlay) -> Result<String> {
+    let mut out = format!(
+        "\n## Work-memory lessons\n\nExplicit observations generated at Unix time {} for this exact snapshot. Cited-source verification does not certify other files or answer correctness.\n\n",
+        learning.generated_unix_secs
+    );
+    for node in &snapshot.nodes {
+        if let Some(annotation) = learning.nodes.get(&node.id) {
+            writeln!(
+                out,
+                "### {} ({})\n\n{}",
+                md(&node.label),
+                md(&node.id),
+                learning_node_markdown(annotation)
+            )?;
+        }
+    }
+    out.push_str("\n### Recorded lessons and event provenance\n\n");
+    // Preserve the shared lesson categories, but render all other content as
+    // indented code. Exact IDs stay readable without activating HTML or links.
+    // Normalize standalone CR too, so every logical line receives indentation.
+    let lessons = learning.lessons.replace("\r\n", "\n").replace('\r', "\n");
+    for line in lessons.lines() {
+        if matches!(
+            line,
+            "## preferred"
+                | "## tentative"
+                | "## contested"
+                | "## dead_end"
+                | "## corrected"
+                | "## Source verification"
+                | "## Event provenance"
+        ) {
+            writeln!(out, "\n{line}\n")?;
+        } else {
+            writeln!(out, "    {line}")?;
+        }
+    }
+    Ok(out)
+}
+
+fn report_markdown(
+    snapshot: &GraphSnapshot,
+    report: &AnalysisReport,
+    learning: Option<&LearningOverlay>,
+) -> Result<String> {
     let nodes: BTreeMap<_, _> = snapshot.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut output = format!(
         "# Graf graph report\n\nGeneration {} · {} nodes · {} edges\n\n{}\n\nPageRank converged: {} ({} iterations). Community convergence: {} ({} passes). Modularity: {:.6}.\n\n",
@@ -892,6 +1012,9 @@ fn report_markdown(snapshot: &GraphSnapshot, report: &AnalysisReport) -> Result<
             md(&edge.confidence)
         )?;
     }
+    if let Some(learning) = learning {
+        output.push_str(&learning_markdown(snapshot, learning)?);
+    }
     Ok(output)
 }
 
@@ -913,6 +1036,7 @@ pub fn write_vault_with_options(
     options: &ExportOptions,
 ) -> Result<VaultReport> {
     analysis::validate(snapshot)?;
+    validate_learning(snapshot, options)?;
     ensure!(
         vault.is_dir(),
         "vault destination must be an existing directory"
@@ -947,7 +1071,10 @@ pub fn write_vault_with_options(
         files += 1;
         Ok(())
     };
-    write("report.md", &report_markdown(snapshot, &report)?)?;
+    write(
+        "report.md",
+        &report_markdown(snapshot, &report, options.learning.as_ref())?,
+    )?;
     write("snapshot.json", &serde_json::to_string_pretty(snapshot)?)?;
     let filenames: BTreeMap<_, _> = snapshot
         .nodes
@@ -1001,6 +1128,17 @@ pub fn write_vault_with_options(
                 md(&edge.id),
                 md(edge.file.as_deref().unwrap_or("unavailable")),
                 edge.line.map(|n| format!("L{n}")).unwrap_or_default()
+            )?;
+        }
+        if let Some(annotation) = options
+            .learning
+            .as_ref()
+            .and_then(|learning| learning.nodes.get(&node.id))
+        {
+            writeln!(
+                note,
+                "\n## Work-memory observation\n\n{}",
+                learning_node_markdown(annotation)
             )?;
         }
         // Entity encoding prevents fence-breaking content, HTML and plugin directives.

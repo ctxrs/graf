@@ -32,6 +32,7 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         modules: HashMap::from([(0, module.clone())]),
         types: vec![],
         implementations: vec![],
+        receivers: vec![],
     };
     r.visit(tree.root_node(), 0, &module, None);
     Ok(r.finish())
@@ -54,6 +55,7 @@ struct Rust<'a> {
     modules: HashMap<usize, String>,
     types: Vec<(usize, usize, Vec<String>, String)>,
     implementations: Vec<(String, usize, Vec<String>, String)>,
+    receivers: Vec<(String, usize, Vec<String>, String)>,
 }
 impl Rust<'_> {
     fn resolve_path(&self, scope: usize, parts: &[String], module: &str) -> Vec<String> {
@@ -99,6 +101,75 @@ impl Rust<'_> {
             }
         }
     }
+    // Only independent, unbounded type parameters can be renamed without
+    // proving trait bounds, substitutions, lifetimes, or const expressions.
+    fn plain_parameters<'n>(&self, node: Syntax<'n>) -> Option<Vec<Syntax<'n>>> {
+        if children(node).iter().any(|n| n.kind() == "where_clause") {
+            return None;
+        }
+        let params = node.child_by_field_name("type_parameters")?;
+        let mut names = vec![];
+        for param in children(params)
+            .into_iter()
+            .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        {
+            let name = param.child_by_field_name("name")?;
+            if param.kind() != "type_parameter"
+                || children(param)
+                    .iter()
+                    .any(|n| *n != name && !matches!(n.kind(), "line_comment" | "block_comment"))
+                || names.iter().any(|n| self.e.text(*n) == self.e.text(name))
+            {
+                return None;
+            }
+            names.push(name);
+        }
+        (!names.is_empty()).then_some(names)
+    }
+    fn impl_owner(&self, node: Syntax<'_>, ty: Syntax<'_>) -> Option<Vec<String>> {
+        if node.child_by_field_name("trait").is_some()
+            || children(node).iter().any(|n| n.kind() == "where_clause")
+        {
+            return None;
+        }
+        let owner = if ty.kind() == "generic_type" {
+            let params = self.plain_parameters(node)?;
+            let args: Vec<_> = children(ty.child_by_field_name("type_arguments")?)
+                .into_iter()
+                .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+                .collect();
+            if params.len() != args.len()
+                || params.iter().zip(args).any(|(p, a)| {
+                    a.kind() != "type_identifier" || self.e.text(*p) != self.e.text(a)
+                })
+            {
+                return None;
+            }
+            ty.child_by_field_name("type")?
+        } else {
+            if node.child_by_field_name("type_parameters").is_some() {
+                return None;
+            }
+            ty
+        };
+        let mut pending = vec![owner];
+        while let Some(part) = pending.pop() {
+            if !matches!(
+                part.kind(),
+                "type_identifier"
+                    | "identifier"
+                    | "scoped_type_identifier"
+                    | "scoped_identifier"
+                    | "crate"
+                    | "self"
+                    | "super"
+            ) {
+                return None;
+            }
+            pending.extend(children(part));
+        }
+        self.path(owner)
+    }
     fn finish(mut self) -> FileFacts {
         for (index, scope, parts, module) in &self.types {
             self.e.facts.references[*index].candidate_keys =
@@ -111,7 +182,76 @@ impl Rust<'_> {
                 (marker.clone(), self.resolve_path(*scope, parts, module))
             })
             .collect();
+        let receivers: HashMap<_, _> = self
+            .receivers
+            .iter()
+            .map(|(marker, scope, parts, module)| {
+                (marker.clone(), self.resolve_path(*scope, parts, module))
+            })
+            .collect();
         let mut facts = self.e.finish();
+        for reference in &mut facts.references {
+            let mut declared = false;
+            reference.candidate_keys = reference
+                .candidate_keys
+                .iter()
+                .flat_map(|key| {
+                    if let Some((marker, member)) = key.rsplit_once(':')
+                        && let Some(types) = receivers.get(marker)
+                    {
+                        declared = true;
+                        if member.contains('.') {
+                            return vec![];
+                        }
+                        types
+                            .iter()
+                            .map(|ty| format!("{ty}#declared.{member}"))
+                            .collect()
+                    } else {
+                        vec![key.clone()]
+                    }
+                })
+                .collect();
+            if declared {
+                reference.relation = "declared_member".into();
+                reference.reason =
+                    "written dyn trait member; runtime dispatch is unresolved".into();
+            }
+        }
+        let owners: HashMap<_, _> = facts
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "trait" && n.binding_key.is_some())
+            .filter(|n| {
+                facts
+                    .nodes
+                    .iter()
+                    .filter(|other| other.binding_key == n.binding_key)
+                    .count()
+                    == 1
+            })
+            .filter_map(|n| {
+                n.binding_key
+                    .as_ref()
+                    .map(|key| (n.id.clone(), key.clone()))
+            })
+            .collect();
+        let parents: HashMap<_, _> = facts
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains")
+            .map(|e| (e.target.clone(), e.source.clone()))
+            .collect();
+        for node in &mut facts.nodes {
+            if node.kind == "method"
+                && node.metadata["conditional"] != true
+                && node.metadata["trait_receiver"] == true
+                && let Some(owner) = parents.get(&node.id).and_then(|id| owners.get(id))
+            {
+                node.metadata["binding_aliases"] =
+                    serde_json::json!([format!("{owner}#declared.{}", node.label)]);
+            }
+        }
         for (marker, keys) in implementations {
             let rewrite = |key: &str| -> Option<String> {
                 if key == marker || key.starts_with(&format!("{marker}::")) {
@@ -122,9 +262,11 @@ impl Rust<'_> {
             };
             for node in &mut facts.nodes {
                 node.binding_key = node.binding_key.as_deref().and_then(&rewrite);
-                if let Some(target) = node.metadata["impl_type"].as_str() {
-                    node.metadata["impl_type"] =
-                        rewrite(target).map_or(serde_json::Value::Null, Into::into);
+                for field in ["impl_type", "generic_impl_type"] {
+                    if let Some(target) = node.metadata[field].as_str() {
+                        node.metadata[field] =
+                            rewrite(target).map_or(serde_json::Value::Null, Into::into);
+                    }
                 }
             }
             for reference in &mut facts.references {
@@ -204,7 +346,49 @@ impl Rust<'_> {
             }
             "parameter" | "let_declaration" => {
                 if let Some(p) = node.child_by_field_name("pattern") {
-                    self.pattern(p, scope, write);
+                    let ty = node.child_by_field_name("type").and_then(|ty| {
+                        let ty = if ty.kind() == "reference_type" {
+                            ty.child_by_field_name("type")?
+                        } else {
+                            ty
+                        };
+                        (ty.kind() == "dynamic_type")
+                            .then_some(ty)
+                            .and_then(|ty| ty.child_by_field_name("trait"))
+                            .filter(|ty| {
+                                matches!(ty.kind(), "type_identifier" | "scoped_type_identifier")
+                            })
+                            .and_then(|ty| self.path(ty))
+                    });
+                    if !write
+                        && p.kind() == "identifier"
+                        && let Some(parts) = ty
+                    {
+                        let mut owner = scope;
+                        while !self.modules.contains_key(&owner) {
+                            let Some(parent) = self.e.scopes[owner].parent else {
+                                break;
+                            };
+                            owner = parent;
+                        }
+                        let module = self.modules.get(&owner).cloned().unwrap_or_default();
+                        let marker = format!(
+                            "rust:receiver:{}:{scope}:{}",
+                            self.e.facts.path,
+                            p.start_byte()
+                        );
+                        self.receivers.push((marker.clone(), scope, parts, module));
+                        self.e.bind(
+                            scope,
+                            self.e.text(p).trim_start_matches("r#"),
+                            Binding::Namespace {
+                                prefixes: vec![format!("{marker}:")],
+                                separator: ".",
+                            },
+                        );
+                    } else {
+                        self.pattern(p, scope, write);
+                    }
                 }
             }
             "field_pattern" => {
@@ -353,9 +537,30 @@ impl Rust<'_> {
         );
         self.e.facts.nodes.last_mut().unwrap().metadata["public"] =
             public(node, self.e.source).into();
+        self.e.facts.nodes.last_mut().unwrap().metadata["trait_receiver"] = node
+            .child_by_field_name("parameters")
+            .is_some_and(|p| children(p).iter().any(|n| n.kind() == "self_parameter"))
+            .into();
+        if implementation == Some("")
+            && node.parent().is_some_and(|body| {
+                children(body)
+                    .iter()
+                    .filter(|member| {
+                        member.child_by_field_name("name").is_some_and(|other| {
+                            self.e.text(other).trim_start_matches("r#") == name
+                        })
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            self.e.facts.nodes.last_mut().unwrap().metadata["trait_receiver"] = false.into();
+        }
         if let Some(ty) = implementation.filter(|t| !t.is_empty()) {
             self.e.facts.nodes.last_mut().unwrap().metadata["impl_type"] = ty.into();
             self.e.bind(child, "Self", Binding::Path(ty.into()));
+        } else if method {
+            self.e.bind(child, "Self", Binding::Unknown);
         }
         for field in ["type_parameters", "parameters"] {
             if let Some(params) = node.child_by_field_name(field) {
@@ -486,9 +691,14 @@ impl Rust<'_> {
                 let Some(ty) = node.child_by_field_name("type") else {
                     return;
                 };
-                let target = self.path(ty);
+                let target = self.impl_owner(node, ty);
+                let eligible = target.is_some();
+                let generic_arity = eligible
+                    .then(|| self.plain_parameters(node))
+                    .flatten()
+                    .map(|p| p.len());
                 let marker = format!("rust:impl:{}:{}", self.e.facts.path, node.start_byte());
-                let trait_impl = node.child_by_field_name("trait").is_some();
+                let start = self.e.facts.nodes.len();
                 let name = format!("impl {}", self.e.text(ty));
                 let child = self.e.define(node, scope, &name, "impl", None, false);
                 // Impl generics are lexical types even though method names are not lexical bindings.
@@ -511,8 +721,14 @@ impl Rust<'_> {
                         body,
                         child,
                         module,
-                        Some(if trait_impl { "" } else { &marker }),
+                        Some(if eligible { &marker } else { "" }),
                     );
+                }
+                if let Some(arity) = generic_arity {
+                    for node in &mut self.e.facts.nodes[start..] {
+                        node.metadata["generic_impl_type"] = marker.clone().into();
+                        node.metadata["generic_impl_arity"] = arity.into();
+                    }
                 }
                 return;
             }
@@ -538,6 +754,12 @@ impl Rust<'_> {
                     .define(node, scope, name, kind, Some(key.clone()), false);
                 self.e.facts.nodes.last_mut().unwrap().metadata["public"] =
                     public(node, self.e.source).into();
+                if matches!(kind, "struct" | "enum" | "union")
+                    && let Some(params) = self.plain_parameters(node)
+                {
+                    self.e.facts.nodes.last_mut().unwrap().metadata["generic_type_arity"] =
+                        params.len().into();
+                }
                 self.e.bind(scope, name, Binding::Path(key.clone()));
                 self.e.scopes[child].class = false;
                 self.e.bind(child, "Self", Binding::Path(key));

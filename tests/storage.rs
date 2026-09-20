@@ -37,11 +37,248 @@ fn reference(id: &str, keys: &[&str]) -> Reference {
         reason: "missing target".into(),
     }
 }
+
+#[test]
+fn native_snapshot_source_proof_is_owned_bounded_and_excludes_capture_stamps() -> anyhow::Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("proof.db");
+    let digest = blake3::hash(b"indexed fixture bytes").to_hex().to_string();
+    let mut facts = Vec::new();
+    for (path, stamp) in [
+        ("local.py", format!("python-v9:context:{digest}")),
+        (
+            "typed.ts",
+            format!("languages-native-languages-13:context::deep:settings:{digest}"),
+        ),
+        ("notes.md", format!("ingest-v1:settings:{digest}")),
+        ("capture.md", format!("managed-v1:{digest}")),
+        ("unknown.txt", format!("future-v1:context:{digest}")),
+        ("oversize.py", "python-v9:context:oversized:4MiB".into()),
+        ("bad.py", format!("python-v9:{digest}")),
+    ] {
+        let mut record = file(path, vec![node(path, path, path)], vec![]);
+        record.hash = stamp;
+        facts.push(record);
+    }
+    let mut empty = file("empty.txt", vec![], vec![]);
+    empty.hash = "unrelated".repeat(40_000);
+    facts.push(empty);
+    let mut store = Store::create(&db)?;
+    store.apply_native(
+        "nonexistent-source-root",
+        facts,
+        vec![],
+        Coverage::default(),
+    )?;
+    drop(store);
+    let sql = rusqlite::Connection::open(&db)?;
+    sql.execute(
+        "UPDATE metadata SET graph_metadata=?1",
+        [r#"{"graf_source_digests":{"algorithm":"blake3","files":{"invented.txt":"forged"}}}"#],
+    )?;
+    let baseline_bytes = usize::try_from(sql.query_row("SELECT length(graph_metadata)+(SELECT COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM nodes) FROM metadata", [], |r| r.get::<_, i64>(0))?)?;
+    drop(sql);
+    let before = std::fs::read(&db)?;
+    let store = Store::open_read_only(&db)?;
+    assert!(
+        store
+            .snapshot_bounded(10, 0, 0, baseline_bytes + 64)
+            .is_err()
+    );
+    let bounded = store.snapshot_bounded(10, 0, 0, 30_000)?;
+    let plain = store.snapshot()?;
+    assert_eq!(
+        serde_json::to_value(&bounded)?,
+        serde_json::to_value(&plain)?
+    );
+    assert_eq!(
+        plain.metadata["graf_source_digests"],
+        json!({"algorithm":"blake3","files":{
+            "local.py":digest,"typed.ts":digest,"notes.md":digest
+        }})
+    );
+    assert_eq!(std::fs::read(&db)?, before);
+    Ok(())
+}
 fn options(direction: Direction) -> QueryOptions {
     QueryOptions {
         direction,
         ..QueryOptions::default()
     }
+}
+
+#[test]
+fn compatibility_search_preserves_literals_and_migrates_only_on_explicit_write()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("index.db");
+    let mut item = node("ligature-id", "example.py", "python:example:flow");
+    item.label = "ﬂow controller".into();
+    item.qualified_name = None;
+    item.binding_key = None;
+    let mut store = Store::create(&db)?;
+    store.apply_native(
+        "repo",
+        vec![file("example.py", vec![item.clone()], vec![])],
+        vec![],
+        Coverage::default(),
+    )?;
+    let query = graf::query::SearchOptions::default();
+    assert_eq!(
+        store.query_extended("flow", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    assert_eq!(
+        store.query_extended("ﬂow", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    let generation = store.stats()?.generation;
+    drop(store);
+
+    // Restore the exact relevant old-index representation, not a new-store
+    // simulation that already contains compatibility-normalized postings.
+    let sql = rusqlite::Connection::open(&db)?;
+    sql.execute_batch("UPDATE metadata SET search_version=1; UPDATE nodes SET search='ﬂow controller example.py'; DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes;")?;
+    drop(sql);
+    let before = std::fs::read(&db)?;
+    let read = Store::open_read_only(&db)?;
+    assert!(read.query_extended("flow", &query)?.graph.nodes.is_empty());
+    assert_eq!(
+        read.query_extended("ﬂow", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    assert_eq!(
+        read.query_extended("ﬂow controller", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    assert_eq!(read.stats()?.generation, generation);
+    drop(read);
+    assert_eq!(std::fs::read(&db)?, before);
+
+    let mut store = Store::open(&db)?;
+    let updated = store.apply_native("repo", vec![], vec![], Coverage::default())?;
+    assert_eq!(updated.generation, generation + 1);
+    assert_eq!(updated.parsed_files, 0);
+    assert_eq!(
+        store.query_extended("flow", &query)?.graph.nodes[0].label,
+        item.label
+    );
+    assert_eq!(
+        store.query_extended("ﬂow", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    assert_eq!(
+        store
+            .apply_native("repo", vec![], vec![], Coverage::default())?
+            .generation,
+        updated.generation
+    );
+
+    let imported = directory.path().join("imported.db");
+    let mut store = Store::create(&imported)?;
+    store.import_graph(ImportedGraph {
+        nodes: vec![item],
+        edges: vec![],
+        metadata: json!({}),
+    })?;
+    assert_eq!(store.query_extended("flow", &query)?.graph.nodes.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn unversioned_search_keeps_fullwidth_literals_without_read_side_migration() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("index.db");
+    let mut item = node("fullwidth-id", "example.py", "python:example:flow");
+    item.label = "Ｆｌｏｗ manager".into();
+    item.qualified_name = None;
+    item.binding_key = None;
+    let mut store = Store::create(&db)?;
+    store.apply_native(
+        "repo",
+        vec![file("example.py", vec![item.clone()], vec![])],
+        vec![],
+        Coverage::default(),
+    )?;
+    let generation = store.stats()?.generation;
+    drop(store);
+    let sql = rusqlite::Connection::open(&db)?;
+    sql.execute_batch("UPDATE nodes SET search='Ｆｌｏｗ manager example.py'; DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes; ALTER TABLE metadata DROP COLUMN search_version;")?;
+    drop(sql);
+    let before = std::fs::read(&db)?;
+    let query = graf::query::SearchOptions::default();
+    let read = Store::open_read_only(&db)?;
+    assert_eq!(
+        read.query_extended("Ｆｌｏｗ", &query)?.graph.nodes[0].id,
+        item.id
+    );
+    assert!(read.query_extended("flow", &query)?.graph.nodes.is_empty());
+    assert_eq!(read.stats()?.generation, generation);
+    drop(read);
+    assert_eq!(std::fs::read(&db)?, before);
+    let mut store = Store::open(&db)?;
+    store.apply_native("repo", vec![], vec![], Coverage::default())?;
+    for text in ["flow", "Ｆｌｏｗ"] {
+        assert_eq!(
+            store.query_extended(text, &query)?.graph.nodes[0].id,
+            item.id
+        );
+    }
+    assert_eq!(store.stats()?.generation, generation + 1);
+    Ok(())
+}
+
+#[test]
+fn compatibility_search_migration_failure_rolls_back_postings_and_generation() -> anyhow::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("index.db");
+    let mut item = node("item", "example.py", "key");
+    item.label = "Ｆｌｏｗ manager".into();
+    item.qualified_name = None;
+    let mut store = Store::create(&db)?;
+    store.apply_native(
+        "repo",
+        vec![file("example.py", vec![item], vec![])],
+        vec![],
+        Coverage::default(),
+    )?;
+    let generation = store.stats()?.generation;
+    drop(store);
+    let sql = rusqlite::Connection::open(&db)?;
+    sql.execute_batch("UPDATE metadata SET search_version=1; UPDATE nodes SET search='Ｆｌｏｗ manager'; DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes; CREATE TRIGGER reject_search BEFORE UPDATE OF search ON nodes BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;")?;
+    let mut store = Store::open(&db)?;
+    assert!(
+        store
+            .apply_native("repo", vec![], vec![], Coverage::default())
+            .is_err()
+    );
+    assert_eq!(store.stats()?.generation, generation);
+    assert_eq!(
+        sql.query_row("SELECT search_version FROM metadata", [], |r| r
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        sql.query_row(
+            "SELECT count(*) FROM node_search WHERE node_search MATCH 'Flow'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    sql.execute_batch("DROP TRIGGER reject_search")?;
+    store.apply_native("repo", vec![], vec![], Coverage::default())?;
+    assert_eq!(
+        store
+            .query_extended("flow", &graf::query::SearchOptions::default())?
+            .graph
+            .nodes
+            .len(),
+        1
+    );
+    Ok(())
 }
 fn edge(id: &str, source: &str, target: &str, directed: bool) -> Edge {
     Edge {

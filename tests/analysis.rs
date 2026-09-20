@@ -729,3 +729,337 @@ fn invalid_resolution_and_community_thresholds_fail_explicitly() {
     assert!(extreme.community_modularity.is_finite());
     assert_eq!(extreme.communities.len(), 2);
 }
+
+fn leiden_options() -> AnalysisOptions {
+    AnalysisOptions {
+        community_algorithm: graf::analysis::CommunityAlgorithm::Leiden,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn native_leiden_known_modularity_and_legacy_choice() {
+    use graf::analysis::CommunityAlgorithm;
+    let defaults: AnalysisOptions = serde_json::from_str("{}").unwrap();
+    assert_eq!(defaults.community_algorithm, CommunityAlgorithm::Louvain);
+    let snapshot = joined_cliques();
+    for algorithm in [CommunityAlgorithm::Louvain, CommunityAlgorithm::Leiden] {
+        let options = AnalysisOptions {
+            community_algorithm: algorithm,
+            ..defaults.clone()
+        };
+        let report = analyze(&snapshot, &options).unwrap();
+        assert_eq!(
+            report
+                .communities
+                .iter()
+                .map(|c| c.nodes.len())
+                .collect::<Vec<_>>(),
+            [5, 5, 1]
+        );
+        assert!((report.community_modularity - 19.0 / 42.0).abs() < 1e-10);
+        assert_connected(&snapshot, &report);
+        assert_eq!(
+            report.community_convergence_known,
+            algorithm == CommunityAlgorithm::Louvain
+        );
+        if algorithm == CommunityAlgorithm::Leiden {
+            assert!(!report.community_converged);
+            assert_eq!(report.community_pass_unit, "leiden_iterations");
+            assert!(report.community_algorithm.contains("native Leiden"));
+        } else {
+            assert_eq!(report.community_pass_unit, "louvain_sweeps");
+        }
+    }
+    let options: AnalysisOptions =
+        serde_json::from_value(json!({"community_algorithm":"leiden"})).unwrap();
+    assert_eq!(options.community_seed, 42);
+    assert_eq!(options.community_local_max_passes, 100);
+}
+
+#[test]
+fn native_leiden_recovers_independently_planted_weighted_partition() {
+    // Four blocks, strong complete internal topology and weak ring bridges.
+    // The planted truth is fixed before either engine is called.
+    let mut records = Vec::new();
+    for block in 0..4 {
+        for a in 0..6 {
+            for b in a + 1..6 {
+                records.push((block * 6 + a, block * 6 + b, 4.0, false));
+            }
+        }
+        records.push((block * 6 + 5, ((block + 1) % 4) * 6, 0.25, true));
+    }
+    let snapshot = graph(26, &records);
+    let report = analyze(&snapshot, &leiden_options()).unwrap();
+    for i in 0..24 {
+        for j in 0..24 {
+            assert_eq!(
+                report.nodes[i].community == report.nodes[j].community,
+                i / 6 == j / 6
+            );
+        }
+    }
+    assert_eq!(report.communities.len(), 6);
+    // Internal weight = 240, total = 241; each block has quarter the strength.
+    assert!((report.community_modularity - (240.0 / 241.0 - 0.25)).abs() < 1e-10);
+    assert_connected(&snapshot, &report);
+}
+
+#[test]
+fn native_leiden_projection_loops_parallel_zero_weights_and_order() {
+    // Two equally weighted components, each with a loop. Q=1 - 2*(1/2)^2.
+    let records = [
+        (0, 1, 1.0, true),
+        (1, 0, 2.0, true),
+        (0, 1, 3.0, false),
+        (0, 0, 4.0, true),
+        (2, 3, 6.0, false),
+        (2, 2, 4.0, false),
+        (1, 2, 0.0, false),
+        (4, 4, 0.0, false),
+    ];
+    let mut snapshot = graph(6, &records);
+    let options = leiden_options();
+    let report = analyze(&snapshot, &options).unwrap();
+    assert_eq!(
+        report
+            .communities
+            .iter()
+            .map(|c| c.nodes.len())
+            .collect::<Vec<_>>(),
+        [2, 2, 1, 1]
+    );
+    assert!((report.community_modularity - 0.5).abs() < 1e-10);
+    assert_connected(&snapshot, &report);
+    for _ in 0..3 {
+        snapshot.nodes.reverse();
+        snapshot.edges.reverse();
+        for edge in &mut snapshot.edges {
+            std::mem::swap(&mut edge.source, &mut edge.target);
+        }
+        let reordered = analyze(&snapshot, &options).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report.communities).unwrap(),
+            serde_json::to_value(&reordered.communities).unwrap()
+        );
+        assert_eq!(report.community_modularity, reordered.community_modularity);
+    }
+    let collapsed = graph(
+        6,
+        &[
+            (0, 1, 6.0, false),
+            (0, 0, 4.0, false),
+            (2, 3, 6.0, false),
+            (2, 2, 4.0, false),
+        ],
+    );
+    let collapsed = analyze(&collapsed, &options).unwrap();
+    assert_eq!(
+        report.nodes.iter().map(|n| n.community).collect::<Vec<_>>(),
+        collapsed
+            .nodes
+            .iter()
+            .map(|n| n.community)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.community_modularity, collapsed.community_modularity);
+    let loop_only = analyze(&graph(3, &[(0, 0, 2.0, false)]), &options).unwrap();
+    assert_eq!(loop_only.communities.len(), 3);
+    assert!(loop_only.community_modularity.abs() < 1e-10);
+}
+
+#[test]
+fn native_leiden_caps_and_adversarial_connectivity_are_honest() {
+    // A chain of cliques with extra movable articulation vertices and leaves.
+    // Incomplete local moves must never leak disconnected final communities.
+    let mut records = Vec::new();
+    for block in 0..8 {
+        let start = block * 4;
+        for a in start..start + 4 {
+            for b in a + 1..start + 4 {
+                records.push((a, b, 2.0, false));
+            }
+        }
+        records.push((start, 32 + block, 1.0, false));
+        if block < 7 {
+            records.push((start + 3, start + 4, 1.0, false));
+            records.push((32 + block, start + 4, 0.5, false));
+        }
+    }
+    let snapshot = graph(42, &records);
+    for seed in [0, 1, 42, u64::MAX] {
+        let options = AnalysisOptions {
+            community_seed: seed,
+            community_max_passes: 1,
+            community_local_max_passes: 1,
+            max_community_size: Some(1),
+            ..leiden_options()
+        };
+        let report = analyze(&snapshot, &options).unwrap();
+        assert_eq!(report.community_passes, 1);
+        assert!(!report.community_converged);
+        assert!(!report.community_convergence_known);
+        assert_eq!(report.community_split_attempts, 0);
+        assert_eq!(
+            report.unsatisfied_community_constraints,
+            report
+                .communities
+                .iter()
+                .filter(|c| c.nodes.len() > 1)
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        );
+        assert_connected(&snapshot, &report);
+    }
+    assert!(
+        analyze(
+            &snapshot,
+            &AnalysisOptions {
+                community_local_max_passes: 0,
+                ..leiden_options()
+            }
+        )
+        .is_err()
+    );
+    let empty = analyze(&graph(4, &[]), &leiden_options()).unwrap();
+    assert_eq!(empty.community_passes, 0);
+    assert!(empty.community_converged && empty.community_convergence_known);
+}
+
+#[test]
+fn native_leiden_optional_thresholds_are_soft_and_share_iteration_budget() {
+    let options = AnalysisOptions {
+        resolution: 0.05,
+        max_community_size: Some(5),
+        ..leiden_options()
+    };
+    let report = analyze(&joined_cliques(), &options).unwrap();
+    assert_eq!(
+        report
+            .communities
+            .iter()
+            .map(|c| c.nodes.len())
+            .collect::<Vec<_>>(),
+        [5, 5, 1]
+    );
+    assert!(report.community_split_attempts > 0);
+    assert!(report.community_passes <= options.community_max_passes);
+    assert!(report.unsatisfied_community_constraints.is_empty());
+    let clique = graph(
+        4,
+        &[
+            (0, 1, 1.0, false),
+            (0, 2, 1.0, false),
+            (0, 3, 1.0, false),
+            (1, 2, 1.0, false),
+            (1, 3, 1.0, false),
+            (2, 3, 1.0, false),
+        ],
+    );
+    let report = analyze(
+        &clique,
+        &AnalysisOptions {
+            max_community_size: Some(2),
+            ..leiden_options()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.communities.len(), 1);
+    assert_eq!(report.unsatisfied_community_constraints, [0]);
+}
+
+#[test]
+fn preserved_community_identity_survives_analysis_and_composition() {
+    use graf::analysis::preserved_communities;
+    let mut snapshot = graph(7, &[(0, 1, 1.0, false)]);
+    snapshot.nodes[0].metadata = json!({"community":7,"community_name":"Backend"});
+    snapshot.nodes[1].metadata = json!({"community":7,"community_name":"Older name"});
+    snapshot.nodes[2].metadata = json!({"community":"7","community_name":"String identity"});
+    snapshot.nodes[3].metadata = json!({"project":"alpha","original_id":"old","original_metadata":{"community":7,"community_name":"Imported"}});
+    snapshot.nodes[4].metadata =
+        json!({"project":"beta","original_id":"old","original_metadata":{"community":7}});
+    snapshot.nodes[5].metadata = json!({"community":null});
+    snapshot.nodes[6].metadata = json!({"community":7.5});
+    let before = serde_json::to_value(&snapshot).unwrap();
+    let groups = preserved_communities(&snapshot);
+    assert_eq!(groups.len(), 4);
+    let integer = groups
+        .iter()
+        .find(|c| c.project.is_empty() && c.id == json!(7))
+        .unwrap();
+    assert_eq!(integer.nodes, ["n00", "n01"]);
+    assert_eq!(integer.names, ["Backend", "Older name"]);
+    assert!(
+        groups
+            .iter()
+            .any(|c| c.project.is_empty() && c.id == json!("7") && c.nodes == ["n02"])
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|c| c.project == ["alpha"] && c.id == json!(7) && c.nodes == ["n03"])
+    );
+    for options in [AnalysisOptions::default(), leiden_options()] {
+        analyze(&snapshot, &options).unwrap();
+        assert_eq!(before, serde_json::to_value(&snapshot).unwrap());
+    }
+    snapshot.nodes.reverse();
+    assert_eq!(
+        serde_json::to_value(groups).unwrap(),
+        serde_json::to_value(preserved_communities(&snapshot)).unwrap()
+    );
+}
+
+#[test]
+fn native_leiden_loop_strength_and_weight_scale_change_no_objective() {
+    // Separate loop-heavy nodes have Q = 8/9 - 1/2 = 7/18; merging gives zero.
+    for scale in [1e-200, 1.0, 1e200] {
+        let snapshot = graph(
+            2,
+            &[
+                (0, 0, 4.0 * scale, false),
+                (1, 1, 4.0 * scale, true),
+                (0, 1, scale, false),
+            ],
+        );
+        let report = analyze(&snapshot, &leiden_options()).unwrap();
+        assert_eq!(report.communities.len(), 2);
+        assert!((report.community_modularity - 7.0 / 18.0).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn native_leiden_hub_reattachment_keeps_connected_groups_and_metadata() {
+    let mut snapshot = joined_cliques();
+    for node in 0..10 {
+        let mut edge = snapshot.edges[0].clone();
+        edge.id = format!("hub{node}");
+        edge.source = "n10".into();
+        edge.target = format!("n{node:02}");
+        snapshot.edges.push(edge);
+    }
+    let options = AnalysisOptions {
+        exclude_hubs_percentile: Some(80.0),
+        ..leiden_options()
+    };
+    let report = analyze(&snapshot, &options).unwrap();
+    // Eight clique nodes have degree 5; bridge endpoints n04/n05 have 6;
+    // n10 has 10. The 80th-percentile rank is floor(11*0.8)=8, whose
+    // degree is 5, so all three nodes strictly above 5 must be excluded.
+    assert_eq!(
+        report.nodes.iter().map(|n| n.degree).collect::<Vec<_>>(),
+        [5, 5, 5, 5, 6, 6, 5, 5, 5, 5, 10]
+    );
+    assert_eq!(report.excluded_hubs, ["n04", "n05", "n10"]);
+    assert_eq!(
+        report
+            .communities
+            .iter()
+            .map(|c| c.nodes.len())
+            .collect::<Vec<_>>(),
+        [6, 5]
+    );
+    assert!(!report.community_convergence_known);
+    assert_connected(&snapshot, &report);
+}

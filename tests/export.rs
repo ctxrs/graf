@@ -634,3 +634,363 @@ fn vault_graph_color_snippets_match_actual_tags_and_preserve_user_configuration(
     .unwrap();
     assert_ne!(next_config["colorGroups"][0]["query"], groups[0]["query"]);
 }
+
+#[test]
+fn viewer_traversal_keeps_off_page_mixed_relations_and_source_evidence() {
+    use graf::export::{ExportOptions, render_with_options};
+    let mut snapshot = fixture();
+    let template = snapshot.nodes[0].clone();
+    let hostile = "neighbor\" </script><img src=x onerror=alert(1)> 世界";
+    snapshot.nodes = ["origin", "same-label", "off-page", hostile]
+        .iter()
+        .map(|id| Node {
+            id: (*id).into(),
+            label: "Shared label".into(),
+            file: format!("docs/{id}.md"),
+            ..template.clone()
+        })
+        .collect();
+    let edge = snapshot.edges[0].clone();
+    snapshot.edges = [
+        ("origin", hostile, true),
+        (hostile, "origin", true),
+        ("origin", hostile, false),
+        ("origin", "origin", false),
+        ("origin", "off-page", true),
+        ("origin", hostile, true),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (source, target, directed))| Edge {
+        id: format!("record-{i}"),
+        source: (*source).into(),
+        target: (*target).into(),
+        directed: *directed,
+        relation: format!("relation-{i} </script>"),
+        file: Some(format!("evidence/{i}.md")),
+        line: Some(i as u32 + 1),
+        ..edge.clone()
+    })
+    .collect();
+    let options = ExportOptions {
+        node_limit: 1,
+        edge_limit: 1,
+        ..Default::default()
+    };
+    let html = render_with_options(&snapshot, ExportFormat::Html, &options).unwrap();
+    let embedded = html
+        .split("<script id=\"graf-data\" type=\"application/json\">")
+        .nth(1)
+        .unwrap()
+        .split("</script>")
+        .next()
+        .unwrap();
+    let data: Value = serde_json::from_str(embedded).unwrap();
+    assert_eq!(data["snapshot"], serde_json::to_value(&snapshot).unwrap());
+    assert_eq!(data["viewer"]["node_limit"], 1);
+    assert_eq!(data["viewer"]["edge_limit"], 1);
+    assert!(!html.contains("<img src=x"));
+    assert!(!html.contains("innerHTML"));
+    assert!(html.contains("connect-src 'none'"));
+    // Export contract only: browser execution separately checks traversal,
+    // focus restoration, geometry, and the inert rendering of these records.
+    for control in [
+        "back",
+        "focus-node",
+        "neighbors",
+        "neighbor-direction",
+        "neighbor-search",
+        "neighbor-previous",
+        "neighbor-next",
+        "fit",
+        "zoom-in",
+        "zoom-out",
+    ] {
+        assert!(html.contains(&format!("id=\"{control}\"")), "{control}");
+    }
+}
+
+#[test]
+fn viewer_empty_snapshot_stays_exportable_and_edge_limit_must_be_positive() {
+    use graf::export::{ExportOptions, render_with_options};
+    let mut snapshot = fixture();
+    snapshot.nodes.clear();
+    snapshot.edges.clear();
+    let html = render(&snapshot, ExportFormat::Html).unwrap();
+    let embedded = html
+        .split("<script id=\"graf-data\" type=\"application/json\">")
+        .nth(1)
+        .unwrap()
+        .split("</script>")
+        .next()
+        .unwrap();
+    let data: Value = serde_json::from_str(embedded).unwrap();
+    assert_eq!(data["snapshot"], serde_json::to_value(&snapshot).unwrap());
+    assert_eq!(data["analysis"]["nodes"], json!([]));
+    assert_eq!(data["analysis"]["communities"], json!([]));
+    assert!(html.contains("id=\"download\""));
+    assert!(
+        render_with_options(
+            &snapshot,
+            ExportFormat::Html,
+            &ExportOptions {
+                edge_limit: 0,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+fn viewer_data(html: &str) -> Value {
+    serde_json::from_str(
+        html.split("<script id=\"graf-data\" type=\"application/json\">")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn learning_fixture(snapshot: &GraphSnapshot) -> graf::memory::LearningOverlay {
+    graf::memory::LearningOverlay {
+        schema_version: 1,
+        generated_unix_secs: 1234,
+        snapshot_hash: Some(blake3::hash(&serde_json::to_vec(snapshot).unwrap()).to_hex().to_string()),
+        nodes: [(snapshot.nodes[0].id.clone(), graf::memory::LearningNode {
+            status: "tentative".into(), score: 1.5, useful: 2, negative: 0,
+            verified_useful: 0, unverified: 2,
+            reason: "unverified </script><img id=learning-injection src=x onerror=alert(1)> 世界".into(),
+        })].into(),
+        lessons: "# Lessons\n## preferred\n## tentative\n    α | useful=2 | verified_useful=0 | unverified=2\nQuestion: <script>alert(1)</script>\nDead end: [link](javascript:evil)\n```\nOriginal answer 世界\nCorrection: preserved\r<img src=x onerror=alert(1)>".into(),
+    }
+}
+
+#[test]
+fn learning_exports_bind_exact_snapshot_escape_observations_and_keep_topology() {
+    use graf::export::{ExportOptions, render_with_options, write_vault_with_options};
+    let snapshot = fixture();
+    let before = serde_json::to_value(&snapshot).unwrap();
+    let options = ExportOptions {
+        learning: Some(learning_fixture(&snapshot)),
+        ..Default::default()
+    };
+    let plain = render(&snapshot, ExportFormat::Html).unwrap();
+    let html = render_with_options(&snapshot, ExportFormat::Html, &options).unwrap();
+    let embedded = viewer_data(&html);
+    assert_eq!(embedded["snapshot"], before);
+    assert_eq!(embedded["analysis"], viewer_data(&plain)["analysis"]);
+    assert_eq!(
+        embedded["learning"],
+        serde_json::to_value(options.learning.as_ref().unwrap()).unwrap()
+    );
+    assert_eq!(embedded["learning"]["nodes"]["α"]["status"], "tentative");
+    assert!(embedded["learning"]["nodes"].get("../notes/世界").is_none());
+    assert!(!html.contains("<img id=learning-injection"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(!html.contains("innerHTML"));
+    assert!(html.contains("connect-src 'none'"));
+    assert!(viewer_data(&plain)["learning"].is_null());
+    let report = render_with_options(&snapshot, ExportFormat::Markdown, &options).unwrap();
+    assert!(report.contains("## Work-memory lessons"));
+    assert!(report.contains("Status: tentative"));
+    assert!(report.contains("verified useful 0"));
+    assert!(report.contains("Original answer 世界"));
+    assert!(report.contains("    Correction: preserved\n"));
+    assert!(report.contains("\n## preferred\n\n"));
+    assert!(
+        report.contains(
+            "\n## tentative\n\n        α | useful=2 | verified_useful=0 | unverified=2\n"
+        )
+    );
+    assert!(report.contains("    Question: <script>alert(1)</script>\n"));
+    assert!(report.contains("    Dead end: [link](javascript:evil)\n"));
+    assert!(report.contains("    ```\n"));
+    assert!(report.contains("\n    <img src=x onerror=alert(1)>\n"));
+    let lessons = report
+        .split("### Recorded lessons and event provenance\n\n")
+        .nth(1)
+        .unwrap();
+    assert!(lessons.lines().all(|line| line.is_empty()
+        || line.starts_with("    ")
+        || matches!(line, "## preferred" | "## tentative")));
+    assert!(
+        !render(&snapshot, ExportFormat::Markdown)
+            .unwrap()
+            .contains("## Work-memory lessons")
+    );
+    let vault = tempfile::tempdir().unwrap();
+    let output = write_vault_with_options(&snapshot, vault.path(), &options).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(output.directory.join("report.md")).unwrap(),
+        report
+    );
+    let first = std::fs::read_to_string(output.directory.join("node-0.md")).unwrap();
+    assert!(first.contains("## Work-memory observation"));
+    assert!(first.contains("Status: tentative"));
+    assert!(!first.contains("<img"));
+    assert!(
+        !std::fs::read_to_string(output.directory.join("node-1.md"))
+            .unwrap()
+            .contains("## Work-memory observation")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &std::fs::read_to_string(output.directory.join("snapshot.json")).unwrap()
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), before);
+}
+
+#[test]
+fn learning_mismatch_rejected_before_render_or_vault_creation() {
+    use graf::export::{ExportOptions, render_with_options, write_vault_with_options};
+    let snapshot = fixture();
+    let options = ExportOptions {
+        learning: Some(learning_fixture(&snapshot)),
+        ..Default::default()
+    };
+    for change in 0..5 {
+        let mut other = snapshot.clone();
+        match change {
+            0 => other.generation += 1,
+            1 => other.nodes[0].label.push_str(" changed"),
+            2 => other.edges[0].relation = "references".into(),
+            3 => other.metadata["source_proof"] = json!("different"),
+            _ => other.root = Some("another-root".into()),
+        }
+        for format in [ExportFormat::Html, ExportFormat::Markdown] {
+            let error = render_with_options(&other, format, &options).unwrap_err();
+            assert!(error.to_string().contains("exact snapshot"), "{error}");
+        }
+        let vault = tempfile::tempdir().unwrap();
+        let error = write_vault_with_options(&other, vault.path(), &options).unwrap_err();
+        assert!(error.to_string().contains("exact snapshot"));
+        assert_eq!(std::fs::read_dir(vault.path()).unwrap().count(), 0);
+    }
+    for invalid in 0..3 {
+        let mut options = options.clone();
+        let learning = options.learning.as_mut().unwrap();
+        match invalid {
+            0 => learning.snapshot_hash = None,
+            1 => learning.schema_version = 999,
+            _ => learning.nodes.values_mut().next().unwrap().score = f64::NAN,
+        }
+        assert!(render_with_options(&snapshot, ExportFormat::Html, &options).is_err());
+    }
+}
+
+#[test]
+fn learning_rejects_other_formats_and_empty_memory_still_matches_snapshot() {
+    use graf::export::{ExportOptions, render_with_options};
+    let snapshot = fixture();
+    let options = ExportOptions {
+        learning: Some(learning_fixture(&snapshot)),
+        ..Default::default()
+    };
+    for format in [
+        ExportFormat::SnapshotJson,
+        ExportFormat::GraphifyJson,
+        ExportFormat::GraphMl,
+        ExportFormat::Cypher,
+        ExportFormat::Mermaid,
+        ExportFormat::Svg,
+        ExportFormat::Canvas,
+        ExportFormat::CallflowHtml,
+        ExportFormat::TreeHtml,
+    ] {
+        let error = render_with_options(&snapshot, format, &options).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only by HTML, Markdown and wiki")
+        );
+    }
+    let memory = tempfile::tempdir().unwrap();
+    let overlay = graf::memory::learning_overlay_at(
+        &graf::memory::ReflectArgs {
+            memory_dir: memory.path().into(),
+            out: memory.path().join("must-not-exist.md"),
+            half_life_days: 30.0,
+            min_corroboration: 2,
+            if_stale: false,
+        },
+        Some(&snapshot),
+        42,
+    )
+    .unwrap();
+    assert_eq!(
+        overlay.snapshot_hash,
+        options.learning.unwrap().snapshot_hash
+    );
+    let options = ExportOptions {
+        learning: Some(overlay),
+        ..Default::default()
+    };
+    assert!(viewer_data(&render_with_options(&snapshot, ExportFormat::Html, &options).unwrap())["learning"]["nodes"].as_object().unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(memory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn viewer_groups_use_current_incidence_edges_without_cliques_or_metadata_guesses() {
+    use graf::export::{ExportOptions, render_with_options};
+    let imported = import(&json!({"directed":false,"multigraph":false,"nodes":[{"id":"a"},{"id":"b"},{"id":"c"}],"links":[],
+        "hyperedges":[{"id":"recorded","label":"Group 世界 </script><img src=x>","nodes":["a","b","c"]}]}).to_string());
+    let mut graph = GraphSnapshot {
+        schema_version: 1,
+        generation: 1,
+        kind: "imported".into(),
+        root: None,
+        nodes: imported.nodes,
+        edges: imported.edges,
+        metadata: imported.metadata,
+    };
+    let group_id = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == "group")
+        .unwrap()
+        .id
+        .clone();
+    // Old embedded group metadata still names c. Only current edges can establish membership.
+    graph.edges.retain(|edge| edge.source != "c");
+    let mut ordinary = graph.edges[0].clone();
+    ordinary.id = "ordinary-group-relation".into();
+    ordinary.source = "c".into();
+    ordinary.relation = "references".into();
+    graph.edges.push(ordinary);
+    // A second incidence is evidence, not a duplicate node or an inferred clique edge.
+    let mut parallel = graph.edges[0].clone();
+    parallel.id = "corroborating-membership".into();
+    std::mem::swap(&mut parallel.source, &mut parallel.target);
+    graph.edges.push(parallel);
+    let before = serde_json::to_value(&graph).unwrap();
+    let options = ExportOptions {
+        node_limit: 1,
+        edge_limit: 1,
+        ..Default::default()
+    };
+    let html = render_with_options(&graph, ExportFormat::Html, &options).unwrap();
+    let data = viewer_data(&html);
+    assert_eq!(data["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(data["groups"][0]["id"], group_id);
+    assert_eq!(data["groups"][0]["members"], json!(["a", "b"]));
+    let incidences: BTreeSet<_> = data["groups"][0]["incidences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(incidences.len(), 3);
+    assert!(incidences.contains("corroborating-membership"));
+    assert!(!incidences.contains("ordinary-group-relation"));
+    assert_eq!(data["snapshot"], before);
+    assert_eq!(data["viewer"], json!({"node_limit":1,"edge_limit":1}));
+    assert_eq!(serde_json::to_value(&graph).unwrap(), before);
+    assert!(!html.contains("<img src=x>"));
+    assert!(html.contains("id=\"groups-panel\""));
+}

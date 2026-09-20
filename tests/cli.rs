@@ -78,6 +78,236 @@ fn ids(graph: &Value) -> Vec<&str> {
     ids
 }
 
+fn learning_cli_fixture() -> (TempDir, String) {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join("source")).unwrap();
+    fs::write(
+        dir.path().join("source/policy.py"),
+        "def policy():\n    return 1\n",
+    )
+    .unwrap();
+    let db = dir.path().join("learning.db");
+    graf::index::run(&dir.path().join("source"), &db).unwrap();
+    let graph = graf::store::Store::open_read_only(&db)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    let id = graph
+        .nodes
+        .iter()
+        .find(|node| node.label == "policy" && node.kind == "function")
+        .unwrap()
+        .id
+        .clone();
+    (dir, id)
+}
+
+fn save_cli_learning(dir: &Path, id: &str) {
+    success(cli(
+        dir,
+        &[
+            "--db",
+            "learning.db",
+            "--json",
+            "save-result",
+            "--question",
+            "Where is the policy?",
+            "--answer",
+            "Do not include this saved answer in node annotations.",
+            "--nodes",
+            id,
+            "--outcome",
+            "useful",
+            "--memory-dir",
+            "memory",
+        ],
+    ));
+}
+
+#[test]
+fn explain_learning_is_explicit_read_only_and_fresh_in_json_and_text() {
+    let (dir, id) = learning_cli_fixture();
+    let args = ["--db", "learning.db", "explain", &id, "--json"];
+    let baseline = success(cli(dir.path(), &args));
+    let baseline_text = cli(dir.path(), &["--db", "learning.db", "show", &id]);
+    assert!(baseline_text.status.success());
+    save_cli_learning(dir.path(), &id);
+    save_cli_learning(dir.path(), &id);
+    let db_before = fs::read(dir.path().join("learning.db")).unwrap();
+    let memory_before: std::collections::BTreeMap<_, _> = fs::read_dir(dir.path().join("memory"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect();
+    assert_eq!(success(cli(dir.path(), &args)), baseline);
+    assert_eq!(
+        cli(dir.path(), &["--db", "learning.db", "show", &id]).stdout,
+        baseline_text.stdout
+    );
+    let annotated_args = [
+        "--db",
+        "learning.db",
+        "explain",
+        &id,
+        "--json",
+        "--memory-dir",
+        "memory",
+    ];
+    let mut annotated = success(cli(dir.path(), &annotated_args));
+    assert_eq!(annotated["learning"]["nodes"][&id]["status"], "preferred");
+    assert_eq!(annotated["learning"]["nodes"][&id]["verified_useful"], 2);
+    assert!(annotated["learning"].get("lessons").is_none());
+    assert!(
+        !annotated
+            .to_string()
+            .contains("Do not include this saved answer")
+    );
+    annotated.as_object_mut().unwrap().remove("learning");
+    assert_eq!(annotated, baseline);
+    let text = cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "explain",
+            &id,
+            "--memory-dir",
+            "memory",
+        ],
+    );
+    assert!(text.status.success());
+    assert!(text.stdout.starts_with(&baseline_text.stdout));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Lesson ") && text.contains("preferred"));
+    assert_terminal_safe(&text);
+    fs::write(
+        dir.path().join("source/policy.py"),
+        "def policy():\n    return 2\n",
+    )
+    .unwrap();
+    let stale = success(cli(dir.path(), &annotated_args));
+    assert_eq!(stale["learning"]["nodes"][&id]["status"], "stale");
+    assert_eq!(stale["generation"], baseline["generation"]);
+    let text = cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "explain",
+            &id,
+            "--memory-dir",
+            "memory",
+        ],
+    );
+    assert!(text.status.success());
+    assert!(String::from_utf8(text.stdout).unwrap().contains("stale"));
+    assert_eq!(fs::read(dir.path().join("learning.db")).unwrap(), db_before);
+    for (path, bytes) in memory_before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(fs::read_dir(dir.path().join("memory")).unwrap().count(), 2);
+    assert!(!dir.path().join("graf-out").exists());
+    failure(cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "callers",
+            &id,
+            "--memory-dir",
+            "memory",
+        ],
+    ));
+}
+
+#[test]
+fn explain_learning_budget_and_invalid_memory_preserve_the_selected_graph() {
+    let (dir, id) = learning_cli_fixture();
+    save_cli_learning(dir.path(), &id);
+    let full = success(cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "show",
+            &id,
+            "--json",
+            "--budget",
+            "2000",
+        ],
+    ));
+    let bytes = serde_json::to_vec(&full["graph"]).unwrap().len();
+    let budget = (bytes.div_ceil(4) + 4).to_string();
+    let base_args = [
+        "--db",
+        "learning.db",
+        "show",
+        &id,
+        "--json",
+        "--budget",
+        &budget,
+    ];
+    let baseline = success(cli(dir.path(), &base_args));
+    let mut annotated_args = base_args.to_vec();
+    annotated_args.extend(["--memory-dir", "memory"]);
+    let mut annotated = success(cli(dir.path(), &annotated_args));
+    assert!(annotated.get("learning").is_none());
+    assert!(
+        annotated["learning_notice"]
+            .as_str()
+            .unwrap()
+            .contains("budget")
+    );
+    annotated.as_object_mut().unwrap().remove("learning_notice");
+    assert_eq!(annotated, baseline);
+    fs::write(
+        dir.path().join("memory/too-large.md"),
+        vec![b'x'; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let mut invalid = success(cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "show",
+            &id,
+            "--json",
+            "--budget",
+            "2000",
+            "--memory-dir",
+            "memory",
+        ],
+    ));
+    assert!(
+        invalid["learning_notice"]
+            .as_str()
+            .unwrap()
+            .contains("memory could not be read")
+    );
+    invalid.as_object_mut().unwrap().remove("learning_notice");
+    assert_eq!(invalid, full);
+    assert_eq!(success(cli(dir.path(), &base_args)), baseline);
+    let absent = dir.path().join("absent-memory");
+    let empty = success(cli(
+        dir.path(),
+        &[
+            "--db",
+            "learning.db",
+            "explain",
+            &id,
+            "--json",
+            "--memory-dir",
+            absent.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(empty["learning"]["status"], "complete");
+    assert!(empty["learning"]["nodes"].as_object().unwrap().is_empty());
+    assert!(!absent.exists());
+}
+
 #[test]
 fn imported_cli_routes_direction_relations_and_preserves_snapshot() {
     let dir = imported();

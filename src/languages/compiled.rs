@@ -1307,7 +1307,15 @@ impl<'s, 't> Compiled<'s, 't> {
             self.type_evidence(ty, scope, context);
         }
         let ty = ty_node
-            .and_then(|n| self.name(n))
+            .and_then(|n| {
+                // An existential names a protocol declaration, not an implementor.
+                let n = if self.e.language == "swift" && n.kind() == "existential_type" {
+                    n.named_child(0).filter(|n| n.kind() == "user_type")?
+                } else {
+                    n
+                };
+                self.name(n)
+            })
             .filter(|s| !matches!(s.as_str(), "var" | "auto" | "dynamic" | "Any" | "AnyObject"));
         let ty = if contains_kind(declarator, "function_declarator") {
             None
@@ -3202,9 +3210,47 @@ impl CompiledContext {
                             .replacen(":member:", ":symbol:", 1)
                             .replacen(":base:", ":symbol:", 1)
                             .replacen(":static:", ":symbol:", 1);
+                        let kotlin_static = static_call && key.starts_with("kotlin:");
+                        let cpp_qualified = r.label.contains("::")
+                            && matches!(
+                                f.nodes
+                                    .first()
+                                    .and_then(|n| n.metadata["language"].as_str()),
+                                Some("cpp")
+                            );
+                        let type_key = if cpp_qualified {
+                            type_key.replacen(":header-static:", ":header-symbol:", 1)
+                        } else {
+                            type_key
+                        };
                         let Some(owner) = inventory.canonical(source, &type_key) else {
+                            // A duplicate receiver must not fall through to a unique
+                            // method key (one duplicate may lack that method).
+                            if (kotlin_static || cpp_qualified)
+                                && inventory
+                                    .types
+                                    .contains_key(&(inventory.unit(source), type_key))
+                            {
+                                result.candidates.insert(r.id.clone(), vec![]);
+                                break;
+                            }
                             continue;
                         };
+                        // Keep qualified-only C++ definitions usable when the header
+                        // supplied no member declaration. A known declaration, however,
+                        // must enforce its access and dispatch evidence before fallback.
+                        if kotlin_static
+                            || (cpp_qualified
+                                && inventory.nodes.values().any(|n| {
+                                    n.label == name
+                                        && inventory
+                                            .parents
+                                            .get(&n.id)
+                                            .is_some_and(|p| inventory.group(&owner).contains(p))
+                                }))
+                        {
+                            result.candidates.insert(r.id.clone(), vec![]);
+                        }
                         let target = if base_call {
                             inventory
                                 .bases

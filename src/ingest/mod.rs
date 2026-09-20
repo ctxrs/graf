@@ -18,7 +18,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use semantic::{Provider, SemanticBudget, SemanticOptions, SemanticUsage};
+pub use semantic::{
+    Provider, ProviderUsage, SemanticBudget, SemanticOptions, SemanticUsage, SemanticUsageRecorder,
+};
 pub use semantic::{
     SemanticCacheEntry, SemanticCacheStatus, inspect_semantic_cache, remove_semantic_cache_entry,
 };

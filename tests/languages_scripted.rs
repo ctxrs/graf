@@ -1540,3 +1540,348 @@ fn ruby_named_visibility_overrides_preserve_public_overrides_and_reject_dynamics
                 && e.relation == "calls")
     );
 }
+
+fn assert_inline_js_aliases(f: &FileFacts) {
+    for n in &f.nodes {
+        assert!(
+            n.metadata
+                .get("binding_aliases")
+                .is_none_or(serde_json::Value::is_array),
+            "binding_aliases must be absent or an array: {}",
+            n.id
+        );
+    }
+}
+
+#[test]
+fn php_inline_js_preserves_php_and_original_byte_coordinates() {
+    let php = "<?php function shared() {} function server() { shared(); } ?>";
+    let source = format!(
+        "{php}π<script data-note=\">\">function shared() {{}}\r\nfunction browser() {{ shared(); }}\r\n</script>\r\n<script>function next() {{ browser(); }} next();</script>"
+    );
+    let f = facts("page.php", &source);
+    assert_inline_js_aliases(&f);
+    let original = facts("page.php", php);
+    for n in original.nodes.iter().skip(1) {
+        assert_eq!(
+            serde_json::to_value(n).unwrap(),
+            serde_json::to_value(f.nodes.iter().find(|other| other.id == n.id).unwrap()).unwrap()
+        );
+    }
+    for reference in &original.references {
+        assert_eq!(
+            serde_json::to_value(reference).unwrap(),
+            serde_json::to_value(f.references.iter().find(|r| r.id == reference.id).unwrap())
+                .unwrap()
+        );
+    }
+    for declaration in [
+        "function shared() {}",
+        "function browser() { shared(); }",
+        "function next() { browser(); }",
+    ] {
+        let start = source.rfind(declaration).unwrap();
+        let n = f
+            .nodes
+            .iter()
+            .find(|n| n.metadata["language"] == "javascript" && n.metadata["start_byte"] == start)
+            .unwrap();
+        assert_eq!(n.file, "page.php");
+        assert_eq!(n.metadata["end_byte"], start + declaration.len());
+        assert_eq!(
+            n.metadata["start_column"],
+            start - source[..start].rfind('\n').map_or(0, |p| p + 1)
+        );
+        assert_eq!(
+            n.line,
+            Some(source[..start].bytes().filter(|b| *b == b'\n').count() as u32 + 1)
+        );
+        assert_eq!(
+            &source[start..n.metadata["end_byte"].as_u64().unwrap() as usize],
+            declaration
+        );
+        assert!(
+            f.edges
+                .iter()
+                .any(|e| e.source == f.nodes[0].id && e.target == n.id && e.relation == "contains")
+        );
+    }
+    let js_shared = f
+        .nodes
+        .iter()
+        .find(|n| n.label == "shared" && n.metadata["language"] == "javascript")
+        .unwrap();
+    assert_ne!(js_shared.id, node(&original, "shared").id);
+    let browser = node(&f, "browser").id.clone();
+    let next = node(&f, "next").id.clone();
+    assert!(
+        refs(&f, "calls", "shared")
+            .iter()
+            .any(|r| r.source == browser && r.line == 2)
+    );
+    assert!(
+        refs(&f, "calls", "next")
+            .iter()
+            .any(|r| r.source == f.nodes[0].id && r.line == 4)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&dir.path().join("graph.db")).unwrap();
+    // A sibling JS module with the same stem must not steal inline calls or vice versa.
+    let sibling = facts(
+        "page.js",
+        "function shared() {} function client() { shared(); }",
+    );
+    let targets = [
+        (browser, js_shared.id.clone()),
+        (next, node(&f, "browser").id.clone()),
+        (
+            node(&f, "server").id.clone(),
+            node(&original, "shared").id.clone(),
+        ),
+        (
+            node(&sibling, "client").id.clone(),
+            node(&sibling, "shared").id.clone(),
+        ),
+    ];
+    store
+        .apply_native(
+            "fixture",
+            vec![f.clone(), sibling],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let graph = store.snapshot().unwrap();
+    for (caller, target) in targets {
+        let calls: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller && e.relation == "calls")
+            .collect();
+        assert_eq!(calls.len(), 1, "{caller}: {calls:?}");
+        assert_eq!(calls[0].target, target);
+    }
+    assert_eq!(
+        serde_json::to_value(&f).unwrap(),
+        serde_json::to_value(facts("page.php", &source)).unwrap()
+    );
+    for ids in [
+        f.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        f.edges.iter().map(|e| &e.id).collect(),
+        f.references.iter().map(|r| &r.id).collect(),
+    ] {
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+    }
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|e| graph.nodes.iter().any(|n| n.id == e.source)
+                && graph.nodes.iter().any(|n| n.id == e.target))
+    );
+}
+
+#[test]
+fn php_inline_js_only_reads_literal_html_script_bodies() {
+    let source = r#"<?php
+function serverOnly() {}
+echo '<script>function echoed() { phantom(); }</script>';
+$markup = "<script>function quoted() { phantom(); }</script>";
+$doc = <<<'MARKUP'
+<script>function heredocText() { phantom(); }</script>
+MARKUP;
+// <script>function commentText() { phantom(); }</script>
+?>
+<!-- <script>function htmlComment() { phantom(); }</script> -->
+<div title="<script>function attributeText() { phantom(); }</script>"></div>
+<textarea><script>function rawText() { phantom(); }</script></textarea>
+<style>p::after { content: '<script>function cssText() { phantom(); }</script>'; }</style>
+<script SRC="external.js">function externalBody() { phantom(); }</script>
+<script type="application/ld+json">function dataBody() { phantom(); }</script>
+<script type="text/plain">function plainBody() { phantom(); }</script>
+<script language="VBScript">function otherLanguage() { phantom(); }</script>
+<script lang="ts">function typedBody() { phantom(); }</script>
+<script>function generated() { <?php echo 'phantom();'; ?> }</script>
+<SCRIPT TYPE=" Text/JavaScript " data-note=">"><!--
+function visible() {}
+// -->
+</SCRIPT>
+<?php function later() { serverOnly(); } ?>
+"#;
+    let f = facts("literal.phtml", source);
+    let js: Vec<_> = f
+        .nodes
+        .iter()
+        .filter(|n| n.metadata["language"] == "javascript")
+        .map(|n| n.label.as_str())
+        .collect();
+    assert_eq!(js, ["visible"]);
+    assert!(refs(&f, "calls", "phantom").is_empty());
+    assert!(refs(&f, "imports", "external.js").is_empty());
+    assert!(f.nodes.iter().any(|n| n.label == "serverOnly"));
+    assert!(f.nodes.iter().any(|n| n.label == "later"));
+    let shell = facts(
+        "literal.sh",
+        "printf '%s' '<script>function shellText() { phantom(); }</script>'\n",
+    );
+    assert!(
+        shell
+            .nodes
+            .iter()
+            .all(|n| n.metadata["language"] != "javascript")
+    );
+}
+
+#[test]
+fn php_inline_js_finds_markup_inside_php_control_flow_and_before_open_tag() {
+    let f = facts(
+        "conditional.php",
+        "<script>function before() {}</script><?php if (true) { ?><script>function inside() { before(); }</script><?php } ?>",
+    );
+    assert_inline_js_aliases(&f);
+    stored(
+        vec![f.clone()],
+        &node(&f, "inside").id,
+        &node(&f, "before").id,
+        "calls",
+    );
+}
+
+#[test]
+fn php_inline_js_module_scopes_do_not_collide_with_classic_scripts() {
+    let source = "<?php function same() {} ?><script>function same() {} function classic() { same(); }</script><script type=\"module\">function same() {} function moduleOne() { same(); }</script><script type=\"module\">function same() {} function moduleTwo() { same(); }</script>";
+    let f = facts("modules.php", source);
+    assert_inline_js_aliases(&f);
+    let declarations: Vec<_> = f
+        .nodes
+        .iter()
+        .filter(|n| n.label == "same" && n.metadata["language"] == "javascript")
+        .collect();
+    assert_eq!(declarations.len(), 3);
+    for (caller, target) in ["classic", "moduleOne", "moduleTwo"]
+        .into_iter()
+        .zip(declarations)
+    {
+        stored(vec![f.clone()], &node(&f, caller).id, &target.id, "calls");
+    }
+}
+
+#[test]
+fn php_inline_js_malformed_input_keeps_php_facts_without_fabricated_js() {
+    for tail in [
+        "<script>function broken( {</script>",
+        "<script>function joined() {</script><script>}</script>",
+        "<script>function callable() {}</script><script>callable(</script><script>);</script>",
+        "<script>function unclosed() {}",
+        "<div title=\"<script>function quoted() {}</script>",
+        "<!-- <script>function hidden() {}</script>",
+    ] {
+        let f = parse(
+            "bad.php",
+            &format!("<?php function intact() {{}} ?>{tail}"),
+            "fixture",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(f.nodes.iter().any(|n| n.label == "intact"));
+        assert!(
+            f.nodes
+                .iter()
+                .all(|n| n.metadata["language"] != "javascript")
+        );
+        assert!(f.references.is_empty());
+    }
+    let f = parse(
+        "bad.php",
+        "<?php function { ?><script>function hidden() {}</script>",
+        "fixture",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!f.diagnostics.is_empty());
+    assert!(f.nodes.is_empty());
+}
+
+#[test]
+fn php_inline_js_bounds_module_passes() {
+    let mut source = "<?php function intact() {} ?>".to_owned();
+    for index in 0..129 {
+        source.push_str(&format!(
+            "<script type=\"module\">function module{index}() {{}}</script>"
+        ));
+    }
+    let f = parse("bounded.php", &source, "fixture").unwrap().unwrap();
+    assert!(f.nodes.iter().any(|n| n.label == "intact"));
+    assert!(f.nodes.iter().any(|n| n.label == "module127"));
+    assert!(!f.nodes.iter().any(|n| n.label == "module128"));
+    assert!(f.diagnostics.iter().any(|d| d.message.contains("limit")));
+}
+
+#[test]
+fn php_inline_js_incremental_replacement_removes_old_symbols_and_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&dir.path().join("graph.db")).unwrap();
+    let php = "<?php function retained() {} ?>";
+    let before = facts(
+        "update.php",
+        &format!(
+            "{php}<script>function oldTarget() {{}} function invoke() {{ oldTarget(); }}</script>"
+        ),
+    );
+    assert_inline_js_aliases(&before);
+    let old_ids: Vec<_> = before
+        .nodes
+        .iter()
+        .filter(|n| n.metadata["language"] == "javascript")
+        .map(|n| n.id.clone())
+        .collect();
+    store
+        .apply_native("fixture", vec![before], vec![], Coverage::default())
+        .unwrap();
+    let after = facts(
+        "update.php",
+        &format!(
+            "{php}<script>function replacement() {{}} function invoke() {{ replacement(); }}</script>"
+        ),
+    );
+    assert_inline_js_aliases(&after);
+    let caller = node(&after, "invoke").id.clone();
+    let target = node(&after, "replacement").id.clone();
+    store
+        .apply_native("fixture", vec![after], vec![], Coverage::default())
+        .unwrap();
+    let graph = store.snapshot().unwrap();
+    assert!(graph.nodes.iter().all(|n| !old_ids.contains(&n.id)));
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|e| !old_ids.contains(&e.source) && !old_ids.contains(&e.target))
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| e.source == caller && e.target == target && e.relation == "calls")
+    );
+    store
+        .apply_native(
+            "fixture",
+            vec![facts("update.php", php)],
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let graph = store.snapshot().unwrap();
+    assert!(graph.nodes.iter().any(|n| n.label == "retained"));
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|n| n.metadata["language"] != "javascript")
+    );
+    assert!(!graph.edges.iter().any(|e| e.relation == "calls"));
+}
