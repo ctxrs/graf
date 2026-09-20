@@ -27,11 +27,21 @@ a model. Explicit learning annotations also check cited local files.
 Use `--db PATH` to select a database; otherwise reads discover the nearest
 ancestor `.graf/index.db`.
 
-Graf 0.5 can read older indexes without upgrading them. Writing an existing
+Graf 0.5 can read older indexes without upgrading them. Refreshing an existing
 index, such as with `graf update`, upgrades its storage format in the same
 transaction; a failed write preserves the previous format and graph. After
 upgrading, open that database with Graf 0.5 or later. The portable JSON snapshot
 format is unchanged.
+
+An upgrade or a large deletion can leave reusable space inside the database
+file. Run `graf compact` to reclaim it explicitly. This reads no source files
+and preserves graph facts and generation; it works on native and imported
+indexes in the current storage format. Refresh an older index before compacting
+it. Compaction can require temporary free space up to twice the database's
+current size and can fail while another writer holds the database. Another
+connection can delay disk-space reclamation; the report says when this happens.
+`graf compact --json` reports database page counts, not total disk usage including
+SQLite coordination files. Ordinary queries and updates never run compaction.
 
 Query supports BFS by default, `--dfs`, repeated `--file`, `--kind`, and
 `--context` filters, plus `--direction in|out|both` and `--relation`. Depth is
@@ -174,6 +184,11 @@ For an immutable JavaScript or TypeScript value created by a factory,
 supported named imports and reexports. The factory's result is not assumed to
 be a particular function or class: runtime `calls` remain unresolved, and a
 same-named interface keeps its separate type identity.
+
+Passing a known local JavaScript or TypeScript function as a callback argument
+records a `references` dependency at that argument. It does not assert that the
+recipient invokes the function. Shadowed, reassigned, or unproved function
+values remain unresolved.
 
 Graf discovers ordinary literal SwiftPM `Sources/` and `Tests/` targets and
 declared local dependencies from an indexed `Package.swift`. Supply module

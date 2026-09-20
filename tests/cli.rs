@@ -67,6 +67,105 @@ fn imported() -> TempDir {
     dir
 }
 
+#[test]
+fn compact_reclaims_native_space_without_source_access_or_graph_changes() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("keep.py"), "def orchard():\n    return 42\n").unwrap();
+    let discarded = (0..160)
+        .map(|i| format!("def discarded_{i}():\n    return {i}\n"))
+        .collect::<String>();
+    fs::write(source.join("discard.py"), discarded).unwrap();
+    let db = dir.path().join("index.db");
+    graf::index::run(&source, &db).unwrap();
+    fs::remove_file(source.join("discard.py")).unwrap();
+    graf::index::run(&source, &db).unwrap();
+    let before = serde_json::to_value(
+        graf::store::Store::open_read_only(&db)
+            .unwrap()
+            .snapshot()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::remove_dir_all(&source).unwrap();
+
+    let report = success(cli(dir.path(), &["--db", "index.db", "compact", "--json"]));
+    assert_eq!(report["schema_version"], 1);
+    assert!(report["pages_after"].as_u64().unwrap() < report["pages_before"].as_u64().unwrap());
+    assert_eq!(report["free_pages_after"], 0);
+    assert_eq!(report["checkpoint_busy"], false);
+    assert_eq!(
+        fs::metadata(&db).unwrap().len(),
+        report["pages_after"].as_u64().unwrap() * report["page_size"].as_u64().unwrap()
+    );
+    let found = success(cli(
+        dir.path(),
+        &["--db", "index.db", "query", "orchard", "--json"],
+    ));
+    assert!(
+        found["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["label"] == "orchard")
+    );
+    let human = cli(dir.path(), &["--db", "index.db", "compact"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("Compacted database:")
+    );
+    let after = serde_json::to_value(
+        graf::store::Store::open_read_only(&db)
+            .unwrap()
+            .snapshot()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after, before);
+    assert!(!source.exists());
+}
+
+#[test]
+fn compact_discovers_imported_database_and_does_not_create_a_missing_one() {
+    let dir = imported();
+    fs::remove_file(dir.path().join("graph.json")).unwrap();
+    fs::create_dir(dir.path().join("child")).unwrap();
+    let before = success(cli(dir.path(), &["stats", "--json"]));
+    let report = success(cli(&dir.path().join("child"), &["compact", "--json"]));
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["checkpoint_busy"], false);
+    assert_eq!(success(cli(dir.path(), &["stats", "--json"])), before);
+    let path = success(cli(dir.path(), &["path", "a", "b", "--json"]));
+    assert_eq!(path["found"], true);
+    failure(cli(
+        dir.path(),
+        &["--db", "missing.db", "compact", "--json"],
+    ));
+    assert!(!dir.path().join("missing.db").exists());
+}
+
+#[test]
+fn compact_rejects_legacy_storage_without_migration_or_writes() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("old.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(include_str!("fixtures/native-format1.sql"))
+            .unwrap();
+    }
+    let before = fs::read(&db).unwrap();
+    let error = failure(cli(dir.path(), &["--db", "old.db", "compact", "--json"]));
+    assert!(error.contains("storage"), "{error}");
+    assert_eq!(fs::read(&db).unwrap(), before);
+}
+
 fn ids(graph: &Value) -> Vec<&str> {
     let mut ids: Vec<_> = graph["nodes"]
         .as_array()

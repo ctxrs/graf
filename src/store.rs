@@ -29,6 +29,19 @@ pub struct Store {
     baseline_generation: u64,
 }
 
+/// Logical SQLite page counts, not filesystem sizes. A busy checkpoint can
+/// leave the old main-file length and WAL allocated after VACUUM commits.
+#[derive(Debug, serde::Serialize)]
+pub struct CompactionReport {
+    pub schema_version: u32,
+    pub page_size: u64,
+    pub pages_before: u64,
+    pub pages_after: u64,
+    pub free_pages_before: u64,
+    pub free_pages_after: u64,
+    pub checkpoint_busy: bool,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE metadata (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -88,7 +101,6 @@ ALTER TABLE compact_node_aliases RENAME TO node_aliases;
 ALTER TABLE compact_edges RENAME TO edges;
 CREATE INDEX nodes_label ON nodes(label, id);
 CREATE INDEX nodes_file ON nodes(file, id);
-CREATE INDEX refs_source ON refs(source_key, id);
 CREATE INDEX refs_owner ON refs(owner_key);
 CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
 CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
@@ -111,6 +123,12 @@ END;
 // Shared by fresh databases and explicit-write migration; these indexes do
 // not change graph identity, payloads, or schema-1 snapshot compatibility.
 const STORAGE_INDICES: &[(&str, &str)] = &[
+    // Unfiltered source lookup serves FK deletion and rebinding. Ordered
+    // unresolved streams keep their separate (source_key, ..., id) indexes.
+    (
+        "refs_source",
+        "CREATE INDEX refs_source ON refs(source_key)",
+    ),
     (
         "nodes_qualified",
         "CREATE INDEX nodes_qualified ON nodes(qualified_name, id) WHERE qualified_name IS NOT NULL",
@@ -221,6 +239,74 @@ impl Store {
         Ok(Self {
             conn,
             baseline_generation,
+        })
+    }
+
+    /// Explicitly repack an existing format-2 database without changing facts
+    /// or the write baseline. SQLite serializes VACUUM with other writers; a
+    /// stale handle compacts current data but remains stale for fact writes.
+    pub fn compact(&mut self) -> Result<CompactionReport> {
+        ensure!(
+            self.conn.is_autocommit(),
+            "cannot compact inside an active transaction"
+        );
+        ensure!(
+            !self.conn.is_readonly("main")?,
+            "cannot compact a read-only Graf database"
+        );
+        let (page_size, pages_before, free_pages_before) = {
+            let tx = self.conn.transaction()?;
+            ensure!(
+                storage_layout(&tx)? == StorageLayout::Compact,
+                "storage format 1 must be upgraded by update or import refresh before compact"
+            );
+            let counts = (
+                tx.pragma_query_value(None, "page_size", |row| {
+                    row.get::<_, u32>(0).map(u64::from)
+                })?,
+                tx.pragma_query_value(None, "page_count", |row| {
+                    row.get::<_, u32>(0).map(u64::from)
+                })?,
+                tx.pragma_query_value(None, "freelist_count", |row| {
+                    row.get::<_, u32>(0).map(u64::from)
+                })?,
+            );
+            tx.commit()?;
+            counts
+        };
+        // VACUUM owns its transaction; never wrap it in a write transaction or
+        // replace the database path. Format 2 has explicit parent INTEGER PKs.
+        self.conn
+            .execute_batch("VACUUM main")
+            .context("cannot compact Graf database")?;
+        let checkpoint_busy = self
+            .conn
+            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, bool>(0)
+            })
+            .context("compaction completed but checkpoint failed")?;
+        let (pages_after, free_pages_after) = (|| -> Result<(u64, u64)> {
+            let tx = self.conn.transaction()?;
+            let counts = (
+                tx.pragma_query_value(None, "page_count", |row| {
+                    row.get::<_, u32>(0).map(u64::from)
+                })?,
+                tx.pragma_query_value(None, "freelist_count", |row| {
+                    row.get::<_, u32>(0).map(u64::from)
+                })?,
+            );
+            tx.commit()?;
+            Ok(counts)
+        })()
+        .context("compaction completed but reading page counts failed")?;
+        Ok(CompactionReport {
+            schema_version: SCHEMA_VERSION,
+            page_size,
+            pages_before,
+            pages_after,
+            free_pages_before,
+            free_pages_after,
+            checkpoint_busy,
         })
     }
 
@@ -1446,4 +1532,128 @@ fn read_stats(conn: &Connection) -> Result<Stats> {
         coverage: serde_json::from_str(&coverage)?,
         diagnostics,
     })
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    fn freed_pages(store: &Store) -> Result<()> {
+        store.conn.execute_batch(
+            "CREATE TABLE discarded(data BLOB);
+             INSERT INTO discarded VALUES(zeroblob(262144));
+             DROP TABLE discarded;",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_lock_failure_and_active_transaction_leave_graph_unchanged() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("locked.db");
+        let mut store = Store::create(&path)?;
+        store.conn.busy_timeout(Duration::from_millis(20))?;
+        freed_pages(&store)?;
+        let before = serde_json::to_value(store.snapshot()?)?;
+        let other = Connection::open(&path)?;
+        other.execute_batch("BEGIN IMMEDIATE")?;
+        let error = store.compact().unwrap_err();
+        assert!(format!("{error:#}").contains("locked"), "{error:#}");
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        other.execute_batch("ROLLBACK")?;
+        store.conn.execute_batch("BEGIN")?;
+        let error = store.compact().unwrap_err();
+        assert!(format!("{error:#}").contains("active transaction"));
+        store.conn.execute_batch("ROLLBACK")?;
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        let report = store.compact()?;
+        assert_eq!(report.free_pages_after, 0);
+        assert!(report.pages_after < report.pages_before);
+        assert!(!report.checkpoint_busy);
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_reports_a_pinned_wal_reader_without_claiming_disk_shrink() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("reader.db");
+        let mut store = Store::create(&path)?;
+        store.conn.busy_timeout(Duration::from_millis(20))?;
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN")?;
+        let generation: i64 =
+            reader.query_row("SELECT generation FROM metadata", [], |row| row.get(0))?;
+        let old_pages: i64 = reader.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        // Commit pages after the pinned reader's end mark, then vacuum them.
+        freed_pages(&store)?;
+        let before = serde_json::to_value(store.snapshot()?)?;
+        let report = store.compact()?;
+        assert!(report.checkpoint_busy);
+        assert_eq!(report.free_pages_after, 0);
+        assert!(std::fs::metadata(path.with_extension("db-wal"))?.len() > 0);
+        assert_eq!(
+            reader.query_row("SELECT generation FROM metadata", [], |row| row
+                .get::<_, i64>(0))?,
+            generation
+        );
+        assert_eq!(
+            reader.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))?,
+            old_pages
+        );
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        reader.execute_batch("COMMIT")?;
+        let report = store.compact()?;
+        assert!(!report.checkpoint_busy);
+        assert_eq!(
+            std::fs::metadata(&path)?.len(),
+            report.pages_after * report.page_size
+        );
+        assert_eq!(std::fs::metadata(path.with_extension("db-wal"))?.len(), 0);
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_error_explicitly_reports_that_compaction_already_completed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("checkpoint.db");
+        let mut store = Store::create(&path)?;
+        freed_pages(&store)?;
+        let before = serde_json::to_value(store.snapshot()?)?;
+        let free: i64 = store
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+        assert!(free > 0);
+        store
+            .conn
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Pragma {
+                    pragma_name: "wal_checkpoint",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+        let error = store.compact().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("compaction completed but checkpoint failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        store
+            .conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        assert!(!store.compact()?.checkpoint_busy);
+        Ok(())
+    }
 }

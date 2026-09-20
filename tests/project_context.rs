@@ -335,6 +335,138 @@ fn javascript_imported_factory_proof_refreshes_without_promoting_the_interface()
 }
 
 #[test]
+fn javascript_provider_scratch_pruning_preserves_local_facts_and_competing_origins() {
+    let f = Fixture::new();
+    f.write(
+        "barrel.ts",
+        "export * from './provider'; export * from './competitor';\n",
+    );
+    f.write("main.ts", "import {Shape, ordinary} from './barrel'; export function use(value: Shape): Shape { Shape(); ordinary(); return value; }\n");
+    let mut previous = None;
+    for (private_count, competitor, eligible) in [
+        (0, "export {};\n", true),
+        (24, "export {};\n", true),
+        (0, "export {};\n", true),
+        (24, "export function Shape() {}\n", false),
+        (24, "export {};\n", true),
+        (24, "export const Shape = otherFactory();\n", false),
+        (24, "export {};\n", true),
+    ] {
+        let mut provider = String::from(
+            "export interface Shape {}\nexport const Shape = factory();\nexport function ordinary() {}\nfunction privateScope() {\n/** Scoped helper. */\nfunction local() {}\nlocal();\n",
+        );
+        for i in 0..private_count {
+            provider.push_str(&format!("function helper_{i}() {{}} helper_{i}();\n"));
+        }
+        provider.push_str("}\n");
+        f.write("provider.ts", &provider);
+        f.write("competitor.ts", competitor);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let declarations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == caller.id && edge.relation == "declared_callee")
+            .collect();
+        assert_eq!(declarations.len(), usize::from(eligible));
+        if eligible {
+            let target = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == declarations[0].target)
+                .unwrap();
+            assert_eq!(
+                (
+                    target.file.as_str(),
+                    target.label.as_str(),
+                    target.kind.as_str()
+                ),
+                ("provider.ts", "Shape", "constant")
+            );
+            assert_eq!(target.metadata["declared_callee_binding"], true);
+            let interface = graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.file == "provider.ts" && node.label == "Shape" && node.kind == "interface"
+                })
+                .unwrap();
+            assert!(graph.edges.iter().any(|edge| edge.source == caller.id
+                && edge.relation == "return_type"
+                && edge.target == interface.id));
+        }
+        assert!(f.unresolved(caller, "Shape"));
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == caller.id && edge.relation == "calls")
+            .collect();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(
+            runtime[0].target,
+            node(&graph, "provider.ts", "ordinary").id
+        );
+
+        // These local definitions never publish own-file provider keys, but
+        // must remain indexed and callable in their original lexical scope.
+        assert!(calls(
+            &graph,
+            ("provider.ts", "privateScope"),
+            ("provider.ts", "local")
+        ));
+        let local = node(&graph, "provider.ts", "local");
+        assert!(
+            !local
+                .binding_key
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    local.metadata["binding_aliases"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|key| key.as_str())
+                )
+                .any(|key| key.starts_with("javascript:file:provider.ts:")
+                    || key.starts_with("javascript:cjs-file:provider.ts:"))
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.file == "provider.ts"
+                    && node.label.starts_with("helper_")
+                    && node.kind == "function")
+                .count(),
+            private_count
+        );
+        for i in 0..private_count {
+            assert!(calls(
+                &graph,
+                ("provider.ts", "privateScope"),
+                ("provider.ts", &format!("helper_{i}"))
+            ));
+        }
+
+        let stamp = Store::open_read_only(&f.db())
+            .unwrap()
+            .file_stamps()
+            .unwrap()
+            .into_iter()
+            .find(|stamp| stamp.path == "main.ts")
+            .unwrap()
+            .hash;
+        if let Some((previous_eligible, previous_stamp)) = previous {
+            assert_eq!(previous_stamp == stamp, previous_eligible == eligible);
+        }
+        previous = Some((eligible, stamp));
+        // This existing comparison includes all persisted references/keys and
+        // aliases as well as the graph; it is independent of source language.
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+}
+
+#[test]
 fn javascript_imported_factory_stars_preserve_ambiguity_and_direct_value_precedence() {
     let f = Fixture::new();
     f.write(

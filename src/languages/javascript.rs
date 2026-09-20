@@ -28,6 +28,7 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         type_bindings: HashMap::new(),
         type_references: vec![],
         component_references: HashSet::new(),
+        callback_arguments: HashSet::new(),
         member_calls: vec![],
         callee_calls: HashMap::new(),
         callee_declarations: HashMap::new(),
@@ -308,6 +309,7 @@ struct Javascript<'a> {
     type_bindings: HashMap<(usize, String), Binding>,
     type_references: Vec<(usize, usize, Vec<String>)>,
     component_references: HashSet<String>,
+    callback_arguments: HashSet<String>,
     member_calls: Vec<(String, String, Vec<String>)>,
     callee_calls: HashMap<String, String>,
     callee_declarations: HashMap<String, CalleeDeclaration>,
@@ -1715,6 +1717,43 @@ impl Javascript<'_> {
         if forward && !self.cjs_forward.is_empty() {
             facts.nodes[0].metadata["commonjs_reexports"] = serde_json::json!(self.cjs_forward);
         }
+        if !self.callback_arguments.is_empty() {
+            // The shared deferred resolver has now applied all lexical writes and
+            // shadows. Only a source-proved function value gets a target; imports
+            // and factory results do not establish callability here.
+            let local = format!("javascript:local:{}:", facts.path);
+            let exact = format!("javascript:file:{}:", facts.path);
+            let functions: HashSet<_> = facts
+                .nodes
+                .iter()
+                .filter(|n| n.kind == "function" && n.binding_key.is_some())
+                .flat_map(|n| {
+                    n.binding_key.as_deref().into_iter().chain(
+                        n.metadata["binding_aliases"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str),
+                    )
+                })
+                .filter(|key| key.starts_with(&local) || key.starts_with(&exact))
+                .collect();
+            for reference in &mut facts.references {
+                if self.callback_arguments.contains(&reference.id) {
+                    reference.id = reference.id.replacen("call:", "references:", 1);
+                    reference.relation = "references".into();
+                    reference
+                        .candidate_keys
+                        .retain(|key| functions.contains(key.as_str()));
+                    reference.reason = if reference.candidate_keys.is_empty() {
+                        "callback argument; function binding is unproved, shadowed, or reassigned; invocation is not implied"
+                    } else {
+                        "callback argument; written function value, invocation is not implied"
+                    }
+                    .into();
+                }
+            }
+        }
         facts
     }
     fn pattern(&mut self, node: Syntax<'_>, scope: usize, write: bool) {
@@ -2448,6 +2487,27 @@ impl Javascript<'_> {
                 }
             }
             "call_expression" | "new_expression" => {
+                if let Some(arguments) = node.child_by_field_name("arguments") {
+                    for argument in children(arguments)
+                        .into_iter()
+                        .filter(|n| n.kind() == "identifier")
+                    {
+                        self.callback_arguments.insert(format!(
+                            "call:{}:{}-{}",
+                            self.e.scopes[scope].owner,
+                            argument.start_byte(),
+                            argument.end_byte()
+                        ));
+                        // Reuse the final lexical/write resolver without treating
+                        // the argument as an invocation in the returned facts.
+                        self.e.call(
+                            argument,
+                            scope,
+                            argument,
+                            Some(vec![self.e.text(argument).into()]),
+                        );
+                    }
+                }
                 if let Some(target) = node
                     .child_by_field_name("function")
                     .or_else(|| node.child_by_field_name("constructor"))
