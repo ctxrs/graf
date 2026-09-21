@@ -64,19 +64,13 @@ Graf is an independent implementation, not a fork or a drop-in replacement for G
 
 ## Migrate from Graphify
 
-Run this from a project that already has `graphify-out/graph.json`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh -s -- --from graphify
-```
-
-That installs Graf, imports the existing snapshot into `.graf/index.db`, switches a supported project MCP connection, and verifies the new server. It leaves Graphify, the original graph, skills, and hooks in place.
-
-Already installed Graf?
+Install Graf using the command above, then run this from a project that already has `graphify-out/graph.json`:
 
 ```bash
 graf switch graphify
 ```
+
+That imports the existing snapshot into `.graf/index.db`, switches a supported project MCP connection, and verifies the new server. It leaves Graphify, the original graph, skills, and hooks in place.
 
 The migration is reversible:
 
