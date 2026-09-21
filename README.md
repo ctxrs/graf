@@ -18,7 +18,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 ```
 
-The installers verify the signed release before replacing anything. Run the same command again to upgrade. The default install directories are `~/.local/bin` and `%LOCALAPPDATA%\Graf\bin`; add that directory to `PATH` if needed. See [installation and downloads](docs/downloads.md) for supported platforms, manual verification, and custom directories.
+The same command upgrades an existing install. See [installation and downloads](docs/downloads.md) for manual downloads, verification, supported platforms, and custom directories.
 
 ## Try it
 
