@@ -18,6 +18,14 @@ pub enum CommunityAlgorithm {
     Louvain,
 }
 
+fn one_start() -> u32 {
+    1
+}
+
+fn is_one_start(starts: &u32) -> bool {
+    *starts == 1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnalysisOptions {
@@ -27,6 +35,10 @@ pub struct AnalysisOptions {
     /// Total Louvain sweeps or Leiden outer iterations, including split retries.
     pub community_max_passes: usize,
     pub community_algorithm: CommunityAlgorithm,
+    /// Leiden starts: 1 preserves early stopping; 4 spends fixed allocations
+    /// within a shared outer budget of 4..=100, including optional split retries.
+    #[serde(skip_serializing_if = "is_one_start")]
+    pub community_starts: u32,
     /// Fixed RNG seed for Leiden; ignored by deterministic Louvain.
     pub community_seed: u64,
     /// Leiden only: at most this many times the level's node count are processed
@@ -54,6 +66,7 @@ impl Default for AnalysisOptions {
             max_iterations: 200,
             community_max_passes: 100,
             community_algorithm: CommunityAlgorithm::default(),
+            community_starts: 1,
             community_seed: 42,
             community_local_max_passes: 100,
             resolution: 1.0,
@@ -148,6 +161,9 @@ pub struct AnalysisReport {
     pub pagerank_iterations: usize,
     pub pagerank_converged: bool,
     pub community_algorithm: String,
+    /// Requested starts per Leiden partition invocation, not executed trials.
+    #[serde(default = "one_start", skip_serializing_if = "is_one_start")]
+    pub community_starts: u32,
     pub community_modularity: f64,
     pub community_resolution: f64,
     pub community_passes: usize,
@@ -272,6 +288,18 @@ fn weight(edge: &Edge) -> Result<f64> {
 
 pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<AnalysisReport> {
     validate(snapshot)?;
+    ensure!(
+        matches!(options.community_starts, 1 | 4),
+        "community starts must be 1 or 4"
+    );
+    ensure!(
+        options.community_starts == 1 || options.community_algorithm == CommunityAlgorithm::Leiden,
+        "four community starts require Leiden"
+    );
+    ensure!(
+        options.community_starts == 1 || (4..=100).contains(&options.community_max_passes),
+        "four community starts require a total community pass budget in 4..=100"
+    );
     ensure!(
         options.damping.is_finite() && (0.0..1.0).contains(&options.damping),
         "damping must be in [0, 1)"
@@ -552,24 +580,75 @@ pub fn analyze(snapshot: &GraphSnapshot, options: &AnalysisOptions) -> Result<An
     let import_cycles = import_cycles(snapshot);
     let (surprises, surprise_candidates, suggested_questions, suggested_question_candidates) =
         structural_insights(snapshot, &metrics, &groups, &hubs);
+    let mut community_algorithm = match options.community_algorithm {
+        CommunityAlgorithm::Louvain => format!(
+            "deterministic multilevel Louvain with connectivity splitting (resolution {})",
+            options.resolution
+        ),
+        CommunityAlgorithm::Leiden => format!(
+            "native Leiden (network_partitions 0.3.0; seed {}; resolution {}; local pass limit {}) with final connectivity splitting",
+            options.community_seed, options.resolution, options.community_local_max_passes
+        ),
+    };
+    if options.community_starts == 4 {
+        community_algorithm.push_str(&format!(
+            "; four fixed singleton starts; shared outer-call budget {}; earliest best modularity candidate",
+            options.community_max_passes
+        ));
+    }
+    let community_iteration_methodology = if options.community_starts == 4 {
+        "Its pass count is outer iterations. Four singleton starts share the total outer-call budget in fixed allocations; unchanged partitions do not stop these allocations. Each partition invocation retains the earliest highest-modularity candidate across its starts. A positive-strength initial search exhausts the shared budget, leaving no optional size/cohesion retries; unmet thresholds are reported. More modularity search does not guarantee better semantic communities."
+    } else {
+        "Its pass count is outer iterations; unchanged consecutive partitions stop iteration but do not certify convergence."
+    };
     Ok(AnalysisReport {
-        surprises, surprise_candidates, suggested_questions, suggested_question_candidates,
-        confidence_counts, isolates, cross_community_edges, import_cycles, excluded_hubs, noise_filtered_hubs,
-        schema_version:snapshot.schema_version,generation:snapshot.generation,nodes:metrics,hubs,communities:groups,
-        pagerank_iterations:iterations,pagerank_converged:rank_converged,
-        community_algorithm: match options.community_algorithm {
-            CommunityAlgorithm::Louvain => format!("deterministic multilevel Louvain with connectivity splitting (resolution {})", options.resolution),
-            CommunityAlgorithm::Leiden => format!("native Leiden (network_partitions 0.3.0; seed {}; resolution {}; local pass limit {}) with final connectivity splitting", options.community_seed, options.resolution, options.community_local_max_passes),
-        },
+        surprises,
+        surprise_candidates,
+        suggested_questions,
+        suggested_question_candidates,
+        confidence_counts,
+        isolates,
+        cross_community_edges,
+        import_cycles,
+        excluded_hubs,
+        noise_filtered_hubs,
+        schema_version: snapshot.schema_version,
+        generation: snapshot.generation,
+        nodes: metrics,
+        hubs,
+        communities: groups,
+        pagerank_iterations: iterations,
+        pagerank_converged: rank_converged,
+        community_algorithm,
+        community_starts: options.community_starts,
         community_convergence_known,
         community_pass_unit: match options.community_algorithm {
             CommunityAlgorithm::Louvain => "louvain_sweeps",
             CommunityAlgorithm::Leiden => "leiden_iterations",
-        }.into(),
-        community_modularity:modularity,community_resolution:options.resolution,community_passes:passes,community_converged,
-        community_split_attempts,unsatisfied_community_constraints,
-        file_dependencies:dependencies.into_iter().map(|((source_file,target_file,relation,directed),evidence)| FileDependency {source_file,target_file,relation,directed,evidence}).collect(),call_edges,
-        methodology:"Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: selected native Leiden or deterministic multilevel Louvain on the weighted symmetric projection with positive resolution and retained self loops. Leiden uses seeded stochastic refinement and aggregation, retains the highest modularity candidate observed across its bounded warm-start iterations, and uses a dimensionless randomness value after total-strength normalization; its local pass limit bounds node processing per call at each level, not total runtime. Its pass count is outer iterations; unchanged consecutive partitions stop iteration but do not certify convergence. The core does not report cap exhaustion, so nontrivial Leiden runs report community_converged=false and community_convergence_known=false. Connectivity splitting protects capped partitions. Louvain counts local sweeps. Neither engine supplies semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the selected engine's total pass budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed.".into(),
+        }
+        .into(),
+        community_modularity: modularity,
+        community_resolution: options.resolution,
+        community_passes: passes,
+        community_converged,
+        community_split_attempts,
+        unsatisfied_community_constraints,
+        file_dependencies: dependencies
+            .into_iter()
+            .map(
+                |((source_file, target_file, relation, directed), evidence)| FileDependency {
+                    source_file,
+                    target_file,
+                    relation,
+                    directed,
+                    evidence,
+                },
+            )
+            .collect(),
+        call_edges,
+        methodology: format!(
+            "Weights: nonnegative metadata.weight, default 1; confidence is separate. PageRank: directed arcs, undirected edges in both orientations, uniform teleport and dangling redistribution; absolute L1 convergence. Degree counts incidences, including parallel edges and two per self loop. Communities: selected native Leiden or deterministic multilevel Louvain on the weighted symmetric projection with positive resolution and retained self loops. Leiden uses seeded stochastic refinement and aggregation, retains the highest modularity candidate observed across its bounded warm-start iterations, and uses a dimensionless randomness value after total-strength normalization; its local pass limit bounds node processing per call at each level, not total runtime. {community_iteration_methodology} The core does not report cap exhaustion, so nontrivial Leiden runs report community_converged=false and community_convergence_known=false. Connectivity splitting protects capped partitions. Louvain counts local sweeps. Neither engine supplies semantic naming. Optional size/cohesion thresholds retry induced subgraphs at max(resolution, 1) after hub reattachment, sharing the selected engine's total pass budget; unresolved thresholds are reported without arbitrary forced splits. Optional hub exclusion removes above-percentile nodes before partitioning and reattaches by distinct positive-neighbor majority with deterministic ties; reported modularity uses the full graph after reattachment. Noise filtering affects hub rankings and labels only. File dependencies group recorded cross-file relations; calls are static evidence, not runtime order or proof of execution. Surprises retain the top 5 eligible edges: recorded confidence AMBIGUOUS=3/INFERRED=2/EXTRACTED=1/other=0, cross-source=1, different source directory=2, different source category=2, cross-community=1, degree <=2 to degree >=5=1; score ties use edge ID. Up to 7 question templates rotate across ambiguity, cross-community incidence, inferred hub edges, weak nodes and low cohesion; no betweenness or semantic inference is claimed."
+        ),
     })
 }
 
@@ -747,44 +826,52 @@ fn partition(
     let mut passes = 0;
     let mut best_membership = None;
     let mut best_modularity = f64::NEG_INFINITY;
-    for _ in 0..max_passes {
-        let groups = membership.iter().max().map_or(0, |id| id + 1);
-        let initial = Clustering::as_defined(membership.clone(), groups);
-        let (_, output) = leiden_view(
-            &network,
-            Some(initial),
-            Some(1),
-            Some(resolution),
-            Some(LEIDEN_RANDOMNESS),
-            &mut rng,
-            true,
-            Some(options.community_local_max_passes),
-        )
-        .map_err(|error| anyhow::anyhow!("Leiden failed: {error:?}"))?;
-        let next = (0..adjacency.len())
-            .map(|i| {
-                output
-                    .cluster_at(i)
-                    .map_err(|e| anyhow::anyhow!("invalid Leiden partition: {e:?}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Capped local moving may stop before refinement can repair every group.
-        // Repair also keeps isolates separate before the next warm start.
-        let next = connected_membership(adjacency, &next);
-        let candidate_modularity = partition_modularity(adjacency, strengths, &next, resolution);
-        ensure!(
-            candidate_modularity.is_finite(),
-            "Leiden produced non-finite modularity"
-        );
-        passes += 1;
-        let unchanged = next == membership;
-        if candidate_modularity > best_modularity {
-            best_modularity = candidate_modularity;
-            best_membership = Some(next.clone());
+    let starts = options.community_starts as usize;
+    for trial in 0..starts {
+        if trial > 0 {
+            membership = (0..adjacency.len()).collect();
         }
-        membership = next;
-        if unchanged {
-            break;
+        let allocation = max_passes / starts + usize::from(trial < max_passes % starts);
+        for _ in 0..allocation {
+            let groups = membership.iter().max().map_or(0, |id| id + 1);
+            let initial = Clustering::as_defined(membership.clone(), groups);
+            let (_, output) = leiden_view(
+                &network,
+                Some(initial),
+                Some(1),
+                Some(resolution),
+                Some(LEIDEN_RANDOMNESS),
+                &mut rng,
+                true,
+                Some(options.community_local_max_passes),
+            )
+            .map_err(|error| anyhow::anyhow!("Leiden failed: {error:?}"))?;
+            let next = (0..adjacency.len())
+                .map(|i| {
+                    output
+                        .cluster_at(i)
+                        .map_err(|e| anyhow::anyhow!("invalid Leiden partition: {e:?}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Capped local moving may stop before refinement can repair every group.
+            // Repair also keeps isolates separate before the next warm start.
+            let next = connected_membership(adjacency, &next);
+            let candidate_modularity =
+                partition_modularity(adjacency, strengths, &next, resolution);
+            ensure!(
+                candidate_modularity.is_finite(),
+                "Leiden produced non-finite modularity"
+            );
+            passes += 1;
+            let unchanged = next == membership;
+            if candidate_modularity > best_modularity {
+                best_modularity = candidate_modularity;
+                best_membership = Some(next.clone());
+            }
+            membership = next;
+            if unchanged && starts == 1 {
+                break;
+            }
         }
     }
     let membership =

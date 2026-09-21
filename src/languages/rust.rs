@@ -76,6 +76,20 @@ struct Rust<'a> {
     receivers: Vec<(String, usize, Vec<String>, String)>,
 }
 impl Rust<'_> {
+    fn callable_sequence(mut node: Syntax<'_>) -> bool {
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "block" if !children(parent).iter().any(|n| n.kind() == "label") => {}
+                "expression_statement" | "return_expression" => {}
+                "function_item" | "closure_expression" => {
+                    return parent.child_by_field_name("body") == Some(node);
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        false
+    }
     fn record_binding(&mut self, scope: usize, name: &str, value_only: bool) {
         self.value_bindings
             .entry(scope)
@@ -725,6 +739,7 @@ impl Rust<'_> {
             key,
             !method && !closure,
         );
+        self.e.scopes[child].callable_capture = closure;
         if !method && !closure {
             // define registers the shared symbol; retain its namespace after invalidation.
             self.record_binding(scope, &name, true);
@@ -853,6 +868,9 @@ impl Rust<'_> {
                     }
                     if conditional {
                         self.local_uses.truncate(import_start);
+                        // An attributed statement can remove/replace local writes.
+                        // Keep ordinary extraction intact; reject only value flow.
+                        self.e.escape_callable_local(scope, None);
                         if let Some(name) = item.child_by_field_name("name") {
                             let name = self.e.text(name).trim_start_matches("r#");
                             if item.kind() == "mod_item" {
@@ -1069,6 +1087,17 @@ impl Rust<'_> {
                 return;
             }
             "let_declaration" => {
+                if let Some(name) = node
+                    .child_by_field_name("pattern")
+                    .filter(|n| n.kind() == "identifier")
+                    && node
+                        .child_by_field_name("value")
+                        .is_some_and(|n| n.kind() == "identifier")
+                    && node.child_by_field_name("alternative").is_none()
+                {
+                    self.e
+                        .declare_callable_local(scope, self.e.text(name).trim_start_matches("r#"));
+                }
                 self.pattern(node, scope, false);
                 if let Some(ty) = node.child_by_field_name("type") {
                     self.type_refs(ty, scope, module, "references_type");
@@ -1129,6 +1158,15 @@ impl Rust<'_> {
                                 "static path is unavailable or ambiguous",
                             );
                             self.paths.push((index, scope, parts, module.into()));
+                        } else if target.kind() == "identifier"
+                            && Self::callable_sequence(node)
+                            && node.child_by_field_name("arguments").is_some_and(|args| {
+                                children(args)
+                                    .iter()
+                                    .all(|n| matches!(n.kind(), "line_comment" | "block_comment"))
+                            })
+                        {
+                            self.e.call_with_callable_local(node, scope, target, parts);
                         } else {
                             self.e.call(node, scope, target, parts);
                         }
@@ -1136,6 +1174,7 @@ impl Rust<'_> {
                 }
             }
             "macro_invocation" => {
+                self.e.escape_callable_local(scope, None);
                 self.e.reference(
                     node,
                     scope,
@@ -1145,6 +1184,13 @@ impl Rust<'_> {
                     "macro expansion is not executed",
                 );
                 return;
+            }
+            "reference_expression" => {
+                let parts = node.child_by_field_name("value").and_then(|n| self.path(n));
+                self.e.escape_callable_local(
+                    scope,
+                    parts.as_ref().and_then(|p| p.first()).map(String::as_str),
+                );
             }
             "macro_definition" => {
                 if let Some(name) = node.child_by_field_name("name") {
@@ -1175,6 +1221,23 @@ impl Rust<'_> {
         }
         for n in children(node) {
             self.visit(n, scope, module, implementation);
+        }
+        if matches!(node.kind(), "let_declaration" | "assignment_expression") {
+            let declaration = node.kind() == "let_declaration";
+            if let Some(name) = node
+                .child_by_field_name(if declaration { "pattern" } else { "left" })
+                .filter(|n| n.kind() == "identifier")
+            {
+                let rhs = node
+                    .child_by_field_name(if declaration { "value" } else { "right" })
+                    .filter(|n| n.kind() == "identifier" && Self::callable_sequence(node))
+                    .map(|n| self.e.text(n).trim_start_matches("r#"));
+                self.e.assign_callable_local(
+                    scope,
+                    self.e.text(name).trim_start_matches("r#"),
+                    rhs,
+                );
+            }
         }
     }
 }

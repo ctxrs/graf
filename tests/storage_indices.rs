@@ -169,7 +169,7 @@ fn assert_layout(conn: &Connection) -> anyhow::Result<()> {
     }
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))?,
-        2
+        3
     );
     // General adjacency and ref_key's original uniqueness constraint stay intact.
     for index in [

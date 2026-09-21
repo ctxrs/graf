@@ -1102,3 +1102,268 @@ fn native_leiden_hub_reattachment_keeps_connected_groups_and_metadata() {
     assert!(!report.community_convergence_known);
     assert_connected(&snapshot, &report);
 }
+
+#[test]
+fn one_start_preserves_legacy_option_and_report_serialization() {
+    use graf::analysis::{AnalysisReport, CommunityAlgorithm};
+    let legacy_options = r#"{"damping":0.85,"tolerance":1e-10,"max_iterations":200,"community_max_passes":100,"community_algorithm":"leiden","community_seed":42,"community_local_max_passes":100,"resolution":1.0,"max_community_size":null,"min_cohesion":null,"exclude_hubs_percentile":null,"filter_noise":true}"#;
+    let decoded: AnalysisOptions = serde_json::from_str(legacy_options).unwrap();
+    assert_eq!(decoded.community_starts, 1);
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), legacy_options);
+    assert_eq!(
+        serde_json::to_string(&AnalysisOptions::default()).unwrap(),
+        legacy_options
+    );
+    let explicit: AnalysisOptions = serde_json::from_str(r#"{"community_starts":1}"#).unwrap();
+    assert_eq!(serde_json::to_string(&explicit).unwrap(), legacy_options);
+    for algorithm in [CommunityAlgorithm::Leiden, CommunityAlgorithm::Louvain] {
+        let options = AnalysisOptions {
+            community_algorithm: algorithm,
+            ..decoded.clone()
+        };
+        let ordinary = analyze(&joined_cliques(), &options).unwrap();
+        let explicit = analyze(
+            &joined_cliques(),
+            &AnalysisOptions {
+                community_starts: 1,
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&ordinary).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&explicit).unwrap());
+        assert!(
+            serde_json::to_value(&ordinary)
+                .unwrap()
+                .get("community_starts")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_slice::<AnalysisReport>(&bytes)
+                .unwrap()
+                .community_starts,
+            1
+        );
+        let larger = analyze(
+            &joined_cliques(),
+            &AnalysisOptions {
+                community_max_passes: 101,
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&larger).unwrap());
+    }
+}
+
+#[test]
+fn community_start_requests_validate_count_engine_and_shared_budget() {
+    use graf::analysis::CommunityAlgorithm;
+    let empty = graph(0, &[]);
+    for starts in [0, 2, 3, 8, u32::MAX] {
+        let options: AnalysisOptions =
+            serde_json::from_value(json!({"community_starts":starts})).unwrap();
+        assert_eq!(
+            analyze(&empty, &options).unwrap_err().to_string(),
+            "community starts must be 1 or 4"
+        );
+    }
+    for value in [
+        json!("4"),
+        json!(null),
+        json!(-1),
+        json!(1.5),
+        json!(4294967296_u64),
+    ] {
+        assert!(
+            serde_json::from_value::<AnalysisOptions>(json!({"community_starts":value})).is_err()
+        );
+    }
+    let four = AnalysisOptions {
+        community_starts: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        analyze(
+            &empty,
+            &AnalysisOptions {
+                community_algorithm: CommunityAlgorithm::Louvain,
+                ..four.clone()
+            }
+        )
+        .unwrap_err()
+        .to_string(),
+        "four community starts require Leiden"
+    );
+    for budget in [0, 1, 2, 3, 101, usize::MAX] {
+        assert_eq!(
+            analyze(
+                &empty,
+                &AnalysisOptions {
+                    community_max_passes: budget,
+                    ..four.clone()
+                }
+            )
+            .unwrap_err()
+            .to_string(),
+            "four community starts require a total community pass budget in 4..=100"
+        );
+    }
+}
+
+#[test]
+fn four_starts_exhaust_the_shared_budget_and_report_unmet_soft_targets() {
+    for budget in [4, 7, 99, 100] {
+        let options = AnalysisOptions {
+            community_starts: 4,
+            community_max_passes: budget,
+            resolution: 0.05,
+            max_community_size: Some(5),
+            min_cohesion: Some(0.9),
+            ..Default::default()
+        };
+        let snapshot = joined_cliques();
+        let report = analyze(&snapshot, &options).unwrap();
+        assert_eq!(report.community_starts, 4);
+        assert_eq!(report.community_passes, budget);
+        assert_eq!(report.community_split_attempts, 0);
+        assert_eq!(
+            report
+                .communities
+                .iter()
+                .map(|c| c.nodes.len())
+                .collect::<Vec<_>>(),
+            [10, 1]
+        );
+        assert_eq!(report.unsatisfied_community_constraints, [0]);
+        assert!((report.community_modularity - 0.95).abs() < 1e-10);
+        assert!(!report.community_converged && !report.community_convergence_known);
+        assert_eq!(report.community_pass_unit, "leiden_iterations");
+        assert_connected(&snapshot, &report);
+    }
+}
+
+#[test]
+fn four_starts_share_the_budget_with_a_positive_induced_retry() {
+    let snapshot = graph(3, &[(0, 1, 1.0, false), (0, 2, 1.0, false)]);
+    let options = AnalysisOptions {
+        community_starts: 4,
+        community_max_passes: 7,
+        exclude_hubs_percentile: Some(50.0),
+        max_community_size: Some(1),
+        ..Default::default()
+    };
+    let report = analyze(&snapshot, &options).unwrap();
+    // Removing the star's center leaves no positive initial projection. Its
+    // reattachment joins n00/n01, so the induced retry consumes the seven calls.
+    assert_eq!(report.excluded_hubs, ["n00"]);
+    assert_eq!(report.community_passes, 7);
+    assert_eq!(report.community_split_attempts, 1);
+    assert_eq!(report.communities[0].nodes, ["n00", "n01"]);
+    assert_eq!(report.communities[1].nodes, ["n02"]);
+    assert_eq!(report.unsatisfied_community_constraints, [0]);
+    assert_connected(&snapshot, &report);
+}
+
+#[test]
+fn four_starts_preserve_zero_mass_and_loop_controls() {
+    use graf::analysis::AnalysisReport;
+    let options = AnalysisOptions {
+        community_starts: 4,
+        ..Default::default()
+    };
+    for snapshot in [
+        graph(0, &[]),
+        graph(3, &[]),
+        graph(2, &[(0, 1, 0.0, false)]),
+    ] {
+        let report = analyze(&snapshot, &options).unwrap();
+        assert_eq!(report.community_starts, 4);
+        assert_eq!(report.community_passes, 0);
+        assert_eq!(report.community_split_attempts, 0);
+        assert_eq!(report.communities.len(), snapshot.nodes.len());
+        assert!(report.community_converged && report.community_convergence_known);
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AnalysisReport>(&bytes)
+                .unwrap()
+                .community_starts,
+            4
+        );
+    }
+    let snapshot = graph(
+        2,
+        &[(0, 0, 4.0, false), (1, 1, 4.0, false), (0, 1, 1.0, false)],
+    );
+    let report = analyze(&snapshot, &options).unwrap();
+    assert_eq!(report.community_passes, 100);
+    assert_eq!(report.communities.len(), 2);
+    assert!((report.community_modularity - 7.0 / 18.0).abs() < 1e-10);
+    assert_connected(&snapshot, &report);
+}
+
+#[test]
+fn four_fixed_starts_improve_the_ring_and_preserve_input_order_independence() {
+    let mut records = Vec::new();
+    for block in 0..30 {
+        let a = block * 3;
+        records.extend([
+            (a, a + 1, 1.0, false),
+            (a + 1, a + 2, 1.0, false),
+            (a, a + 2, 1.0, false),
+            (a + 2, ((block + 1) % 30) * 3, 1.0, false),
+        ]);
+    }
+    let mut snapshot = graph(90, &records);
+    // Explicit lexical identities are part of this reproducible trajectory.
+    for (i, node) in snapshot.nodes.iter_mut().enumerate() {
+        node.id = format!("n{i}");
+    }
+    for (edge, &(a, b, _, _)) in snapshot.edges.iter_mut().zip(&records) {
+        edge.source = format!("n{a}");
+        edge.target = format!("n{b}");
+    }
+    let current = analyze(&snapshot, &AnalysisOptions::default()).unwrap();
+    assert_eq!(current.community_passes, 2);
+    assert!((current.community_modularity - 0.81).abs() < 1e-10);
+    let options = AnalysisOptions {
+        community_starts: 4,
+        ..Default::default()
+    };
+    let report = analyze(&snapshot, &options).unwrap();
+    assert_eq!(report.community_passes, 100);
+    assert!((report.community_modularity - 487.0 / 600.0).abs() < 1e-10);
+    assert_connected(&snapshot, &report);
+    let membership: std::collections::BTreeMap<usize, usize> = report
+        .nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id.strip_prefix('n').unwrap().parse().unwrap(),
+                n.community,
+            )
+        })
+        .collect();
+    for block in 0..30 {
+        assert_eq!(membership[&(block * 3)], membership[&(block * 3 + 1)]);
+        assert_eq!(membership[&(block * 3)], membership[&(block * 3 + 2)]);
+    }
+    // For connected whole-triangle groups, Q=1-c/120-sum(k_i^2)/900.
+    let squared_sizes: f64 = report
+        .communities
+        .iter()
+        .map(|c| {
+            let triangles = c.nodes.len() as f64 / 3.0;
+            triangles * triangles
+        })
+        .sum();
+    let independent_q = 1.0 - report.communities.len() as f64 / 120.0 - squared_sizes / 900.0;
+    assert!((report.community_modularity - independent_q).abs() < 1e-10);
+    let bytes = serde_json::to_vec(&report).unwrap();
+    snapshot.nodes.reverse();
+    snapshot.edges.reverse();
+    assert_eq!(
+        bytes,
+        serde_json::to_vec(&analyze(&snapshot, &options).unwrap()).unwrap()
+    );
+}

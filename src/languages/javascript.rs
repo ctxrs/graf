@@ -318,6 +318,52 @@ struct Javascript<'a> {
     classes: HashMap<usize, ClassMembers>,
 }
 impl Javascript<'_> {
+    fn callable_sequence(mut node: Syntax<'_>) -> bool {
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "statement_block"
+                | "expression_statement"
+                | "return_statement"
+                | "lexical_declaration"
+                | "variable_declaration" => {}
+                "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition" => {
+                    return parent.child_by_field_name("body") == Some(node);
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        false
+    }
+    fn declare_callable(&mut self, node: Syntax<'_>, scope: usize) {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier")
+            && node
+                .child_by_field_name("value")
+                .is_some_and(|n| n.kind() == "identifier")
+        {
+            self.e.declare_callable_local(scope, self.e.text(name));
+        }
+    }
+    fn assign_callable(&mut self, node: Syntax<'_>, scope: usize) {
+        let declaration = node.kind() == "variable_declarator";
+        if let Some(name) = node
+            .child_by_field_name(if declaration { "name" } else { "left" })
+            .filter(|n| n.kind() == "identifier")
+        {
+            let rhs = node
+                .child_by_field_name(if declaration { "value" } else { "right" })
+                .filter(|n| n.kind() == "identifier" && Self::callable_sequence(node))
+                .map(|n| self.e.text(n));
+            self.e.assign_callable_local(scope, self.e.text(name), rhs);
+        }
+    }
     fn receiver(&mut self, scope: usize, name: &str, at: usize, evidence: Receiver) {
         let marker = format!("javascript:receiver:{}:{scope}:{at}", self.e.facts.path);
         self.receivers.insert(marker.clone(), evidence);
@@ -1888,7 +1934,18 @@ impl Javascript<'_> {
                 Some(parts[..parts.len() - 1].to_vec()),
             );
         }
-        self.e.call(node, scope, target, parts);
+        if node.kind() == "call_expression"
+            && target.kind() == "identifier"
+            && Self::callable_sequence(node)
+            && !children(node).iter().any(|n| n.kind() == "optional_chain")
+            && node
+                .child_by_field_name("arguments")
+                .is_some_and(|args| children(args).iter().all(|n| n.kind() == "comment"))
+        {
+            self.e.call_with_callable_local(node, scope, target, parts);
+        } else {
+            self.e.call(node, scope, target, parts);
+        }
     }
     fn function(&mut self, node: Syntax<'_>, scope: usize, assigned: Option<&str>) {
         let name_node = node.child_by_field_name("name");
@@ -2415,6 +2472,7 @@ impl Javascript<'_> {
                     function_scope = self.e.scopes[function_scope].parent.unwrap_or(0);
                 }
                 for var in children(node) {
+                    self.declare_callable(var, function_scope);
                     if let (Some(name), Some(value)) = (
                         var.child_by_field_name("name"),
                         var.child_by_field_name("value"),
@@ -2437,10 +2495,12 @@ impl Javascript<'_> {
                     if let Some(value) = var.child_by_field_name("value") {
                         self.visit(value, scope);
                     }
+                    self.assign_callable(var, scope);
                 }
                 return;
             }
             "variable_declarator" => {
+                self.declare_callable(node, scope);
                 if let (Some(name), Some(value)) = (
                     node.child_by_field_name("name"),
                     node.child_by_field_name("value"),
@@ -2640,6 +2700,9 @@ impl Javascript<'_> {
         }
         for n in children(node) {
             self.visit(n, scope);
+        }
+        if matches!(node.kind(), "variable_declarator" | "assignment_expression") {
+            self.assign_callable(node, scope);
         }
     }
 }

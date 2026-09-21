@@ -150,6 +150,128 @@ fn leiden_cli_flags_report_their_budget_and_leave_the_store_unchanged() {
 }
 
 #[test]
+fn community_start_cli_preserves_default_bytes_and_reports_four_start_budget() {
+    let s = Sandbox::new();
+    let db = s.db("starts", "example");
+    let before = fs::read(&db).unwrap();
+    let ordinary = s.cli(&["--json", "--db", string(&db), "analyze"]);
+    let explicit = s.cli(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-starts",
+        "1",
+    ]);
+    assert!(ordinary.status.success() && explicit.status.success());
+    assert_eq!(ordinary.stdout, explicit.stdout);
+    let report: Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+    assert!(report.get("community_starts").is_none());
+    let four = s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-starts",
+        "4",
+        "--max-community-size",
+        "1",
+    ]);
+    assert_eq!(four["community_starts"], 4);
+    assert_eq!(four["community_passes"], 100);
+    assert_eq!(four["community_split_attempts"], 0);
+    assert_eq!(four["unsatisfied_community_constraints"], json!([0]));
+    assert_eq!(four["community_pass_unit"], "leiden_iterations");
+    assert_eq!(four["community_convergence_known"], false);
+    assert!(
+        four["community_algorithm"]
+            .as_str()
+            .unwrap()
+            .contains("four fixed singleton starts")
+    );
+    assert!(
+        four["methodology"]
+            .as_str()
+            .unwrap()
+            .contains("unchanged partitions do not stop")
+    );
+    assert!(
+        !four["methodology"]
+            .as_str()
+            .unwrap()
+            .contains("unchanged consecutive partitions stop iteration")
+    );
+    let alias = s.ok(&[
+        "--json",
+        "--db",
+        string(&db),
+        "cluster-only",
+        "--community-starts",
+        "4",
+        "--max-community-size",
+        "1",
+    ]);
+    assert_eq!(four, alias);
+    assert_eq!(fs::read(db).unwrap(), before);
+}
+
+#[test]
+fn community_start_cli_rejects_unsupported_counts_and_louvain() {
+    let s = Sandbox::new();
+    let db = s.db("starts", "example");
+    let before = fs::read(&db).unwrap();
+    for count in ["0", "2", "3", "8", "01", "4.0", "4294967296"] {
+        fails(
+            s.cli(&["--db", string(&db), "analyze", "--community-starts", count]),
+            "community starts must be 1 or 4",
+        );
+    }
+    fails(
+        s.cli(&[
+            "--db",
+            string(&db),
+            "analyze",
+            "--community-algorithm",
+            "louvain",
+            "--community-starts",
+            "4",
+        ]),
+        "four community starts require Leiden",
+    );
+    let omitted = s.cli(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-algorithm",
+        "louvain",
+    ]);
+    let one = s.cli(&[
+        "--json",
+        "--db",
+        string(&db),
+        "analyze",
+        "--community-algorithm",
+        "louvain",
+        "--community-starts",
+        "1",
+    ]);
+    assert!(omitted.status.success() && one.status.success());
+    assert_eq!(omitted.stdout, one.stdout);
+    let help = s.cli(&["analyze", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--community-starts"));
+    assert!(
+        help.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("unmet soft targets")
+    );
+    assert_eq!(fs::read(db).unwrap(), before);
+}
+
+#[test]
 fn snapshot_exports_guard_shrink_and_preserve_previous_bytes() {
     let s = Sandbox::new();
     let db = s.db("source", "example");

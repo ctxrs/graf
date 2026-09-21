@@ -617,8 +617,9 @@ impl crate::store::Store {
     }
 
     /// Resolve a unique endpoint: exact ID/label/scope, exact file, then literal
-    /// Unicode/accent-insensitive exact, prefix and substring tiers. Punctuation
-    /// stays literal; ties and incomplete convenience scans return errors.
+    /// Unicode/accent-insensitive exact, scoped qualified-tail, prefix and
+    /// substring tiers. Punctuation stays literal; ties and incomplete scans
+    /// return errors.
     pub fn resolve_endpoint(&self, text: &str, options: &SearchOptions) -> Result<Node> {
         catalog_budgeted(&self.conn, || {
             validate_search(options)?;
@@ -887,6 +888,7 @@ fn endpoint_tier(
     qualified: Option<&str>,
     term: &str,
     callable: &str,
+    qualified_tail: bool,
 ) -> Option<usize> {
     let normalized = [
         normalize(id),
@@ -895,10 +897,20 @@ fn endpoint_tier(
     ];
     if normalized.iter().any(|value| value == term) || normalized[1] == callable {
         Some(0)
-    } else if normalized.iter().any(|value| value.starts_with(term)) {
+    } else if qualified_tail
+        && normalized[2].strip_suffix(term).is_some_and(|prefix| {
+            prefix.is_empty()
+                || prefix
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c == '.' || c.is_whitespace())
+        })
+    {
         Some(1)
-    } else if normalized.iter().any(|value| value.contains(term)) {
+    } else if normalized.iter().any(|value| value.starts_with(term)) {
         Some(2)
+    } else if normalized.iter().any(|value| value.contains(term)) {
+        Some(3)
     } else {
         None
     }
@@ -910,10 +922,11 @@ fn scan_endpoint_rows(
     values: &[rusqlite::types::Value],
     term: &str,
     callable: &str,
-) -> Result<[Vec<String>; 3]> {
+    qualified_tail: bool,
+) -> Result<[Vec<String>; 4]> {
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query(rusqlite::params_from_iter(values.iter().cloned()))?;
-    let mut tiers: [Vec<String>; 3] = Default::default();
+    let mut tiers: [Vec<String>; 4] = Default::default();
     let start = Instant::now();
     let mut bytes = 0;
     let mut examined = 0;
@@ -934,7 +947,7 @@ fn scan_endpoint_rows(
             record_bytes <= MAX_SEARCH_BYTES && bytes <= MAX_RANK_BYTES,
             "endpoint lookup exceeded its normalization byte budget; use an exact ID or a smaller file/kind scope"
         );
-        if let Some(tier) = endpoint_tier(id, label, qualified, term, callable)
+        if let Some(tier) = endpoint_tier(id, label, qualified, term, callable, qualified_tail)
             && tiers[tier].len() < 2
         {
             tiers[tier].push(id.to_owned());
@@ -1244,6 +1257,11 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
     let callable = term
         .strip_suffix("()")
         .map_or_else(|| format!("{term}()"), str::to_owned);
+    // A complete scoped Owner.member spelling is stronger than a partial
+    // match in a longer name or descendant, but never outranks full equality.
+    let qualified_tail = file.is_some()
+        && term.contains('.')
+        && term.split('.').all(|component| !component.is_empty());
     let mut values = Vec::new();
     let mut filters = filter_sql(options, &mut values);
     if let Some(file) = file {
@@ -1267,24 +1285,31 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
              FROM node_search CROSS JOIN nodes n ON n.rowid=node_search.rowid
              WHERE node_search MATCH ?{filters} ORDER BY n.id"
         );
-        let fts_tiers = scan_endpoint_rows(conn, &fts_sql, &fts_values, &term, &callable)?;
-        if fts_tiers[0].is_empty() && fts_tiers[1].is_empty() {
+        let fts_tiers = scan_endpoint_rows(
+            conn,
+            &fts_sql,
+            &fts_values,
+            &term,
+            &callable,
+            qualified_tail,
+        )?;
+        if fts_tiers[0].is_empty() && fts_tiers[2].is_empty() {
             // Tokenization cannot prove arbitrary literal substrings, so keep
             // the complete endpoint scan when no exact/prefix tier was found.
-            [Vec::new(), Vec::new(), Vec::new()]
+            Default::default()
         } else {
             fts_tiers
         }
     } else {
-        [Vec::new(), Vec::new(), Vec::new()]
+        Default::default()
     };
-    if tiers[0].is_empty() && tiers[1].is_empty() {
+    if tiers[0].is_empty() && tiers[2].is_empty() {
         let sql = format!(
             "SELECT n.id,n.label,n.qualified_name FROM nodes n WHERE 1=1{filters}
             ORDER BY n.id LIMIT {}",
             MAX_RANK_POSTINGS + 1
         );
-        tiers = scan_endpoint_rows(conn, &sql, &values, &term, &callable)?;
+        tiers = scan_endpoint_rows(conn, &sql, &values, &term, &callable, qualified_tail)?;
     }
     let ids = tiers
         .into_iter()

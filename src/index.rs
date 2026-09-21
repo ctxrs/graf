@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
-const EXTRACTOR_REVISION: u32 = 11;
+const EXTRACTOR_REVISION: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

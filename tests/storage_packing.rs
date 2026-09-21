@@ -106,7 +106,10 @@ fn schema(conn: &Connection) -> anyhow::Result<Vec<String>> {
 }
 
 fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
-    let compact = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 2;
+    let compact = matches!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+        2 | 3
+    );
     let statements = if compact {
         [
             "SELECT json_array(rowid,id,payload,search) FROM nodes ORDER BY id",
@@ -180,7 +183,7 @@ fn assert_packed(conn: &Connection) -> anyhow::Result<()> {
     );
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2
+        3
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {

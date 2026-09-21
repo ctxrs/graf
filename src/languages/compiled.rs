@@ -91,6 +91,7 @@ pub fn parse(path: &str, source: &str, hash: &str) -> Result<Option<FileFacts>> 
         pending: vec![],
         includes: vec![],
         tests,
+        swift_callables: SwiftCallables::default(),
     };
     let package = children(root)
         .into_iter()
@@ -172,12 +173,43 @@ struct Pending<'t> {
     constructor: bool,
     context: Option<&'static str>,
 }
+#[derive(Clone)]
+struct SwiftFunctionValue {
+    scope: usize,
+    name: String,
+    key: String,
+    node: usize,
+}
+struct SwiftCallableLocal {
+    declaration: (usize, usize),
+    assignment: (usize, usize),
+    value: Option<SwiftFunctionValue>,
+    mutable: bool,
+    blocked: bool,
+}
+struct SwiftCallableCall {
+    binding: (usize, String),
+    assignment: (usize, usize),
+    value: Option<SwiftFunctionValue>,
+}
+#[derive(Default)]
+struct SwiftCallables<'t> {
+    functions: HashMap<String, Option<usize>>,
+    locals: HashMap<(usize, String), SwiftCallableLocal>,
+    calls: HashMap<(usize, usize), SwiftCallableCall>,
+    uses: Vec<(Syntax<'t>, usize)>,
+    unbound_writes: Vec<(usize, String)>,
+    escaped: HashSet<(usize, String)>,
+    conditional_depth: HashMap<usize, usize>,
+    conditional_owners: HashSet<String>,
+}
 struct Compiled<'s, 't> {
     e: Extractor<'s>,
     scopes: HashMap<usize, Context>,
     pending: Vec<Pending<'t>>,
     includes: Vec<String>,
     tests: Vec<StringTest>,
+    swift_callables: SwiftCallables<'t>,
 }
 impl<'s, 't> Compiled<'s, 't> {
     fn name(&self, n: Syntax<'_>) -> Option<String> {
@@ -203,6 +235,14 @@ impl<'s, 't> Compiled<'s, 't> {
         format!("{}:{kind}:{qualified}", self.e.language)
     }
     fn bind(&mut self, scope: usize, name: &str, value: Binding) {
+        if self.e.language == "swift"
+            && let Some(local) = self
+                .swift_callables
+                .locals
+                .get_mut(&(scope, name.to_owned()))
+        {
+            local.blocked = true;
+        }
         self.scopes
             .get_mut(&scope)
             .unwrap()
@@ -222,6 +262,290 @@ impl<'s, 't> Compiled<'s, 't> {
             }
             scope = self.e.scopes[scope].parent?;
         }
+    }
+    // This lookup also sees uncertain closure scopes, solely to invalidate a
+    // captured local. Positive function identity still requires normal lookup.
+    fn swift_binding_scope(&self, mut scope: usize, name: &str) -> Option<usize> {
+        loop {
+            if self.scopes[&scope].bindings.contains_key(name) {
+                return Some(scope);
+            }
+            scope = self.e.scopes[scope].parent?;
+        }
+    }
+    fn swift_function_value(&self, scope: usize, n: Syntax<'_>) -> Option<SwiftFunctionValue> {
+        if n.kind() != "simple_identifier" {
+            return None;
+        }
+        let name = self.e.text(n);
+        let Binding::Symbol(key) = self.lookup(scope, name)? else {
+            return None;
+        };
+        let node = (*self.swift_callables.functions.get(key)?)?;
+        Some(SwiftFunctionValue {
+            scope: self.swift_binding_scope(scope, name)?,
+            name: name.to_owned(),
+            key: key.clone(),
+            node,
+        })
+    }
+    fn swift_conditional_scope(&self, mut scope: usize) -> bool {
+        loop {
+            if self
+                .swift_callables
+                .conditional_depth
+                .get(&scope)
+                .is_some_and(|depth| *depth > 0)
+            {
+                return true;
+            }
+            let Some(parent) = self.e.scopes[scope].parent else {
+                return false;
+            };
+            scope = parent;
+        }
+    }
+    fn swift_callable_read(&mut self, n: Syntax<'t>, scope: usize) {
+        if n.kind() == "directive" {
+            // Swift's #if markers are siblings, not containers for the guarded
+            // statements. Decline the affected body's entire callable timeline.
+            self.swift_callables
+                .conditional_owners
+                .insert(self.e.scopes[scope].owner.clone());
+            let depth = self
+                .swift_callables
+                .conditional_depth
+                .entry(scope)
+                .or_default();
+            match n.child(0).map(|c| c.kind()) {
+                Some("#if") => *depth += 1,
+                Some("#elseif" | "#else") => *depth = (*depth).max(1),
+                Some("#endif") => *depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if n.kind() == "assignment"
+            && let Some(name) = swift_assignment_name(n)
+            && self.swift_binding_scope(scope, self.e.text(name)).is_none()
+        {
+            // The ordinary assignment visitor creates an unknown binding for
+            // this spelling. Remember the write before that can hide a later
+            // outer declaration captured by a nested function.
+            self.swift_callables
+                .unbound_writes
+                .push((scope, self.e.text(name).to_owned()));
+        }
+        if n.kind() == "simple_identifier"
+            && !n.parent().is_some_and(|p| p.kind() == "navigation_suffix")
+        {
+            // A member suffix is not a lexical read. Exclude it from both the
+            // immediate capture check and the deferred capture/escape pass.
+            // The navigation receiver still visits the normal lexical path.
+            let name = self.e.text(n).to_owned();
+            if let Some(binding_scope) = self.swift_binding_scope(scope, &name)
+                && self.e.scopes[scope].owner != self.e.scopes[binding_scope].owner
+                && let Some(local) = self.swift_callables.locals.get_mut(&(binding_scope, name))
+            {
+                local.blocked = true;
+            }
+            // Resolve captures after all declarations have been visited: nested
+            // functions and closures do not execute on their textual timeline.
+            self.swift_callables.uses.push((n, scope));
+        }
+        if n.kind() != "call_expression" {
+            return;
+        }
+        let Some(target) = n.named_child(0).filter(|c| c.kind() == "simple_identifier") else {
+            return;
+        };
+        let name = self.e.text(target).to_owned();
+        let Some(binding_scope) = self.swift_binding_scope(scope, &name) else {
+            return;
+        };
+        let binding = (binding_scope, name);
+        let Some(local) = self.swift_callables.locals.get(&binding) else {
+            return;
+        };
+        // Swift represents subscripts as call expressions too. Only an ordinary
+        // parenthesized invocation, directly in this function body, has proof.
+        let ordinary = n.named_child(1).is_some_and(|suffix| {
+            suffix.kind() == "call_suffix"
+                && suffix.named_child_count() == 1
+                && suffix.named_child(0).is_some_and(|args| {
+                    args.kind() == "value_arguments"
+                        && args.child(0).is_some_and(|c| c.kind() == "(")
+                })
+        });
+        let statement = n
+            .parent()
+            .filter(|p| {
+                p.kind() == "control_transfer_statement"
+                    && p.child(0).is_some_and(|c| c.kind() == "return")
+                    && p.child_by_field_name("result") == Some(n)
+            })
+            .unwrap_or(n);
+        let value = if ordinary && swift_body_statement(statement) && !self.uncertain(scope) {
+            local.value.clone()
+        } else {
+            None
+        };
+        self.swift_callables.calls.insert(
+            (scope, n.start_byte()),
+            SwiftCallableCall {
+                binding,
+                assignment: local.assignment,
+                value,
+            },
+        );
+    }
+    fn swift_callable_write(&mut self, n: Syntax<'_>, scope: usize) {
+        if n.kind() == "property_declaration"
+            && self.scopes[&scope].local
+            && swift_body_statement(n)
+            && !self.uncertain(scope)
+        {
+            let Some(pattern) = n.child_by_field_name("name") else {
+                return;
+            };
+            let Some(name) = pattern.child_by_field_name("bound_identifier") else {
+                return;
+            };
+            let mut cursor = n.walk();
+            if name.kind() != "simple_identifier"
+                || pattern.child_count() != 1
+                || n.children_by_field_name("name", &mut cursor).count() != 1
+                || children(n).iter().any(|c| {
+                    matches!(
+                        c.kind(),
+                        "modifiers"
+                            | "computed_property"
+                            | "willset_didset_block"
+                            | "type_constraints"
+                    )
+                })
+            {
+                return;
+            }
+            let Some(value) = n.child_by_field_name("value") else {
+                return;
+            };
+            let value = self.swift_function_value(scope, value);
+            let mutable = children(n).iter().any(|c| {
+                c.kind() == "value_binding_pattern"
+                    && c.child_by_field_name("mutability")
+                        .is_some_and(|m| self.e.text(m) == "var")
+            });
+            let span = (n.start_byte(), n.end_byte());
+            self.swift_callables
+                .locals
+                .entry((scope, self.e.text(name).to_owned()))
+                .and_modify(|local| local.blocked = true)
+                .or_insert(SwiftCallableLocal {
+                    declaration: span,
+                    assignment: span,
+                    value,
+                    mutable,
+                    blocked: false,
+                });
+        } else if n.kind() == "assignment" {
+            let Some(name) = swift_assignment_name(n) else {
+                return;
+            };
+            let name = self.e.text(name).to_owned();
+            let Some(binding_scope) = self.swift_binding_scope(scope, &name) else {
+                return;
+            };
+            let value = n
+                .child_by_field_name("result")
+                .and_then(|value| self.swift_function_value(scope, value));
+            if let Some(local) = self.swift_callables.locals.get_mut(&(binding_scope, name)) {
+                if scope != binding_scope
+                    || !swift_body_statement(n)
+                    || !local.mutable
+                    || !n
+                        .child_by_field_name("operator")
+                        .is_some_and(|op| self.e.text(op) == "=")
+                {
+                    local.blocked = true;
+                } else {
+                    local.value = value;
+                    local.assignment = (n.start_byte(), n.end_byte());
+                }
+            }
+        }
+    }
+    fn swift_callable_escapes(&mut self) {
+        for (mut scope, name) in std::mem::take(&mut self.swift_callables.unbound_writes) {
+            loop {
+                if let Some(local) = self.swift_callables.locals.get_mut(&(scope, name.clone())) {
+                    local.blocked = true;
+                    break;
+                }
+                if let Some(Binding::Symbol(key)) = self.scopes[&scope].bindings.get(&name)
+                    && self.swift_callables.functions.contains_key(key)
+                {
+                    self.swift_callables.escaped.insert((scope, name));
+                    break;
+                }
+                let Some(parent) = self.e.scopes[scope].parent else {
+                    break;
+                };
+                scope = parent;
+            }
+        }
+        for (n, scope) in std::mem::take(&mut self.swift_callables.uses) {
+            let name = self.e.text(n).to_owned();
+            let Some(binding_scope) = self.swift_binding_scope(scope, &name) else {
+                continue;
+            };
+            let binding = (binding_scope, name);
+            let escaped = std::iter::successors(n.parent(), |p| p.parent())
+                .take_while(|p| p.kind() != "statements")
+                .any(|p| {
+                    (p.kind() == "prefix_expression"
+                        && p.child_by_field_name("operation")
+                            .is_some_and(|op| self.e.text(op) == "&"))
+                        || (p.kind() == "assignment"
+                            && swift_assignment_name(p).is_none()
+                            && p.child_by_field_name("target").is_some_and(|target| {
+                                target.start_byte() <= n.start_byte()
+                                    && n.end_byte() <= target.end_byte()
+                            }))
+                });
+            if escaped {
+                self.swift_callables.escaped.insert(binding.clone());
+            }
+            if let Some(local) = self.swift_callables.locals.get_mut(&binding)
+                && (escaped || self.e.scopes[scope].owner != self.e.scopes[binding_scope].owner)
+            {
+                local.blocked = true;
+            }
+        }
+    }
+    fn swift_callable_target<'a>(
+        &self,
+        call: &'a SwiftCallableCall,
+    ) -> Option<&'a SwiftFunctionValue> {
+        if self.swift_callables.locals[&call.binding].blocked
+            || self
+                .swift_callables
+                .conditional_owners
+                .contains(&self.e.scopes[call.binding.0].owner)
+        {
+            return None;
+        }
+        let value = call.value.as_ref()?;
+        // A snapshot records a declaration identity, never just a spelling. A
+        // later overload, shadowing declaration, or unknown write invalidates it.
+        (matches!(self.scopes[&value.scope].bindings.get(&value.name),
+            Some(Binding::Symbol(key)) if key == &value.key)
+            && !self
+                .swift_callables
+                .escaped
+                .contains(&(value.scope, value.name.clone()))
+            && self.swift_callables.functions.get(&value.key) == Some(&Some(value.node))
+            && self.e.facts.nodes[value.node].binding_key.as_ref() == Some(&value.key))
+        .then_some(value)
     }
     fn child(&mut self, scope: usize, n: Syntax<'_>) -> usize {
         let child = self.e.block(scope, n);
@@ -430,6 +754,9 @@ impl<'s, 't> Compiled<'s, 't> {
     }
     fn visit(&mut self, n: Syntax<'t>, mut scope: usize) {
         let kind = n.kind();
+        if self.e.language == "swift" {
+            self.swift_callable_read(n, scope);
+        }
         if kind == "template_declaration" {
             scope = self.child(scope, n);
         }
@@ -884,6 +1211,9 @@ impl<'s, 't> Compiled<'s, 't> {
         for child in children(n) {
             self.visit(child, scope);
         }
+        if self.e.language == "swift" {
+            self.swift_callable_write(n, scope);
+        }
     }
     fn modifier(&self, n: Syntax<'_>, word: &str) -> bool {
         children(n)
@@ -990,6 +1320,7 @@ impl<'s, 't> Compiled<'s, 't> {
             });
         let parameterless = self.parameterless(n);
         let uncertain = self.uncertain(scope) || extension || simple_name(&name).is_none();
+        let swift_conditional = self.e.language == "swift" && self.swift_conditional_scope(scope);
         let child = self.define(
             n,
             scope,
@@ -998,6 +1329,11 @@ impl<'s, 't> Compiled<'s, 't> {
             qualified.clone(),
             !dynamic && !uncertain,
         );
+        if swift_conditional {
+            self.swift_callables
+                .conditional_owners
+                .insert(self.e.scopes[child].owner.clone());
+        }
         self.bind(
             scope,
             &name,
@@ -1021,6 +1357,20 @@ impl<'s, 't> Compiled<'s, 't> {
                 self.e.language,
                 if static_member { "static" } else { "member" }
             )]);
+        }
+        if self.e.language == "swift"
+            && !member
+            && !uncertain
+            && !swift_conditional
+            && !children(n).iter().any(|c| c.kind() == "type_parameters")
+            && let Some(key) = node.binding_key.clone()
+        {
+            let index = self.e.facts.nodes.len() - 1;
+            self.swift_callables
+                .functions
+                .entry(key)
+                .and_modify(|node| *node = None)
+                .or_insert(Some(index));
         }
         let child_ctx = self.scopes.get_mut(&child).unwrap();
         child_ctx.local = true;
@@ -1708,6 +2058,7 @@ impl<'s, 't> Compiled<'s, 't> {
         }
     }
     fn finish(&mut self) {
+        self.swift_callable_escapes();
         if matches!(self.e.language, "c" | "cpp") {
             let own = format!("@{}.", self.e.facts.path);
             let mut links = vec![];
@@ -1780,7 +2131,29 @@ impl<'s, 't> Compiled<'s, 't> {
             {
                 continue;
             }
-            let keys = self.resolve(&p);
+            let callable = self
+                .swift_callables
+                .calls
+                .get(&(p.scope, p.node.start_byte()))
+                .filter(|_| p.relation == "calls");
+            let proven = callable.and_then(|call| self.swift_callable_target(call));
+            let keys = if callable.is_some() {
+                proven
+                    .map(|value| vec![value.key.clone()])
+                    .unwrap_or_default()
+            } else {
+                self.resolve(&p)
+            };
+            let callable_evidence = callable.zip(proven).map(|(call, value)| {
+                let local = &self.swift_callables.locals[&call.binding];
+                json!({
+                    "declaration_start_byte": local.declaration.0,
+                    "declaration_end_byte": local.declaration.1,
+                    "assignment_start_byte": call.assignment.0,
+                    "assignment_end_byte": call.assignment.1,
+                    "target_id": self.e.facts.nodes[value.node].id,
+                })
+            });
             let relation = if p.relation == "inherits"
                 && matches!(self.e.language, "csharp" | "swift" | "kotlin")
                 && !self.scopes[&p.scope].abstract_members
@@ -1809,6 +2182,19 @@ impl<'s, 't> Compiled<'s, 't> {
                 keys.clone(),
                 &reason,
             );
+            if let Some(mut evidence) = callable_evidence {
+                let owner = &self.e.scopes[p.scope].owner;
+                evidence["reference_id"] = json!(self.e.facts.references.last().unwrap().id);
+                if let Some(node) = self.e.facts.nodes.iter_mut().find(|n| &n.id == owner) {
+                    if !node.metadata["swift_callable_values"].is_array() {
+                        node.metadata["swift_callable_values"] = json!([]);
+                    }
+                    node.metadata["swift_callable_values"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(evidence);
+                }
+            }
             if let Some(context) = p.context {
                 let owner = &self.e.scopes[p.scope].owner;
                 let id = self.e.facts.references.last().unwrap().id.clone();
@@ -1821,6 +2207,19 @@ impl<'s, 't> Compiled<'s, 't> {
             }
         }
     }
+}
+fn swift_body_statement(n: Syntax<'_>) -> bool {
+    n.parent().is_some_and(|p| {
+        p.kind() == "statements" && p.parent().is_some_and(|p| p.kind() == "function_body")
+    })
+}
+fn swift_assignment_name(n: Syntax<'_>) -> Option<Syntax<'_>> {
+    let target = n.child_by_field_name("target")?;
+    target.named_child(0).filter(|c| {
+        target.kind() == "directly_assignable_expression"
+            && target.named_child_count() == 1
+            && c.kind() == "simple_identifier"
+    })
 }
 fn declarator_name(mut n: Syntax<'_>) -> Option<Syntax<'_>> {
     loop {
@@ -1907,6 +2306,17 @@ pub fn apply_swift_context(facts: &mut FileFacts, module: &str, imports: &[(Stri
         .map(|(name, ids)| (*name, *ids.iter().next().unwrap()))
         .collect();
     let own = format!("@{}.", facts.path);
+    let callable_values: HashSet<String> = facts
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.metadata["swift_callable_values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|proof| proof["reference_id"].as_str().map(str::to_owned))
+        })
+        .collect();
     let remap = |key: &str| -> Option<String> {
         let rest = key.strip_prefix("swift:")?;
         let (kind, symbol) = rest.split_once(':')?;
@@ -1969,6 +2379,9 @@ pub fn apply_swift_context(facts: &mut FileFacts, module: &str, imports: &[(Stri
             // an unordered search space and cannot be Store's priority list.
             if imported.len() == 1
                 && unique.len() == 1
+                // A copied local function already names an exact declaration;
+                // importing a same-named function cannot replace that identity.
+                && !callable_values.contains(&reference.id)
                 && let Some((kind, symbol)) =
                     key.strip_prefix("swift:").and_then(|s| s.split_once(':'))
                 && let Some(symbol) = symbol.strip_prefix(&own)

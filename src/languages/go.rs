@@ -106,6 +106,54 @@ struct Go<'a> {
     receivers: Vec<(String, usize, Vec<String>, bool)>,
 }
 impl Go<'_> {
+    fn callable_sequence(mut node: Syntax<'_>) -> bool {
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "block"
+                | "statement_list"
+                | "expression_statement"
+                | "return_statement"
+                | "var_declaration"
+                | "var_spec_list" => {}
+                "expression_list" if children(parent).len() == 1 => {}
+                "function_declaration" | "method_declaration" | "func_literal" => {
+                    return parent.child_by_field_name("body") == Some(node);
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        false
+    }
+    fn callable_pair(node: Syntax<'_>) -> Option<(Syntax<'_>, Syntax<'_>)> {
+        let (names, value) = if node.kind() == "var_spec" {
+            let mut cursor = node.walk();
+            (
+                node.children_by_field_name("name", &mut cursor)
+                    .collect::<Vec<_>>(),
+                node.child_by_field_name("value")?,
+            )
+        } else {
+            if node.kind() == "assignment_statement"
+                && node
+                    .child_by_field_name("operator")
+                    .is_none_or(|n| n.kind() != "=")
+            {
+                return None;
+            }
+            (
+                children(node.child_by_field_name("left")?),
+                node.child_by_field_name("right")?,
+            )
+        };
+        let values = children(value);
+        match (names.as_slice(), values.as_slice()) {
+            ([name], [value]) if name.kind() == "identifier" && value.kind() == "identifier" => {
+                Some((*name, *value))
+            }
+            _ => None,
+        }
+    }
     fn receiver_binding(binding: &Binding) -> bool {
         matches!(binding, Binding::Namespace { prefixes, .. } if prefixes.iter().all(|p| p.starts_with("go:receiver:")))
     }
@@ -437,6 +485,11 @@ impl Go<'_> {
         }
     }
     fn visit(&mut self, node: Syntax<'_>, scope: usize) {
+        if matches!(node.kind(), "var_spec" | "short_var_declaration")
+            && let Some((name, _)) = Self::callable_pair(node)
+        {
+            self.e.declare_callable_local(scope, self.e.text(name));
+        }
         match node.kind() {
             "source_file" => {
                 // Imports are file scoped even when written after declarations.
@@ -570,8 +623,31 @@ impl Go<'_> {
             }
             "call_expression" => {
                 if let Some(target) = node.child_by_field_name("function") {
-                    self.e.call(node, scope, target, self.dotted(target));
+                    if target.kind() == "identifier"
+                        && Self::callable_sequence(node)
+                        && node.child_by_field_name("arguments").is_some_and(|args| {
+                            children(args).iter().all(|n| n.kind() == "comment")
+                        })
+                    {
+                        self.e
+                            .call_with_callable_local(node, scope, target, self.dotted(target));
+                    } else {
+                        self.e.call(node, scope, target, self.dotted(target));
+                    }
                 }
+            }
+            "unary_expression"
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|n| n.kind() == "&") =>
+            {
+                let parts = node
+                    .child_by_field_name("operand")
+                    .and_then(|n| self.dotted(n));
+                self.e.escape_callable_local(
+                    scope,
+                    parts.as_ref().and_then(|p| p.first()).map(String::as_str),
+                );
             }
             "block"
             | "for_statement"
@@ -596,6 +672,17 @@ impl Go<'_> {
         }
         for n in children(node) {
             self.visit(n, scope);
+        }
+        if matches!(
+            node.kind(),
+            "var_spec" | "short_var_declaration" | "assignment_statement"
+        ) && let Some((name, rhs)) = Self::callable_pair(node)
+        {
+            self.e.assign_callable_local(
+                scope,
+                self.e.text(name),
+                Self::callable_sequence(node).then(|| self.e.text(rhs)),
+            );
         }
     }
 }
