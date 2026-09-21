@@ -1,4 +1,4 @@
-<img src="docs/assets/graf-readme-banner.svg" alt="Your codebase is a graph. Query it with graf. 7x faster indexing, 40x faster search, one native binary. Graphify, rebuilt." width="100%">
+<img src="docs/assets/graf-readme-banner.svg" alt="graf is graphify, rebuilt in rust for 40x faster search" width="100%">
 
 Grep can find a name. **graf** tells you who calls it, what depends on it, what might break if it changes, and how it connects to the rest of the repository.
 
