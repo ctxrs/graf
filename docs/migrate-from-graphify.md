@@ -2,34 +2,15 @@
 
 Graf can import an existing Graphify snapshot and replace a supported project MCP connection without deleting the old setup.
 
-## Install and switch in one command
+## Install Graf, then migrate
 
-Run this from a project containing `graphify-out/graph.json`.
-
-Linux or macOS:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh -s -- --from graphify
-```
-
-Windows PowerShell:
-
-```powershell
-$env:GRAF_FROM = 'graphify'
-try {
-    irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
-} finally {
-    Remove-Item Env:GRAF_FROM -ErrorAction SilentlyContinue
-}
-```
-
-The installer verifies and installs the latest Graf release, then runs `graf switch graphify` from the current directory.
-
-If Graf is already installed:
+Install Graf using the command in [installation and downloads](downloads.md). Then run the migration from a project containing `graphify-out/graph.json`:
 
 ```bash
 graf switch graphify
 ```
+
+This imports the Graphify snapshot into `.graf/index.db`, switches a supported project MCP connection, and verifies the new server. It leaves Graphify and its existing setup in place.
 
 ## What Graf changes
 
