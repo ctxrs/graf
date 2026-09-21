@@ -607,6 +607,95 @@ fn variance_recovery_does_not_hide_invalid_or_unsupported_syntax() {
 }
 
 #[test]
+fn factory_return_proof_keeps_nested_returns_and_type_assertions_separate() {
+    let parsed = facts(
+        "factory.ts",
+        r#"
+export interface build {}
+export function build() {
+  function other(flag) { if (flag) return 1; return 2; }
+  function Implementation() { return other(true); }
+  Object.defineProperty(Implementation, "name", { value: "Published" });
+  return Implementation as any;
+}
+export const Value: build = build();
+export function invoke() { return new Value(); }
+"#,
+    );
+    let factory = parsed
+        .nodes
+        .iter()
+        .find(|n| n.label == "build" && n.kind == "function")
+        .unwrap();
+    let body = parsed
+        .nodes
+        .iter()
+        .find(|n| n.label == "Implementation")
+        .unwrap();
+    assert_eq!(factory.metadata["factory_return"]["target"], body.id);
+    let key = factory.metadata["factory_return"]["key"].as_str().unwrap();
+    assert!(
+        body.metadata["binding_aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == key)
+    );
+    let value = parsed.nodes.iter().find(|n| n.label == "Value").unwrap();
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(
+                |r| value.metadata["factory_initializer"].as_str() == Some(r.id.as_str())
+                    && r.label == "build"
+                    && r.relation == "calls"
+            )
+    );
+    // Returning the function is not an invocation of it. No probe may escape.
+    assert!(!parsed.references.iter().any(|r| r.source == factory.id
+        && r.relation == "calls"
+        && r.candidate_keys.iter().any(|k| k == key)));
+    assert!(
+        !parsed.references.iter().any(|r| r.source == factory.id
+            && r.relation == "calls"
+            && r.label == "Implementation")
+    );
+}
+
+#[test]
+fn factory_return_proof_rejects_competing_async_generator_and_mutated_bindings() {
+    for source in [
+        "function build() { function Body() {} if (flag) return Body; }",
+        "function build() { function Body() {} if (flag) return Body; return Body; }",
+        "function build() { function Body() {} return flag ? Body : external; }",
+        "function build() { function Body() {} Body = external; return Body; }",
+        "function build() { function Body() {} function replace() { Body = external; } return Body; }",
+        "function build() { function Body() {} function Body() {} return Body; }",
+        "function build() { if (flag) { function Body() {} } return Body; }",
+        "function build(Body) { return Body; }",
+        "function build() { const Body = () => {}; return Body; }",
+        "function build() { return () => {}; }",
+        "async function build() { function Body() {} return Body; }",
+        "function* build() { function Body() {} return Body; }",
+        "function build() { async function Body() {} return Body; }",
+        "function build() { function* Body() {} return Body; }",
+        "function build() { function Body() {} eval(code); return Body; }",
+        "function build() { function Body() {} return Body; } build = external;",
+    ] {
+        let parsed = facts("negative.ts", source);
+        assert!(
+            parsed
+                .nodes
+                .iter()
+                .filter(|n| n.label == "build")
+                .all(|n| n.metadata["factory_return"].is_null()),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn factory_const_callees_keep_type_identity_and_callsite_provenance() {
     let source = r#"
 export interface Shape {}
@@ -815,6 +904,38 @@ function use() { service.run(); service(); Job(); new Job(); }
                 .filter(|r| r.label == name && r.relation == "calls")
                 .all(|r| r.candidate_keys.is_empty())
         );
+    }
+}
+
+#[test]
+fn optional_factory_calls_stay_unresolved_across_javascript_and_typescript() {
+    for path in ["optional.js", "optional.ts", "optional.tsx"] {
+        for (initializer, invocation, eligible) in [
+            ("build()", "Value()", true),
+            ("build?.()", "Value()", false),
+            ("core.build?.()", "Value()", false),
+            ("build()", "Value?.()", false),
+        ] {
+            let source = format!(
+                "function build() {{ function Body() {{}} return Body; }}\nconst Value = {initializer};\nfunction invoke() {{ {invocation}; }}"
+            );
+            let parsed = facts(path, &source);
+            let caller = parsed.nodes.iter().find(|n| n.label == "invoke").unwrap();
+            let calls: Vec<_> = parsed
+                .references
+                .iter()
+                .filter(|r| r.source == caller.id && r.relation == "calls" && r.label == "Value")
+                .collect();
+            assert_eq!(calls.len(), 1, "{path}: {source}");
+            assert!(calls[0].candidate_keys.is_empty(), "{path}: {source}");
+            assert_eq!(
+                parsed.references.iter().any(|r| {
+                    r.source == caller.id && r.relation == "declared_callee" && r.label == "Value"
+                }),
+                eligible,
+                "{path}: {source}"
+            );
+        }
     }
 }
 

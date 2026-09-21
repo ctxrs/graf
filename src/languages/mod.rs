@@ -84,5 +84,5 @@ pub fn parse(path: &str, source: &str, hash: &str) -> Result<Option<FileFacts>> 
 
 /// Changes whenever extraction or binding semantics change, for incremental cache invalidation.
 pub fn revision() -> &'static str {
-    "native-languages-18"
+    "native-languages-19"
 }
