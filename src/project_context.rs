@@ -1571,7 +1571,7 @@ impl JavascriptContext {
             }
             result.files.insert(path.clone());
             if let Some(source) = source
-                && let Some(facts) = crate::languages::parse(path, source, &hash)?
+                && let Some(mut facts) = crate::languages::parse(path, source, &hash)?
             {
                 if facts
                     .nodes
@@ -1580,6 +1580,7 @@ impl JavascriptContext {
                 {
                     result.esm_files.insert(path.clone());
                 }
+                facts.references.shrink_to_fit();
                 result.raw_facts.insert(path.clone(), facts);
             }
         }
