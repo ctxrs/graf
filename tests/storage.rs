@@ -333,6 +333,77 @@ fn bounded_snapshots_include_unresolved_evidence_and_check_payload_before_loadin
 }
 
 #[test]
+fn multiple_reference_resolutions_preserve_bindings_and_call_sites() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("index.db");
+    let mut store = Store::create(&db)?;
+    let mut last = reference("c-last", &["last"]);
+    last.source = "other-caller".into();
+    last.relation = "uses".into();
+    last.line = 8;
+    store.apply_native(
+        "repo",
+        vec![
+            file(
+                "caller.py",
+                vec![
+                    node("caller", "caller.py", "caller"),
+                    node("other-caller", "caller.py", "other-caller"),
+                ],
+                // Resolution order is by ID, independent of insertion order.
+                vec![
+                    last,
+                    reference("b-missing", &["missing"]),
+                    reference("a-first", &["first"]),
+                ],
+            ),
+            file(
+                "targets.py",
+                vec![
+                    node("first", "targets.py", "first"),
+                    node("last", "targets.py", "last"),
+                ],
+                vec![],
+            ),
+        ],
+        vec![],
+        Coverage::default(),
+    )?;
+    let graph = store.snapshot()?;
+    assert_eq!(
+        graph
+            .edges
+            .iter()
+            .map(|e| json!([e.id, e.source, e.target, e.relation, e.line]))
+            .collect::<Vec<_>>(),
+        vec![
+            json!(["reference:a-first", "caller", "first", "calls", 2]),
+            json!(["reference:c-last", "other-caller", "last", "uses", 8]),
+        ]
+    );
+    let conn = rusqlite::Connection::open(&db)?;
+    let resolutions = conn
+        .prepare("SELECT r.id,n.id,r.resolution_reason FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key ORDER BY r.id")?
+        .query_map([], |row| {
+            Ok(json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?
+            ]))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(
+        resolutions,
+        vec![
+            json!(["a-first", "first", ""]),
+            json!(["b-missing", null, "missing target"]),
+            json!(["c-last", "last", ""]),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn deltas_revisit_negative_and_ambiguous_bindings_without_losing_call_sites() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
@@ -737,6 +808,129 @@ fn fts_is_persistent_and_removed_with_file_facts() -> anyhow::Result<()> {
 }
 
 #[test]
+fn compact_search_projection_keeps_identifier_and_prose_recall() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("index.db");
+    let mut item = node("camel-id", "example.py", "key");
+    item.label = "CamelCase".into();
+    item.metadata = json!({"description":"searchable prose"});
+    let expected = "camel-id CamelCase camel-id example.py searchable prose camel-id Camel Case camel-id example.py searchable prose";
+    let legacy = "camel-id CamelCase camel-id example.py searchable prose camel-id CamelCase camel-id example.py searchable prose camel-id Camel Case camel-id example.py searchable prose";
+    let mut store = Store::create(&path)?;
+    store.apply_native(
+        "repo",
+        vec![file("example.py", vec![item.clone()], vec![])],
+        vec![],
+        Coverage::default(),
+    )?;
+
+    let sql = rusqlite::Connection::open(&path)?;
+    let search: String = sql.query_row("SELECT search FROM nodes", [], |r| r.get(0))?;
+    assert_eq!(search, expected);
+    assert!(search.len() < legacy.len());
+    for text in ["camelcase", "camel case", "searchable"] {
+        assert_eq!(
+            store.query(text, &QueryOptions::default())?.nodes[0].id,
+            item.id
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(store.snapshot()?.nodes)?,
+        serde_json::to_value(vec![item.clone()])?
+    );
+
+    drop(store);
+    let sql = rusqlite::Connection::open(&path)?;
+    sql.execute("UPDATE metadata SET search_version=3", [])?;
+    sql.execute("UPDATE nodes SET search=?1", [&legacy])?;
+    sql.execute_batch(
+        "DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes;",
+    )?;
+    drop(sql);
+    let before = std::fs::read(&path)?;
+    let read = Store::open_read_only(&path)?;
+    assert_eq!(
+        serde_json::to_value(read.snapshot()?.nodes)?,
+        serde_json::to_value(vec![item.clone()])?
+    );
+    drop(read);
+    assert_eq!(std::fs::read(&path)?, before);
+
+    let mut store = Store::open(&path)?;
+    store.apply_native("repo", vec![], vec![], Coverage::default())?;
+    let sql = rusqlite::Connection::open(&path)?;
+    assert_eq!(
+        sql.query_row("SELECT search_version FROM metadata", [], |r| r
+            .get::<_, i64>(0))?,
+        5
+    );
+    let search: String = sql.query_row("SELECT search FROM nodes", [], |r| r.get(0))?;
+    assert_eq!(search, expected);
+    assert_eq!(
+        serde_json::to_value(store.snapshot()?.nodes)?,
+        serde_json::to_value(vec![item])?
+    );
+    Ok(())
+}
+
+#[test]
+fn literal_compatibility_prefixes_survive_explicit_search_migration() -> anyhow::Result<()> {
+    for (label, prefix) in [("ﬂow controller", "ﬂow"), ("Ｆｌｏｗ manager", "Ｆｌｏｗ")]
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("index.db");
+        let mut item = node("item", "example.py", "key");
+        item.label = label.into();
+        let mut store = Store::create(&path)?;
+        store.apply_native(
+            "repo",
+            vec![file("example.py", vec![item.clone()], vec![])],
+            vec![],
+            Coverage::default(),
+        )?;
+        assert_eq!(
+            store.query(prefix, &QueryOptions::default())?.nodes[0].id,
+            "item"
+        );
+        assert_eq!(
+            store.query("flow", &QueryOptions::default())?.nodes[0].id,
+            "item"
+        );
+        let mut snapshot = serde_json::to_value(store.snapshot()?)?;
+        drop(store);
+
+        // Authentic old raw postings: changing only the version on new
+        // postings would not exercise literal old-index compatibility.
+        let sql = rusqlite::Connection::open(&path)?;
+        let raw = format!("item {label} item example.py");
+        sql.execute("UPDATE metadata SET search_version=3", [])?;
+        sql.execute("UPDATE nodes SET search=?1", [&raw])?;
+        sql.execute_batch("DELETE FROM node_search; INSERT INTO node_search(rowid,text) SELECT rowid,search FROM nodes;")?;
+        drop(sql);
+        let reader = Store::open_read_only(&path)?;
+        assert_eq!(
+            reader.query(prefix, &QueryOptions::default())?.nodes[0].id,
+            "item"
+        );
+        drop(reader);
+
+        let mut store = Store::open(&path)?;
+        store.apply_native("repo", vec![], vec![], Coverage::default())?;
+        // Explicit search migration publishes one new generation, preserving
+        // the complete graph and all remaining snapshot fields.
+        snapshot["generation"] = (snapshot["generation"].as_u64().unwrap() + 1).into();
+        for query in [prefix, "flow", label] {
+            assert_eq!(
+                store.query(query, &QueryOptions::default())?.nodes[0].id,
+                "item"
+            );
+        }
+        assert_eq!(serde_json::to_value(store.snapshot()?)?, snapshot);
+    }
+    Ok(())
+}
+
+#[test]
 fn a_query_never_combines_generations_during_updates() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("index.db");
@@ -832,11 +1026,11 @@ fn directional_hubs_use_filtered_indexes_and_a_shared_edge_budget() -> anyhow::R
     assert_eq!(outgoing.edges.len(), 5_000);
     let conn = rusqlite::Connection::open(&path)?;
     for (column, expected) in [
-        ("source", "edges_source_direction_relation"),
-        ("target", "edges_target_direction_relation"),
+        ("source_key", "edges_source_direction_relation"),
+        ("target_key", "edges_target_direction_relation"),
     ] {
         let sql = format!(
-            "EXPLAIN QUERY PLAN SELECT payload FROM edges WHERE {column}=?1 AND directed=0 AND relation=?2 ORDER BY id LIMIT 10"
+            "EXPLAIN QUERY PLAN SELECT payload FROM edges WHERE {column}=(SELECT nkey FROM nodes WHERE id=?1) AND directed=0 AND relation=?2 ORDER BY id LIMIT 10"
         );
         let mut stmt = conn.prepare(&sql)?;
         let plan = stmt

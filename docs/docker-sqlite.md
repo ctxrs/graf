@@ -20,10 +20,11 @@ from a profile does not delete that volume. See Docker's current
 and [profiles guide](https://docs.docker.com/ai/mcp-catalog-and-toolkit/profiles/).
 
 For a client with manual stdio configuration, select executable `docker` and
-arguments:
+the arguments below. Replace `PROFILE_ID` with the profile ID shown by the
+Toolkit; its display name and ID can differ.
 
 ```json
-["mcp", "gateway", "run", "--profile", "graf-scratch"]
+["mcp", "gateway", "run", "--profile", "PROFILE_ID"]
 ```
 
 Use your client's normal MCP configuration editor; its enclosing JSON format

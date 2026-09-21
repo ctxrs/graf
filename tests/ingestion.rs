@@ -1454,7 +1454,53 @@ fn bedrock_and_claude_cli_use_native_envelopes_and_bounded_settings() {
     assert_eq!(receipts[0].cache_read_input_tokens, Some(5));
     assert_eq!(receipts[0].cache_creation_input_tokens, Some(3));
     let response = json!([{"type":"system"},{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","result":graph().to_string()}]);
-    std::fs::write(&script,format!("import os,sys\nassert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='2048'\nassert sys.argv[sys.argv.index('--tools')+1]==''\nassert sys.argv[sys.argv.index('--max-turns')+1]=='1'\nassert '--no-session-persistence' in sys.argv\nassert sys.argv[sys.argv.index('--model')+1]=='explicit-claude-model'\nassert 'Queue provides durability' in sys.stdin.read()\nprint({:?})\n",response.to_string())).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            r#"import json, os, sys
+if sys.argv[-1] == '--help':
+    assert sys.argv[1:] == ['--help']
+    print('--json-schema <schema>')
+    sys.exit(0)
+a = sys.argv
+assert os.environ['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] == '2048'
+assert a[a.index('--tools')+1] == ''
+assert a[a.index('--max-turns')+1] == '1'
+assert '--no-session-persistence' in a
+assert a[a.index('--setting-sources')+1] == ''
+assert '--strict-mcp-config' in a
+assert json.loads(a[a.index('--mcp-config')+1]) == {{'mcpServers': {{}}}}
+assert a[a.index('--model')+1] == 'explicit-claude-model'
+assert 'Queue provides durability' in sys.stdin.read()
+schema = json.loads(a[a.index('--json-schema')+1])
+assert schema['$schema'] == 'http://json-schema.org/draft-07/schema#'
+assert schema['type'] == 'object'
+assert set(schema['required']) == {{'nodes', 'edges'}}
+assert set(schema['definitions']) == {{'Entity', 'Relation', 'Group'}}
+for field, definition in [('nodes', 'Entity'), ('edges', 'Relation'), ('hyperedges', 'Group')]:
+    assert schema['properties'][field]['items']['$ref'] == '#/definitions/' + definition
+# Inspect the actual argv schema, including every nested reference target.
+pending = [schema]
+while pending:
+    value = pending.pop()
+    if isinstance(value, dict):
+        assert '$defs' not in value
+        if '$ref' in value:
+            ref = value['$ref']
+            assert ref.startswith('#/definitions/')
+            target = schema
+            for segment in ref[2:].split('/'):
+                target = target[segment.replace('~1', '/').replace('~0', '~')]
+            assert isinstance(target, dict)
+        pending.extend(value.values())
+    elif isinstance(value, list):
+        pending.extend(value)
+print({:?})
+"#,
+            response.to_string()
+        ),
+    )
+    .unwrap();
     let mut adapter = CommandAdapter::claude_cli();
     adapter.program = "python3".into();
     adapter.args.insert(0, script.to_string_lossy().into());
@@ -2635,6 +2681,8 @@ assert p.parent.stat().st_mode & 0o077 == 0
 assert pathlib.Path.cwd().stat().st_mode & 0o077 == 0
 assert p.as_posix() in sys.stdin.read()
 schema = json.loads(a[a.index('--json-schema') + 1])
+assert schema['$schema'] == 'http://json-schema.org/draft-07/schema#'
+assert 'definitions' in schema and '$defs' not in schema
 assert schema['type'] == 'object'
 assert set(schema['required']) == {{'nodes', 'edges'}}
 pathlib.Path({record:?}).write_text(json.dumps({{'image':str(p), 'cwd':str(pathlib.Path.cwd())}}))

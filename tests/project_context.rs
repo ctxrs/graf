@@ -88,6 +88,803 @@ fn file_relation(
     })
 }
 
+fn javascript_assert_fresh_equivalent(f: &Fixture, incremental: &GraphSnapshot) {
+    let normalized = |graph: &GraphSnapshot| {
+        let mut graph = graph.clone();
+        graph.generation = 0;
+        graph.root = None;
+        serde_json::to_value(graph).unwrap()
+    };
+    let expected = normalized(incremental);
+    let forced = f.index_with(&IndexOptions {
+        code_only: true,
+        force: true,
+        ..Default::default()
+    });
+    assert_eq!(expected, normalized(&forced), "incremental versus forced");
+    let fresh = tempdir().unwrap();
+    let db = fresh.path().join("fresh.db");
+    index::run_with_options(
+        &f.root(),
+        &db,
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        expected,
+        normalized(&Store::open(&db).unwrap().snapshot().unwrap()),
+        "incremental versus fresh"
+    );
+    assert!(index::check_update(&f.root(), &f.db()).unwrap().fresh);
+}
+
+#[test]
+fn javascript_unrelated_inventory_and_terminal_edits_keep_unchanged_caller_facts() {
+    let f = Fixture::new();
+    f.write("lib.ts", "export function work() {}\n");
+    f.write(
+        "main.ts",
+        "import {work} from './lib'; export function use() { work(); }\n",
+    );
+    let original = f.index();
+    assert!(calls(&original, ("main.ts", "use"), ("lib.ts", "work")));
+    let stamp = || {
+        Store::open(&f.db())
+            .unwrap()
+            .file_stamps()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.path == "main.ts")
+            .unwrap()
+            .hash
+    };
+    let caller_stamp = stamp();
+    f.write("unrelated.ts", "export function elsewhere() {}\n");
+    let changes = index::check_update(&f.root(), &f.db()).unwrap();
+    assert!(
+        !changes
+            .changed
+            .iter()
+            .any(|p| p == "main.ts" || p == "lib.ts")
+    );
+    let added = f.index();
+    assert_eq!(stamp(), caller_stamp);
+    javascript_assert_fresh_equivalent(&f, &added);
+    fs::remove_file(f.root().join("unrelated.ts")).unwrap();
+    let removed = f.index();
+    assert_eq!(stamp(), caller_stamp);
+    javascript_assert_fresh_equivalent(&f, &removed);
+    for (source, present) in [
+        ("export {};\n", false),
+        ("\nexport function work() {}\n", true),
+    ] {
+        f.write("lib.ts", source);
+        assert!(
+            !index::check_update(&f.root(), &f.db())
+                .unwrap()
+                .changed
+                .iter()
+                .any(|p| p == "main.ts")
+        );
+        let graph = f.index();
+        assert_eq!(stamp(), caller_stamp);
+        let caller = node(&graph, "main.ts", "use");
+        assert_eq!(f.unresolved(caller, "work"), !present);
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.source == caller.id && e.relation == "calls")
+                .count(),
+            usize::from(present)
+        );
+        if present {
+            assert!(calls(&graph, ("main.ts", "use"), ("lib.ts", "work")));
+            assert_eq!(node(&graph, "lib.ts", "work").line, Some(2));
+        }
+        javascript_assert_fresh_equivalent(&f, &graph);
+        let noop = f.index();
+        let generation = noop.generation;
+        assert_eq!(generation, f.index().generation);
+    }
+}
+
+#[test]
+fn javascript_selected_module_add_delete_matches_fresh_without_export_fallback() {
+    let f = Fixture::new();
+    f.write("lib/index.ts", "export function work() {}\n");
+    f.write(
+        "main.ts",
+        "import {work} from './lib'; function use() { work(); }\n",
+    );
+    let first = f.index();
+    assert!(calls(&first, ("main.ts", "use"), ("lib/index.ts", "work")));
+    for source in [
+        Some("export {};\n"),
+        Some("export function work() {}\n"),
+        None,
+    ] {
+        if let Some(source) = source {
+            f.write("lib.ts", source);
+        } else {
+            fs::remove_file(f.root().join("lib.ts")).unwrap();
+        }
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        if source == Some("export {};\n") {
+            assert!(f.unresolved(caller, "work"));
+            assert!(
+                !graph
+                    .edges
+                    .iter()
+                    .any(|e| e.source == caller.id && e.relation == "calls")
+            );
+        } else {
+            let target = if source.is_some() {
+                "lib.ts"
+            } else {
+                "lib/index.ts"
+            };
+            assert!(calls(&graph, ("main.ts", "use"), (target, "work")));
+        }
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_local_factory_returns_link_bodies_without_promoting_values_or_types() {
+    let f = Fixture::new();
+    for definition in [
+        "function build() { function Body() {} return Body; }",
+        "function build() { return function Body() {}; }",
+    ] {
+        f.write("main.ts", &format!("{definition}\ninterface Value {{}}\nconst Value = build();\nexport function use(): Value {{ Value(); return new Value(); }}\n"));
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let body = node(&graph, "main.ts", "Body");
+        let value = graph
+            .nodes
+            .iter()
+            .find(|n| n.label == "Value" && n.kind == "constant")
+            .unwrap();
+        let interface = graph
+            .nodes
+            .iter()
+            .find(|n| n.label == "Value" && n.kind == "interface")
+            .unwrap();
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "calls")
+            .collect();
+        assert_eq!(runtime.len(), 2);
+        assert!(
+            runtime
+                .iter()
+                .all(|e| e.target == body.id && e.line == Some(4))
+        );
+        let declarations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "declared_callee")
+            .collect();
+        assert_eq!(declarations.len(), 2);
+        for call in runtime {
+            assert!(declarations.iter().any(|e| e.target == value.id
+                && e.metadata["reference_id"]
+                    == format!(
+                        "{}:declared_callee",
+                        call.metadata["reference_id"].as_str().unwrap()
+                    )
+                && e.file == call.file
+                && e.line == call.line));
+        }
+        assert!(graph.edges.iter().any(|e| e.source == caller.id
+            && e.target == interface.id
+            && e.relation == "return_type"));
+        assert!(!graph.edges.iter().any(|e| e.source == caller.id
+            && e.relation == "calls"
+            && (e.target == value.id || e.target == interface.id)));
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_namespace_factory_return_proof_tracks_updates_deletion_and_ambiguity() {
+    let f = Fixture::new();
+    f.write("barrel.ts", "export * from './factory.js';\n");
+    f.write("value.ts", "import * as core from './barrel.js';\nexport interface Value {}\nexport const Value: core.build = core.build();\n");
+    f.write("main.ts", "import { Value } from './value.js';\nexport function use(): Value {\n return new Value();\n}\n");
+    let provider = |body: &str| {
+        format!(
+            "export interface build {{ new(): unknown; }}\nexport function build() {{\n function helper(flag) {{ if (flag) return 1; return 2; }}\n function {body}() {{ return helper(true); }}\n Object.defineProperty({body}, 'name', {{ value: 'Value' }});\n return {body} as any;\n}}\n"
+        )
+    };
+    for step in 0..7 {
+        match step {
+            0 => f.write("factory.ts", &provider("First")),
+            1 => f.write("factory.ts", &provider("Replacement")),
+            2 => fs::remove_file(f.root().join("factory.ts")).unwrap(),
+            3 | 6 => f.write("factory.ts", &provider("Restored")),
+            4 => f.write("factory.ts", "export interface build {} export function build(flag) { function Left() {} function Right() {} if (flag) return Left; return Right; }"),
+            5 => {
+                f.write("factory.ts", &provider("Restored"));
+                f.write("competitor.ts", &provider("Competing"));
+                f.write("barrel.ts", "export * from './factory.js'; export * from './competitor.js';");
+            }
+            _ => unreachable!(),
+        }
+        if step == 6 {
+            fs::remove_file(f.root().join("competitor.ts")).unwrap();
+            f.write("barrel.ts", "export * from './factory.js';");
+        }
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "calls")
+            .collect();
+        let expected = match step {
+            0 => Some("First"),
+            1 => Some("Replacement"),
+            3 | 6 => Some("Restored"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(runtime.len(), 1, "step {step}");
+            assert_eq!(runtime[0].target, node(&graph, "factory.ts", expected).id);
+            assert_eq!(runtime[0].line, Some(3));
+            assert_eq!(runtime[0].file.as_deref(), Some("main.ts"));
+            assert!(!f.unresolved(caller, "Value"));
+        } else {
+            assert!(runtime.is_empty(), "step {step}");
+            assert!(f.unresolved(caller, "Value"), "step {step}");
+        }
+        let value = graph
+            .nodes
+            .iter()
+            .find(|n| n.file == "value.ts" && n.kind == "constant")
+            .unwrap();
+        assert!(graph.edges.iter().any(|e| e.source == caller.id
+            && e.relation == "declared_callee"
+            && e.target == value.id));
+        assert!(!graph.edges.iter().any(|e| {
+            e.source == caller.id
+                && e.relation == "calls"
+                && graph.nodes.iter().any(|n| {
+                    n.id == e.target && matches!(n.kind.as_str(), "constant" | "interface")
+                })
+        }));
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_factory_return_calls_require_executable_unique_immutable_proof() {
+    let f = Fixture::new();
+    f.write(
+        "factory.ts",
+        "export interface build {} export function build() { function Body() {} return Body; }",
+    );
+    for (setup, result) in [
+        (
+            "import type { build } from './factory';",
+            "const Value = build();",
+        ),
+        (
+            "import type * as core from './factory';",
+            "const Value = core.build();",
+        ),
+        (
+            "interface build { new(): unknown; } declare const unknown: build;",
+            "const Value = unknown();",
+        ),
+        (
+            "import * as core from './factory'; core.build = other;",
+            "const Value = core.build();",
+        ),
+        ("import { build } from './factory';", "let Value = build();"),
+        (
+            "import { build } from './factory';",
+            "const Value = build(); Value = other;",
+        ),
+        (
+            "import { build } from './factory';",
+            "const Value = build?.();",
+        ),
+        (
+            "import { build } from './factory';",
+            "const Value = build()();",
+        ),
+        (
+            "import * as core from './factory';",
+            "const Value = core[key]();",
+        ),
+        (
+            "import * as core from './factory';",
+            "const Value = core?.build();",
+        ),
+    ] {
+        f.write(
+            "main.ts",
+            &format!("{setup}\n{result}\nexport function use() {{ new Value(); }}"),
+        );
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{setup} {result}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+    // A parameter hides the imported factory; a value parameter hides the const.
+    for source in [
+        "import { build } from './factory'; export function use(build) { const Value = build(); return new Value(); }",
+        "import { build } from './factory'; const Value = build(); export function use(Value) { return new Value(); }",
+    ] {
+        f.write("main.ts", source);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{source}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+    f.write("main.ts", "import { build } from './factory'; const Value = build(); export function use() { return new Value(); }");
+    for provider in [
+        "export interface build { new(): unknown; }",
+        "export async function build() { function Body() {} return Body; }",
+        "export function* build() { function Body() {} return Body; }",
+        "export function build() { return () => {}; }",
+        "export function build() { function Body() {} Body = other; return Body; }",
+        "export function build() { function Body() {} function change() { Body = other; } return Body; }",
+        "export function build(Body) { return Body; }",
+        "export function build() { function Body() {} if (flag) return Body; return Body; }",
+        "export function build() { function Body() {} return Body; } build = other;",
+    ] {
+        f.write("factory.ts", provider);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{provider}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+}
+
+#[test]
+fn javascript_imported_factory_proof_refreshes_without_promoting_the_interface() {
+    let f = Fixture::new();
+    f.write("main.ts", "import {Shape as Value, ordinary, Plain} from './provider';\nexport function use(value: Value): Value {\n Value();\n new Value();\n Value?.();\n Value[key]();\n ordinary(); new Plain(); return value;\n}\n");
+    for (declaration, eligible) in [
+        ("export const Shape = factory();", true),
+        ("", false),
+        ("export const Shape = external;", false),
+        ("export const Shape = factory(); Shape = external;", false),
+        (
+            "export const Shape = factory(); const Shape = factory();",
+            false,
+        ),
+        ("export const Shape = factory();", true),
+    ] {
+        f.write("provider.ts", &format!("export interface Shape {{}}\n{declaration}\nexport function ordinary() {{}}\nexport class Plain {{}}\n"));
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let interface = graph
+            .nodes
+            .iter()
+            .find(|n| n.file == "provider.ts" && n.label == "Shape" && n.kind == "interface")
+            .unwrap();
+        assert!(graph.edges.iter().any(|e| e.source == caller.id
+            && e.relation == "return_type"
+            && e.target == interface.id));
+        assert!(calls(
+            &graph,
+            ("main.ts", "use"),
+            ("provider.ts", "ordinary")
+        ));
+        assert!(calls(&graph, ("main.ts", "use"), ("provider.ts", "Plain")));
+        let original: Vec<_> = graph.metadata["graf_unresolved_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["source"] == caller.id && r["relation"] == "calls" && r["label"] == "Value"
+            })
+            .collect();
+        assert_eq!(original.len(), 3);
+        assert!(
+            original
+                .iter()
+                .all(|r| r["candidate_keys"] == serde_json::json!([]))
+        );
+        let siblings: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "declared_callee")
+            .collect();
+        assert_eq!(siblings.len(), if eligible { 3 } else { 0 });
+        // Optional invocation still identifies the written imported binding;
+        // declaration navigation does not assert that the value is callable.
+        assert!(original.iter().any(|r| r["line"] == 5));
+        assert_eq!(siblings.iter().any(|e| e.line == Some(5)), eligible);
+        assert!(
+            graph.metadata["graf_unresolved_references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["source"] == caller.id
+                    && r["relation"] == "calls"
+                    && r["label"] == "Value[key]"
+                    && r["candidate_keys"] == serde_json::json!([]))
+        );
+        assert!(!graph.edges.iter().any(|e| {
+            e.source == caller.id
+                && e.relation == "calls"
+                && graph
+                    .nodes
+                    .iter()
+                    .any(|n| n.id == e.target && (n.kind == "interface" || n.kind == "constant"))
+        }));
+        for sibling in siblings {
+            let value = graph.nodes.iter().find(|n| n.id == sibling.target).unwrap();
+            assert_eq!(
+                (
+                    value.file.as_str(),
+                    value.label.as_str(),
+                    value.kind.as_str()
+                ),
+                ("provider.ts", "Shape", "constant")
+            );
+            assert_eq!(value.metadata["declared_callee_binding"], true);
+            let call = original
+                .iter()
+                .find(|r| {
+                    sibling.metadata["reference_id"]
+                        == format!("{}:declared_callee", r["id"].as_str().unwrap())
+                })
+                .unwrap();
+            assert_eq!(sibling.file.as_deref(), Some("main.ts"));
+            assert_eq!(sibling.line.map(u64::from), call["line"].as_u64());
+            assert!(matches!(sibling.line, Some(3..=5)));
+        }
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_provider_scratch_pruning_preserves_local_facts_and_competing_origins() {
+    let f = Fixture::new();
+    f.write(
+        "barrel.ts",
+        "export * from './provider'; export * from './competitor';\n",
+    );
+    f.write("main.ts", "import {Shape, ordinary} from './barrel'; export function use(value: Shape): Shape { Shape(); ordinary(); return value; }\n");
+    let mut previous = None;
+    for (private_count, competitor, eligible) in [
+        (0, "export {};\n", true),
+        (24, "export {};\n", true),
+        (0, "export {};\n", true),
+        (24, "export function Shape() {}\n", false),
+        (24, "export {};\n", true),
+        (24, "export const Shape = otherFactory();\n", false),
+        (24, "export {};\n", true),
+    ] {
+        let mut provider = String::from(
+            "export interface Shape {}\nexport const Shape = factory();\nexport function ordinary() {}\nfunction privateScope() {\n/** Scoped helper. */\nfunction local() {}\nlocal();\n",
+        );
+        for i in 0..private_count {
+            provider.push_str(&format!("function helper_{i}() {{}} helper_{i}();\n"));
+        }
+        provider.push_str("}\n");
+        f.write("provider.ts", &provider);
+        f.write("competitor.ts", competitor);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let declarations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == caller.id && edge.relation == "declared_callee")
+            .collect();
+        assert_eq!(declarations.len(), usize::from(eligible));
+        if eligible {
+            let target = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == declarations[0].target)
+                .unwrap();
+            assert_eq!(
+                (
+                    target.file.as_str(),
+                    target.label.as_str(),
+                    target.kind.as_str()
+                ),
+                ("provider.ts", "Shape", "constant")
+            );
+            assert_eq!(target.metadata["declared_callee_binding"], true);
+            let interface = graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.file == "provider.ts" && node.label == "Shape" && node.kind == "interface"
+                })
+                .unwrap();
+            assert!(graph.edges.iter().any(|edge| edge.source == caller.id
+                && edge.relation == "return_type"
+                && edge.target == interface.id));
+        }
+        assert!(f.unresolved(caller, "Shape"));
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == caller.id && edge.relation == "calls")
+            .collect();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(
+            runtime[0].target,
+            node(&graph, "provider.ts", "ordinary").id
+        );
+
+        // These local definitions never publish own-file provider keys, but
+        // must remain indexed and callable in their original lexical scope.
+        assert!(calls(
+            &graph,
+            ("provider.ts", "privateScope"),
+            ("provider.ts", "local")
+        ));
+        let local = node(&graph, "provider.ts", "local");
+        assert!(
+            !local
+                .binding_key
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    local.metadata["binding_aliases"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|key| key.as_str())
+                )
+                .any(|key| key.starts_with("javascript:file:provider.ts:")
+                    || key.starts_with("javascript:cjs-file:provider.ts:"))
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.file == "provider.ts"
+                    && node.label.starts_with("helper_")
+                    && node.kind == "function")
+                .count(),
+            private_count
+        );
+        for i in 0..private_count {
+            assert!(calls(
+                &graph,
+                ("provider.ts", "privateScope"),
+                ("provider.ts", &format!("helper_{i}"))
+            ));
+        }
+
+        let stamp = Store::open_read_only(&f.db())
+            .unwrap()
+            .file_stamps()
+            .unwrap()
+            .into_iter()
+            .find(|stamp| stamp.path == "main.ts")
+            .unwrap()
+            .hash;
+        if let Some((previous_eligible, previous_stamp)) = previous {
+            assert_eq!(previous_stamp == stamp, previous_eligible == eligible);
+        }
+        previous = Some((eligible, stamp));
+        // This existing comparison includes all persisted references/keys and
+        // aliases as well as the graph; it is independent of source language.
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+}
+
+#[test]
+fn javascript_imported_factory_stars_preserve_ambiguity_and_direct_value_precedence() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "export interface Shape {} export const Shape = firstFactory();",
+    );
+    f.write("b.ts", "export const Shape = secondFactory();");
+    f.write("ordinary.ts", "export function Shape() {}");
+    f.write("left.ts", "export * from './a'; export * from './right';");
+    f.write("right.ts", "export * from './a'; export * from './left';");
+    f.write(
+        "main.ts",
+        "import {Shape} from './barrel'; export function use() { Shape(); }",
+    );
+    for (source, target) in [
+        (
+            "export * from './left'; export * from './right';",
+            Some(("a.ts", "declared_callee")),
+        ),
+        ("export * from './a'; export * from './b';", None),
+        ("export * from './a'; export * from './ordinary';", None),
+        (
+            "export * from './a'; export function Shape() {}",
+            Some(("barrel.ts", "calls")),
+        ),
+        (
+            "export interface Shape {} export * from './a';",
+            Some(("a.ts", "declared_callee")),
+        ),
+        ("export * from './a';", Some(("a.ts", "declared_callee"))),
+    ] {
+        f.write("barrel.ts", source);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.source == caller.id && matches!(e.relation.as_str(), "calls" | "declared_callee")
+            })
+            .collect();
+        assert_eq!(edges.len(), usize::from(target.is_some()), "{source}");
+        if let Some((file, relation)) = target {
+            let edge = edges[0];
+            assert_eq!(edge.relation, relation);
+            let target = graph.nodes.iter().find(|n| n.id == edge.target).unwrap();
+            assert_eq!(target.file, file);
+            assert_eq!(
+                target.kind,
+                if relation == "calls" {
+                    "function"
+                } else {
+                    "constant"
+                }
+            );
+        }
+        assert_eq!(
+            f.unresolved(caller, "Shape"),
+            target.is_none_or(|(_, relation)| relation != "calls")
+        );
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_imported_factory_follows_only_published_named_default_routes() {
+    let f = Fixture::new();
+    f.write(
+        "provider.ts",
+        "export interface Shape {} export const Shape = factory(); export function ordinary() {}",
+    );
+    f.write(
+        "named.ts",
+        "export {Shape as Renamed, ordinary} from './provider';",
+    );
+    f.write("default.ts", "export {Renamed as default} from './named';");
+    f.write("main.ts", "import Value from './default'; import {Renamed, ordinary} from './named'; function use() { Value(); Renamed(); ordinary(); }");
+    for route in [
+        "export {Renamed as default} from './named';",
+        "export {Missing as default} from './named';",
+        "export {default} from './default';",
+        "export {Renamed as default} from './named';",
+    ] {
+        f.write("default.ts", route);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let declarations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "declared_callee")
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            if route.contains("Renamed") { 2 } else { 1 }
+        );
+        for declaration in declarations {
+            let target = graph
+                .nodes
+                .iter()
+                .find(|n| n.id == declaration.target)
+                .unwrap();
+            assert_eq!(target.file, "provider.ts");
+            assert_eq!(target.kind, "constant");
+            assert_eq!(target.label, "Shape");
+        }
+        assert!(f.unresolved(caller, "Value"));
+        assert!(f.unresolved(caller, "Renamed"));
+        // Ordinary forwarding retains its existing alias target.
+        assert!(calls(&graph, ("main.ts", "use"), ("named.ts", "ordinary")));
+        assert!(!graph.edges.iter().any(|e| {
+            e.source == caller.id
+                && e.relation == "calls"
+                && graph
+                    .nodes
+                    .iter()
+                    .any(|n| n.id == e.target && n.kind == "interface")
+        }));
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_config_changes_match_fresh_and_preserve_unrelated_outcomes() {
+    let f = Fixture::new();
+    f.write("tsconfig.json", r#"{"extends":"./base.json"}"#);
+    f.write("one.ts", "export function work() {}");
+    f.write("two.ts", "export function work() {}");
+    f.write(
+        "typed.ts",
+        "import {work} from 'target'; function use() { work(); }",
+    );
+    f.write("lib.cjs", "exports.work = function work() {};");
+    f.write(
+        "mode.js",
+        "const lib = require('./lib.cjs'); function use() { lib.work(); }",
+    );
+    f.write(
+        "fixed.cjs",
+        "const lib = require('./lib.cjs'); function use() { lib.work(); }",
+    );
+    f.write("unrelated.ts", "export function unrelated() {}");
+    let mut unrelated_stamp = None;
+    for (target, esm) in [
+        (Some("one.ts"), false),
+        (Some("two.ts"), true),
+        (None, false),
+        (Some("one.ts"), false),
+    ] {
+        if let Some(target) = target {
+            f.write(
+                "base.json",
+                &serde_json::json!({"compilerOptions":{"baseUrl":".","paths":{"target":[target]}}})
+                    .to_string(),
+            );
+        } else {
+            fs::remove_file(f.root().join("base.json")).unwrap();
+        }
+        f.write(
+            "package.json",
+            if esm { r#"{"type":"module"}"# } else { "{}" },
+        );
+        let graph = f.index();
+        if let Some(target) = target {
+            assert!(calls(&graph, ("typed.ts", "use"), (target, "work")));
+        } else {
+            assert!(f.unresolved(node(&graph, "typed.ts", "use"), "work"));
+        }
+        assert_eq!(calls(&graph, ("mode.js", "use"), ("lib.cjs", "work")), !esm);
+        assert!(calls(&graph, ("fixed.cjs", "use"), ("lib.cjs", "work")));
+        let stamp = Store::open(&f.db())
+            .unwrap()
+            .file_stamps()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.path == "unrelated.ts")
+            .unwrap()
+            .hash;
+        if let Some(previous) = &unrelated_stamp {
+            assert_eq!(&stamp, previous);
+        }
+        unrelated_stamp = Some(stamp);
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
 #[test]
 fn go_uses_declared_package_names_excludes_external_tests_and_rebinds_modules() {
     let f = Fixture::new();
@@ -1177,20 +1974,653 @@ fn rust_split_impls_and_public_use_forwarding_refresh_on_source_change() {
         ("app/src/lib.rs", "run"),
         ("core/src/orphan.rs", "ghost")
     ));
+    let before = rust_file_stamps(&f);
     f.write("core/src/lib.rs", "mod state; mod apply; mod save; pub use crate::state::State as Renamed; pub use crate::apply::start;");
-    assert!(
-        index::check_update(&f.root(), &f.db())
-            .unwrap()
-            .changed
-            .iter()
-            .any(|p| p == "app/src/lib.rs")
-    );
+    let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+    assert!(changed.iter().any(|p| p == "core/src/apply.rs"));
+    assert!(!changed.iter().any(|p| p == "app/src/lib.rs"));
     let graph = f.index();
+    assert_eq!(
+        before["app/src/lib.rs"],
+        rust_file_stamps(&f)["app/src/lib.rs"]
+    );
     assert!(f.unresolved(node(&graph, "app/src/lib.rs", "run"), "Engine::apply"));
     assert!(calls(
         &graph,
         ("core/src/apply.rs", "apply"),
         ("core/src/save.rs", "save")
+    ));
+}
+
+#[test]
+fn rust_cached_reexports_resolve_local_calls_to_terminal_definitions() {
+    let f = Fixture::new();
+    f.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let check = |graph: &GraphSnapshot, expected: Option<&str>| {
+        let caller = node(graph, "src/lib.rs", "caller");
+        let outgoing: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == "calls" && edge.source == caller.id)
+            .collect();
+        assert_eq!(outgoing.len(), usize::from(expected.is_some()));
+        assert_eq!(f.unresolved(caller, "crate::exposed"), expected.is_none());
+        if let Some(target) = expected {
+            assert!(calls(
+                graph,
+                ("src/lib.rs", "caller"),
+                ("src/lib.rs", target)
+            ));
+            assert_eq!(node(graph, "src/lib.rs", target).kind, "function");
+        }
+        for reexport in graph.nodes.iter().filter(|node| node.kind == "reexport") {
+            assert!(reexport.binding_key.is_none());
+            assert!(reexport.metadata.get("binding_aliases").is_none());
+        }
+    };
+    // Change the terminal target, remove the alias, remove its definition, restore.
+    for (source, expected) in [
+        (
+            "mod inner { pub fn work() {} } pub use crate::inner::work as exposed;",
+            Some("work"),
+        ),
+        (
+            "mod inner { pub fn other() {} } pub use crate::inner::other as exposed;",
+            Some("other"),
+        ),
+        ("mod inner { pub fn work() {} }", None),
+        ("mod inner {} pub use crate::inner::work as exposed;", None),
+        (
+            "mod inner { pub fn work() {} } pub use crate::inner::work as exposed;",
+            Some("work"),
+        ),
+    ] {
+        f.write(
+            "src/lib.rs",
+            &format!("{source}\npub fn caller() {{ crate::exposed(); }}\n"),
+        );
+        let graph = f.index();
+        check(&graph, expected);
+        let noop = f.index();
+        check(&noop, expected);
+        assert_eq!(noop.generation, graph.generation);
+        check(
+            &f.index_with(&IndexOptions {
+                code_only: true,
+                force: true,
+                ..Default::default()
+            }),
+            expected,
+        );
+        assert!(index::check_update(&f.root(), &f.db()).unwrap().fresh);
+    }
+}
+
+#[test]
+fn rust_reexport_package_aliases_follow_enclosing_module_visibility() {
+    // Exercise both visibility states on a cold index, then change them without
+    // touching the binary consumer. Repeat each outcome on no-op and forced runs.
+    for initially_public in [false, true] {
+        let f = Fixture::new();
+        f.write(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        f.write("src/main.rs", "fn main() { demo::hidden::exposed(); }\n");
+        let check = |graph: &GraphSnapshot, resolved: bool| {
+            let caller = node(graph, "src/main.rs", "main");
+            let outgoing: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == "calls" && edge.source == caller.id)
+                .collect();
+            assert_eq!(outgoing.len(), usize::from(resolved));
+            assert_eq!(f.unresolved(caller, "demo::hidden::exposed"), !resolved);
+            if resolved {
+                assert!(calls(
+                    graph,
+                    ("src/main.rs", "main"),
+                    ("src/lib.rs", "work")
+                ));
+                assert_eq!(node(graph, "src/lib.rs", "work").kind, "function");
+            }
+        };
+        let exported = "pub fn work() {} pub use self::work as exposed;";
+        for (public, body, resolved) in [
+            (initially_public, exported, initially_public),
+            (!initially_public, exported, !initially_public),
+            (initially_public, exported, initially_public),
+            (true, "pub fn work() {}", false),
+            (true, "pub use self::work as exposed;", false),
+            (true, exported, true),
+            (false, exported, false),
+        ] {
+            let visibility = if public { "pub " } else { "" };
+            f.write(
+                "src/lib.rs",
+                &format!("{visibility}mod hidden {{ {body} }}\n"),
+            );
+            let graph = f.index();
+            check(&graph, resolved);
+            let noop = f.index();
+            check(&noop, resolved);
+            assert_eq!(noop.generation, graph.generation);
+            check(
+                &f.index_with(&IndexOptions {
+                    code_only: true,
+                    force: true,
+                    ..Default::default()
+                }),
+                resolved,
+            );
+            assert!(index::check_update(&f.root(), &f.db()).unwrap().fresh);
+        }
+    }
+}
+
+#[test]
+fn rust_standalone_add_delete_rebinds_without_reparsing_the_family() {
+    let f = Fixture::new();
+    f.write("a.rs", "fn a() {}\n");
+    f.write("caller.rs", "fn caller() { a(); }\n");
+    let first = index::run_with_options(
+        &f.root(),
+        &f.db(),
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(first.parsed_files, 2);
+
+    f.write("added.rs", "fn added() {}\n");
+    let added = index::run_with_options(
+        &f.root(),
+        &f.db(),
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((added.parsed_files, added.unchanged_files), (1, 2));
+
+    fs::remove_file(f.root().join("added.rs")).unwrap();
+    let deleted = index::run_with_options(
+        &f.root(),
+        &f.db(),
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((deleted.parsed_files, deleted.unchanged_files), (0, 2));
+    assert_eq!(deleted.deleted_files, 1);
+}
+
+fn rust_file_stamps(f: &Fixture) -> BTreeMap<String, String> {
+    Store::open_read_only(&f.db())
+        .unwrap()
+        .file_stamps()
+        .unwrap()
+        .into_iter()
+        .map(|stamp| (stamp.path, stamp.hash))
+        .collect()
+}
+
+fn rust_stored_outcome(db: &std::path::Path) -> serde_json::Value {
+    let mut graph = Store::open_read_only(db).unwrap().snapshot().unwrap();
+    graph.generation = 0;
+    graph.root = None;
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let connection = connection.unchecked_transaction().unwrap();
+    // Include every persisted reference, its resolution and ordered keys, not
+    // just the unresolved references exposed in a graph snapshot. Compare
+    // public identities rather than incidental integer allocation order.
+    let physical_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let relationship_queries = match physical_version {
+        1 => [
+            "SELECT json_array(id,source,owner_file,relation,payload,resolved_target,resolution_reason) FROM refs ORDER BY id",
+            "SELECT json_array(ref_id,priority,binding_key) FROM ref_keys ORDER BY ref_id,priority",
+            "SELECT json_array(node_id,binding_key) FROM node_aliases ORDER BY node_id,binding_key",
+        ],
+        2 | 3 => [
+            "SELECT json_array(r.id,s.id,f.path,r.relation,r.payload,t.id,r.resolution_reason) FROM refs r JOIN nodes s ON s.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
+            "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
+            "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
+        ],
+        other => panic!("unexpected physical format {other}"),
+    };
+    assert!(
+        connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+    if matches!(physical_version, 2 | 3) {
+        let dangling: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key WHERE r.resolved_target_key IS NOT NULL AND n.nkey IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "resolved references must retain their targets");
+    }
+    let mut records = vec![];
+    for query in
+        std::iter::once("SELECT json_array(path,hash,module,diagnostics) FROM files ORDER BY path")
+            .chain(relationship_queries)
+    {
+        records.push(
+            connection
+                .prepare(query)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+        );
+    }
+    for (rows, table) in records
+        .iter()
+        .zip(["files", "refs", "ref_keys", "node_aliases"])
+    {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            i64::try_from(rows.len()).unwrap(),
+            count,
+            "every {table} row must remain visible"
+        );
+    }
+    serde_json::json!({"graph": graph, "records": records})
+}
+
+fn rust_assert_fresh_forced_equivalent(f: &Fixture) {
+    let expected = rust_stored_outcome(&f.db());
+    f.index_with(&IndexOptions {
+        code_only: true,
+        force: true,
+        ..Default::default()
+    });
+    assert_eq!(expected, rust_stored_outcome(&f.db()), "forced output");
+    let fresh = tempdir().unwrap();
+    let db = fresh.path().join("fresh.db");
+    index::run_with_options(
+        &f.root(),
+        &db,
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(expected, rust_stored_outcome(&db), "fresh output");
+    assert!(index::check_update(&f.root(), &f.db()).unwrap().fresh);
+    let generation = Store::open_read_only(&f.db())
+        .unwrap()
+        .stats()
+        .unwrap()
+        .generation;
+    assert_eq!(f.index().generation, generation, "no-op generation");
+}
+
+fn rust_incremental_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.write(
+        "Cargo.toml",
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    f.write(
+        "src/lib.rs",
+        "pub mod builder; pub use crate::builder::Command; mod caller; mod sibling;\n",
+    );
+    f.write(
+        "src/builder/mod.rs",
+        "mod command; pub use command::Command;\n",
+    );
+    f.write(
+        "src/builder/command.rs",
+        "pub struct Command; impl Command { pub fn new() -> Self { Self } }\n",
+    );
+    f.write(
+        "src/caller.rs",
+        "use crate::Command; pub fn caller() { Command::new(); }\n",
+    );
+    f.write("src/sibling.rs", "pub fn unrelated() {}\n");
+    let graph = f.index();
+    assert!(calls(
+        &graph,
+        ("src/caller.rs", "caller"),
+        ("src/builder/command.rs", "new")
+    ));
+    f
+}
+
+#[test]
+fn rust_provider_body_and_comment_edits_keep_unchanged_outcomes() {
+    let f = rust_incremental_fixture();
+    for provider in [
+        "pub struct Command; impl Command { pub fn new() -> Self { let _value = 1; Self } }\n",
+        "// Move the terminal method without changing its exported path.\npub struct Command; impl Command { pub fn new() -> Self { let _value = 1; Self } }\n",
+    ] {
+        let before = rust_file_stamps(&f);
+        let old = Store::open_read_only(&f.db()).unwrap().snapshot().unwrap();
+        let old_target = node(&old, "src/builder/command.rs", "new").id.clone();
+        f.write("src/builder/command.rs", provider);
+        assert_eq!(
+            index::check_update(&f.root(), &f.db()).unwrap().changed,
+            ["src/builder/command.rs"]
+        );
+        let report = index::run_with_options(
+            &f.root(),
+            &f.db(),
+            &IndexOptions {
+                code_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((report.parsed_files, report.unchanged_files), (1, 5));
+        let after = rust_file_stamps(&f);
+        for (path, stamp) in before {
+            assert_eq!(
+                stamp == after[&path],
+                path != "src/builder/command.rs",
+                "{path}"
+            );
+        }
+        let graph = Store::open_read_only(&f.db()).unwrap().snapshot().unwrap();
+        assert!(calls(
+            &graph,
+            ("src/caller.rs", "caller"),
+            ("src/builder/command.rs", "new")
+        ));
+        assert!(!f.unresolved(node(&graph, "src/caller.rs", "caller"), "Command::new"));
+        let target = node(&graph, "src/builder/command.rs", "new");
+        if provider.starts_with("//") {
+            assert_ne!(old_target, target.id);
+            assert!(!graph.edges.iter().any(|edge| edge.target == old_target));
+        }
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+}
+
+#[test]
+fn rust_unrelated_file_and_module_add_delete_keep_existing_outcomes() {
+    let f = rust_incremental_fixture();
+    let baseline = rust_file_stamps(&f);
+    let root = "pub mod builder; pub use crate::builder::Command; mod caller; mod sibling;\n";
+    for declared in [false, true] {
+        f.write("src/unrelated.rs", "pub fn elsewhere() {}\n");
+        if declared {
+            f.write("src/lib.rs", &format!("{root}pub mod unrelated;\n"));
+        }
+        let added = index::run_with_options(
+            &f.root(),
+            &f.db(),
+            &IndexOptions {
+                code_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (added.parsed_files, added.unchanged_files),
+            if declared { (2, 5) } else { (1, 6) }
+        );
+        let stamps = rust_file_stamps(&f);
+        for (path, stamp) in &baseline {
+            assert_eq!(
+                stamp == &stamps[path],
+                !declared || path != "src/lib.rs",
+                "{path}"
+            );
+        }
+        let graph = Store::open_read_only(&f.db()).unwrap().snapshot().unwrap();
+        assert!(calls(
+            &graph,
+            ("src/caller.rs", "caller"),
+            ("src/builder/command.rs", "new")
+        ));
+        rust_assert_fresh_forced_equivalent(&f);
+
+        fs::remove_file(f.root().join("src/unrelated.rs")).unwrap();
+        if declared {
+            f.write("src/lib.rs", root);
+        }
+        let deleted = index::run_with_options(
+            &f.root(),
+            &f.db(),
+            &IndexOptions {
+                code_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                deleted.parsed_files,
+                deleted.unchanged_files,
+                deleted.deleted_files
+            ),
+            if declared { (1, 5, 1) } else { (0, 6, 1) }
+        );
+        assert_eq!(baseline, rust_file_stamps(&f));
+        let graph = Store::open_read_only(&f.db()).unwrap().snapshot().unwrap();
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.file == "src/unrelated.rs")
+        );
+        assert!(calls(
+            &graph,
+            ("src/caller.rs", "caller"),
+            ("src/builder/command.rs", "new")
+        ));
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+}
+
+#[test]
+fn rust_outcomes_retract_aliases_generic_impls_and_cargo_origins() {
+    let f = rust_incremental_fixture();
+    let manifest = "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\ndemo={path='..'}\n";
+    f.write("app/Cargo.toml", manifest);
+    f.write("app/src/lib.rs", "pub fn root_call() { demo::Command::new(); } pub fn module_call() { demo::builder::Command::new(); }\n");
+    f.index();
+    let root = "pub mod builder; pub use crate::builder::Command; mod caller; mod sibling;\n";
+    for (source, root_visible, module_visible) in [
+        ("pub mod builder; mod caller; mod sibling;\n", false, true),
+        (root, true, true),
+        (
+            "mod builder; pub use crate::builder::Command; mod caller; mod sibling;\n",
+            true,
+            false,
+        ),
+        (root, true, true),
+    ] {
+        let before = rust_file_stamps(&f);
+        f.write("src/lib.rs", source);
+        let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+        assert!(changed.iter().any(|path| path == "src/builder/command.rs"));
+        assert!(!changed.iter().any(|path| path == "app/src/lib.rs"));
+        let graph = f.index();
+        let after = rust_file_stamps(&f);
+        assert_ne!(
+            before["src/builder/command.rs"],
+            after["src/builder/command.rs"]
+        );
+        assert_eq!(before["app/src/lib.rs"], after["app/src/lib.rs"]);
+        for (caller, visible) in [("root_call", root_visible), ("module_call", module_visible)] {
+            assert_eq!(
+                calls(
+                    &graph,
+                    ("app/src/lib.rs", caller),
+                    ("src/builder/command.rs", "new")
+                ),
+                visible
+            );
+            let source = node(&graph, "app/src/lib.rs", caller);
+            let calls: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.source == source.id && edge.relation == "calls")
+                .collect();
+            assert_eq!(calls.len(), usize::from(visible));
+            assert_eq!(
+                f.unresolved(
+                    source,
+                    if caller == "root_call" {
+                        "demo::Command::new"
+                    } else {
+                        "demo::builder::Command::new"
+                    }
+                ),
+                !visible
+            );
+        }
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+    for optional in [true, false] {
+        f.write(
+            "app/Cargo.toml",
+            &manifest.replace(
+                "path='..'",
+                if optional {
+                    "path='..',optional=true"
+                } else {
+                    "path='..'"
+                },
+            ),
+        );
+        assert!(
+            index::check_update(&f.root(), &f.db())
+                .unwrap()
+                .changed
+                .iter()
+                .any(|path| path == "app/src/lib.rs")
+        );
+        let graph = f.index();
+        for caller in ["root_call", "module_call"] {
+            assert_eq!(
+                calls(
+                    &graph,
+                    ("app/src/lib.rs", caller),
+                    ("src/builder/command.rs", "new")
+                ),
+                !optional
+            );
+        }
+        rust_assert_fresh_forced_equivalent(&f);
+    }
+
+    let g = Fixture::new();
+    g.write("Cargo.toml", "[package]\nname='generic'\nversion='0.1.0'\n");
+    g.write("src/lib.rs", "pub mod model; mod provider; mod caller;\n");
+    let model = "pub struct Register<A, B>(pub A, pub B);\n";
+    g.write("src/model.rs", model);
+    g.write(
+        "src/provider.rs",
+        "use crate::model::Register; impl<X, Y> Register<X, Y> { pub fn empty() {} }\n",
+    );
+    g.write(
+        "src/caller.rs",
+        "use crate::model::Register; pub fn caller() { Register::empty(); }\n",
+    );
+    assert!(calls(
+        &g.index(),
+        ("src/caller.rs", "caller"),
+        ("src/provider.rs", "empty")
+    ));
+    for (source, supported) in [("pub struct Register<A>(pub A);\n", false), (model, true)] {
+        let before = rust_file_stamps(&g);
+        g.write("src/model.rs", source);
+        assert!(
+            index::check_update(&g.root(), &g.db())
+                .unwrap()
+                .changed
+                .iter()
+                .any(|path| path == "src/provider.rs")
+        );
+        let graph = g.index();
+        let after = rust_file_stamps(&g);
+        assert_ne!(before["src/provider.rs"], after["src/provider.rs"]);
+        assert_eq!(before["src/caller.rs"], after["src/caller.rs"]);
+        assert_eq!(
+            node(&graph, "src/provider.rs", "empty")
+                .binding_key
+                .is_some(),
+            supported
+        );
+        assert_eq!(
+            calls(
+                &graph,
+                ("src/caller.rs", "caller"),
+                ("src/provider.rs", "empty")
+            ),
+            supported
+        );
+        assert_eq!(
+            g.unresolved(node(&graph, "src/caller.rs", "caller"), "Register::empty"),
+            !supported
+        );
+        rust_assert_fresh_forced_equivalent(&g);
+    }
+}
+
+#[test]
+fn rust_declared_module_file_addition_still_refreshes_context_dependents() {
+    let f = Fixture::new();
+    f.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    );
+    f.write("src/lib.rs", "mod caller;\nmod target;\n");
+    f.write("src/caller.rs", "fn caller() { crate::target::work(); }\n");
+    let initial = f.index();
+    assert!(f.unresolved(
+        node(&initial, "src/caller.rs", "caller"),
+        "crate::target::work"
+    ));
+
+    // Root visibility changes and a missing declared module acquires a source.
+    // The caller's previously rejected candidate must now be restored.
+    f.write("src/lib.rs", "mod caller;\npub mod target;\n");
+    f.write("src/target.rs", "pub fn work() {}\n");
+    let report = index::run_with_options(
+        &f.root(),
+        &f.db(),
+        &IndexOptions {
+            code_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.parsed_files, 3);
+    let graph = Store::open(&f.db()).unwrap().snapshot().unwrap();
+    assert!(calls(
+        &graph,
+        ("src/caller.rs", "caller"),
+        ("src/target.rs", "work")
     ));
 }
 
@@ -1397,7 +2827,7 @@ export function untyped(x) { x.run(); }
         "export class Service { renamed() {} static create() {} private hidden() {} }",
     );
     assert!(
-        index::check_update(&f.root(), &f.db())
+        !index::check_update(&f.root(), &f.db())
             .unwrap()
             .changed
             .iter()
@@ -1406,6 +2836,7 @@ export function untyped(x) { x.run(); }
     let graph = f.index();
     assert!(f.unresolved(node(&graph, "main.ts", "typed"), "x.run"));
     assert!(calls(&graph, ("main.ts", "native"), ("service.mjs", "run")));
+    javascript_assert_fresh_equivalent(&f, &graph);
 }
 
 #[test]
@@ -2273,15 +3704,11 @@ fn rust_alpha_renamed_generic_impls_follow_exact_declared_cargo_modules() {
         );
     };
     check(&f.index(), true);
-    // Removing module membership retracts links without changing either impl.
+    // Removing module membership retracts links without replacing the caller.
     f.write("src/lib.rs", "pub mod model; mod consumer; mod unrelated;");
-    assert!(
-        index::check_update(&f.root(), &f.db())
-            .unwrap()
-            .changed
-            .iter()
-            .any(|p| p == "src/consumer.rs")
-    );
+    let changed = index::check_update(&f.root(), &f.db()).unwrap().changed;
+    assert!(changed.iter().any(|p| p == "src/provider.rs"));
+    assert!(!changed.iter().any(|p| p == "src/consumer.rs"));
     check(&f.index(), false);
     f.write("src/lib.rs", root);
     check(&f.index(), true);
