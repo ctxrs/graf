@@ -36,7 +36,7 @@ fn assert_impact(
     consumer: &Node,
     unrelated: &Node,
     relation: &str,
-    call_label: &str,
+    call: (&str, Option<&Node>),
     linked: bool,
 ) {
     let snapshot = store.snapshot().unwrap();
@@ -47,7 +47,7 @@ fn assert_impact(
         .collect();
     assert_eq!(recorded.len(), usize::from(linked));
 
-    // The runtime call stays unresolved even when its written declaration is known.
+    // Declaration navigation and proof of the runtime body are independent.
     let runtime = store
         .neighbors(
             &consumer.id,
@@ -58,12 +58,28 @@ fn assert_impact(
             },
         )
         .unwrap();
-    assert!(runtime.edges.is_empty());
-    assert_eq!(runtime.unresolved.len(), 1);
-    let call = &runtime.unresolved[0];
-    assert_eq!(call.source, consumer.id);
-    assert_eq!(call.label, call_label);
-    assert_eq!(call.relation, "calls");
+    let (call_label, runtime_body) = call;
+    let (call_file, call_line) = if let Some(body) = runtime_body {
+        assert!(runtime.unresolved.is_empty());
+        assert_eq!(runtime.edges.len(), 1);
+        let call = &runtime.edges[0];
+        assert_eq!(call.source, consumer.id);
+        assert_eq!(call.target, body.id);
+        assert_ne!(call.target, target.id);
+        assert_eq!(call.relation, "calls");
+        assert_eq!(call.file.as_deref(), Some(consumer.file.as_str()));
+        assert_eq!(call.line, consumer.line);
+        assert!(call.directed);
+        (call.file.as_deref().unwrap(), call.line.unwrap())
+    } else {
+        assert!(runtime.edges.is_empty());
+        assert_eq!(runtime.unresolved.len(), 1);
+        let call = &runtime.unresolved[0];
+        assert_eq!(call.source, consumer.id);
+        assert_eq!(call.label, call_label);
+        assert_eq!(call.relation, "calls");
+        (call.file.as_str(), call.line)
+    };
 
     let impact = store
         .impact_extended(&target.id, &ImpactOptions::default())
@@ -89,14 +105,23 @@ fn assert_impact(
     if linked {
         let evidence = recorded[0];
         assert!(evidence.directed);
-        assert_eq!(evidence.file.as_deref(), Some(call.file.as_str()));
-        assert_eq!(evidence.line, Some(call.line));
+        assert_eq!(evidence.file.as_deref(), Some(call_file));
+        assert_eq!(evidence.line, Some(call_line));
         assert!(
             evidence.metadata["reference_id"]
                 .as_str()
                 .unwrap()
                 .ends_with(&format!(":{relation}"))
         );
+        if runtime_body.is_some() {
+            assert_eq!(
+                evidence.metadata["reference_id"],
+                format!(
+                    "{}:{relation}",
+                    runtime.edges[0].metadata["reference_id"].as_str().unwrap()
+                )
+            );
+        }
         // Impact preserves the stored relation, orientation, confidence, and provenance.
         assert_eq!(
             serde_json::to_value(&impact.graph.edges[0]).unwrap(),
@@ -134,10 +159,22 @@ fn impact_tracks_factory_const_evidence_and_loses_a_shadowed_consumer() {
         (source.to_owned(), true),
         (source.replace("consume()", "consume(Product)"), false),
     ] {
-        fs::write(&path, source).unwrap();
+        fs::write(&path, &source).unwrap();
         let store = indexed(dir.path());
         let graph = store.snapshot().unwrap();
         let target = node(&graph, "Product", "constant");
+        let bodies: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.file == "factory.js" && n.kind == "function" && n.label == "runtime")
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        let body = bodies[0];
+        assert_eq!(body.line, Some(1));
+        assert_eq!(
+            body.metadata["start_byte"],
+            source.find("function runtime").unwrap()
+        );
         assert_eq!(target.metadata["declared_callee_binding"], true);
         assert_eq!(
             target_id.get_or_insert_with(|| target.id.clone()).as_str(),
@@ -149,7 +186,7 @@ fn impact_tracks_factory_const_evidence_and_loses_a_shadowed_consumer() {
             node(&graph, "consume", "function"),
             node(&graph, "unrelated", "function"),
             "declared_callee",
-            "Product",
+            ("Product", linked.then_some(body)),
             linked,
         );
     }
@@ -206,7 +243,7 @@ fn impact_tracks_dynamic_member_evidence_and_removes_links_when_proof_is_lost() 
                 node(&graph, "Reader.read", "method"),
                 node(&graph, "unrelated", "function"),
                 "declared_member",
-                call,
+                (call, None),
                 linked,
             );
         }
