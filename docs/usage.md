@@ -185,9 +185,11 @@ they do not identify the implementation that will run.
 
 For an immutable JavaScript or TypeScript value created by a factory,
 `declared_callee` can link a use to its written `const` declaration, including
-supported named imports and reexports. The factory's result is not assumed to
-be a particular function or class: runtime `calls` remain unresolved, and a
-same-named interface keeps its separate type identity.
+supported named imports and reexports. When an ordinary factory has one final
+return of a known, unchanged ordinary function, indexing can also link `calls`
+to that returned function's body. The declaration link remains separate, as
+does a same-named interface. Other factory results remain unresolved; a type
+annotation alone does not establish the function that will run.
 
 Passing a known local JavaScript or TypeScript function as a callback argument
 records a `references` dependency at that argument. It does not assert that the

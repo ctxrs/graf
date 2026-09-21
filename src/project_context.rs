@@ -1538,6 +1538,8 @@ struct JavascriptContext {
     // Some(key): one proven declaration; None: type-only or conflicting route.
     // Absent entries retain ordinary function/class resolution.
     imported_callees: BTreeMap<String, Option<String>>,
+    // Exact immutable value declaration -> exact returned callable body key.
+    factory_results: BTreeMap<String, String>,
     star_aliases: BTreeMap<String, Vec<String>>,
     esm_files: BTreeSet<String>,
 }
@@ -1813,11 +1815,41 @@ impl JavascriptContext {
         };
         let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut providers = BTreeMap::new();
+        let mut factory_returns = BTreeMap::new();
+        let mut initializers = Vec::new();
         for raw in self.raw_facts.values() {
             let mut facts = raw.clone();
             // Called before star aliases are installed: these are direct owners,
             // not discovery-only names competing with their terminal targets.
             self.apply_paths(&mut facts);
+            let local_prefix = format!("javascript:local:{}:", facts.path);
+            let mut local_factory_keys = BTreeSet::new();
+            for node in &facts.nodes {
+                if node.metadata["declared_callee_binding"] != true {
+                    continue;
+                }
+                if let Some(key) = node
+                    .binding_key
+                    .as_deref()
+                    .filter(|k| k.starts_with(&local_prefix))
+                {
+                    local_factory_keys.insert(key);
+                }
+                if let Some(initializer) = node.metadata["factory_initializer"].as_str()
+                    && let Some(reference) = facts
+                        .references
+                        .iter()
+                        .find(|r| r.id == initializer && r.relation == "calls")
+                {
+                    local_factory_keys.extend(
+                        reference
+                            .candidate_keys
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|k| k.starts_with(&local_prefix)),
+                    );
+                }
+            }
             for node in &facts.nodes {
                 let keys: BTreeSet<_> = node
                     .binding_key
@@ -1833,6 +1865,7 @@ impl JavascriptContext {
                     .filter(|k| {
                         k.starts_with(&format!("javascript:file:{}:", facts.path))
                             || k.starts_with(&format!("javascript:cjs-file:{}:", facts.path))
+                            || local_factory_keys.contains(k)
                     })
                     .map(str::to_owned)
                     .collect();
@@ -1847,6 +1880,32 @@ impl JavascriptContext {
                         .is_some_and(|k| k.ends_with(SUFFIX)))
                 .then(|| keys.iter().find(|k| k.ends_with(SUFFIX)).cloned())
                 .flatten();
+                if node.kind == "function"
+                    && let (Some(target), Some(key)) = (
+                        node.metadata["factory_return"]["target"].as_str(),
+                        node.metadata["factory_return"]["key"].as_str(),
+                    )
+                    && facts.nodes.iter().any(|body| {
+                        body.id == target
+                            && body.kind == "function"
+                            && body.metadata["binding_aliases"]
+                                .as_array()
+                                .is_some_and(|aliases| {
+                                    aliases.iter().any(|alias| alias.as_str() == Some(key))
+                                })
+                    })
+                {
+                    factory_returns.insert(node.id.clone(), key.to_owned());
+                }
+                if let Some(key) = &declaration
+                    && let Some(initializer) = node.metadata["factory_initializer"].as_str()
+                    && let Some(reference) = facts
+                        .references
+                        .iter()
+                        .find(|r| r.id == initializer && r.relation == "calls")
+                {
+                    initializers.push((key.clone(), reference.candidate_keys.clone()));
+                }
                 let references: Vec<_> = if node.kind == "alias" {
                     facts
                         .references
@@ -1979,6 +2038,29 @@ impl JavascriptContext {
                 if changed && queued.insert(from.clone()) {
                     pending.push_back(from.clone());
                 }
+            }
+        }
+        self.factory_results.clear();
+        for (declaration, keys) in initializers {
+            let mut factory = None;
+            let complete = !keys.is_empty()
+                && keys.iter().all(|key| {
+                    let Some(origins) = values.get(key).filter(|origins| origins.len() == 1) else {
+                        return false;
+                    };
+                    let Some(JavascriptCallee::Ordinary(id)) = origins.first() else {
+                        return false;
+                    };
+                    if !factory_returns.contains_key(id) || factory.is_some_and(|prior| prior != id)
+                    {
+                        return false;
+                    }
+                    factory = Some(id);
+                    true
+                });
+            if complete && let Some(factory) = factory {
+                self.factory_results
+                    .insert(declaration, factory_returns[factory].clone());
             }
         }
         self.imported_callees = values
@@ -2187,6 +2269,32 @@ impl JavascriptContext {
     fn apply(&self, facts: &mut FileFacts) {
         self.apply_paths(facts);
         self.apply_imported_callees(facts);
+        self.apply_factory_returns(facts);
+    }
+    fn apply_factory_returns(&self, facts: &mut FileFacts) {
+        let targets: BTreeMap<_, _> = facts
+            .references
+            .iter_mut()
+            .filter_map(|reference| {
+                if reference.relation != "declared_callee" || reference.candidate_keys.len() != 1 {
+                    return None;
+                }
+                let target = self.factory_results.get(&reference.candidate_keys[0])?;
+                let call = reference.id.strip_suffix(":declared_callee")?.to_owned();
+                reference.reason =
+                    "written immutable callee binding; invocation body proved by factory return"
+                        .into();
+                Some((call, target.clone()))
+            })
+            .collect();
+        for reference in &mut facts.references {
+            if reference.relation == "calls"
+                && let Some(target) = targets.get(&reference.id)
+            {
+                reference.candidate_keys = vec![target.clone()];
+                reference.reason = "immutable factory result; single returned callable body".into();
+            }
+        }
     }
     fn apply_imported_callees(&self, facts: &mut FileFacts) {
         let mut ids: BTreeSet<_> = facts.references.iter().map(|r| r.id.clone()).collect();

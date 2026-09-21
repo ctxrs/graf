@@ -235,6 +235,239 @@ fn javascript_selected_module_add_delete_matches_fresh_without_export_fallback()
 }
 
 #[test]
+fn javascript_local_factory_returns_link_bodies_without_promoting_values_or_types() {
+    let f = Fixture::new();
+    for definition in [
+        "function build() { function Body() {} return Body; }",
+        "function build() { return function Body() {}; }",
+    ] {
+        f.write("main.ts", &format!("{definition}\ninterface Value {{}}\nconst Value = build();\nexport function use(): Value {{ Value(); return new Value(); }}\n"));
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let body = node(&graph, "main.ts", "Body");
+        let value = graph
+            .nodes
+            .iter()
+            .find(|n| n.label == "Value" && n.kind == "constant")
+            .unwrap();
+        let interface = graph
+            .nodes
+            .iter()
+            .find(|n| n.label == "Value" && n.kind == "interface")
+            .unwrap();
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "calls")
+            .collect();
+        assert_eq!(runtime.len(), 2);
+        assert!(
+            runtime
+                .iter()
+                .all(|e| e.target == body.id && e.line == Some(4))
+        );
+        let declarations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "declared_callee")
+            .collect();
+        assert_eq!(declarations.len(), 2);
+        for call in runtime {
+            assert!(declarations.iter().any(|e| e.target == value.id
+                && e.metadata["reference_id"]
+                    == format!(
+                        "{}:declared_callee",
+                        call.metadata["reference_id"].as_str().unwrap()
+                    )
+                && e.file == call.file
+                && e.line == call.line));
+        }
+        assert!(graph.edges.iter().any(|e| e.source == caller.id
+            && e.target == interface.id
+            && e.relation == "return_type"));
+        assert!(!graph.edges.iter().any(|e| e.source == caller.id
+            && e.relation == "calls"
+            && (e.target == value.id || e.target == interface.id)));
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_namespace_factory_return_proof_tracks_updates_deletion_and_ambiguity() {
+    let f = Fixture::new();
+    f.write("barrel.ts", "export * from './factory.js';\n");
+    f.write("value.ts", "import * as core from './barrel.js';\nexport interface Value {}\nexport const Value: core.build = core.build();\n");
+    f.write("main.ts", "import { Value } from './value.js';\nexport function use(): Value {\n return new Value();\n}\n");
+    let provider = |body: &str| {
+        format!(
+            "export interface build {{ new(): unknown; }}\nexport function build() {{\n function helper(flag) {{ if (flag) return 1; return 2; }}\n function {body}() {{ return helper(true); }}\n Object.defineProperty({body}, 'name', {{ value: 'Value' }});\n return {body} as any;\n}}\n"
+        )
+    };
+    for step in 0..7 {
+        match step {
+            0 => f.write("factory.ts", &provider("First")),
+            1 => f.write("factory.ts", &provider("Replacement")),
+            2 => fs::remove_file(f.root().join("factory.ts")).unwrap(),
+            3 | 6 => f.write("factory.ts", &provider("Restored")),
+            4 => f.write("factory.ts", "export interface build {} export function build(flag) { function Left() {} function Right() {} if (flag) return Left; return Right; }"),
+            5 => {
+                f.write("factory.ts", &provider("Restored"));
+                f.write("competitor.ts", &provider("Competing"));
+                f.write("barrel.ts", "export * from './factory.js'; export * from './competitor.js';");
+            }
+            _ => unreachable!(),
+        }
+        if step == 6 {
+            fs::remove_file(f.root().join("competitor.ts")).unwrap();
+            f.write("barrel.ts", "export * from './factory.js';");
+        }
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        let runtime: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == caller.id && e.relation == "calls")
+            .collect();
+        let expected = match step {
+            0 => Some("First"),
+            1 => Some("Replacement"),
+            3 | 6 => Some("Restored"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(runtime.len(), 1, "step {step}");
+            assert_eq!(runtime[0].target, node(&graph, "factory.ts", expected).id);
+            assert_eq!(runtime[0].line, Some(3));
+            assert_eq!(runtime[0].file.as_deref(), Some("main.ts"));
+            assert!(!f.unresolved(caller, "Value"));
+        } else {
+            assert!(runtime.is_empty(), "step {step}");
+            assert!(f.unresolved(caller, "Value"), "step {step}");
+        }
+        let value = graph
+            .nodes
+            .iter()
+            .find(|n| n.file == "value.ts" && n.kind == "constant")
+            .unwrap();
+        assert!(graph.edges.iter().any(|e| e.source == caller.id
+            && e.relation == "declared_callee"
+            && e.target == value.id));
+        assert!(!graph.edges.iter().any(|e| {
+            e.source == caller.id
+                && e.relation == "calls"
+                && graph.nodes.iter().any(|n| {
+                    n.id == e.target && matches!(n.kind.as_str(), "constant" | "interface")
+                })
+        }));
+        javascript_assert_fresh_equivalent(&f, &graph);
+    }
+}
+
+#[test]
+fn javascript_factory_return_calls_require_executable_unique_immutable_proof() {
+    let f = Fixture::new();
+    f.write(
+        "factory.ts",
+        "export interface build {} export function build() { function Body() {} return Body; }",
+    );
+    for (setup, result) in [
+        (
+            "import type { build } from './factory';",
+            "const Value = build();",
+        ),
+        (
+            "import type * as core from './factory';",
+            "const Value = core.build();",
+        ),
+        (
+            "interface build { new(): unknown; } declare const unknown: build;",
+            "const Value = unknown();",
+        ),
+        (
+            "import * as core from './factory'; core.build = other;",
+            "const Value = core.build();",
+        ),
+        ("import { build } from './factory';", "let Value = build();"),
+        (
+            "import { build } from './factory';",
+            "const Value = build(); Value = other;",
+        ),
+        (
+            "import { build } from './factory';",
+            "const Value = build?.();",
+        ),
+        (
+            "import { build } from './factory';",
+            "const Value = build()();",
+        ),
+        (
+            "import * as core from './factory';",
+            "const Value = core[key]();",
+        ),
+        (
+            "import * as core from './factory';",
+            "const Value = core?.build();",
+        ),
+    ] {
+        f.write(
+            "main.ts",
+            &format!("{setup}\n{result}\nexport function use() {{ new Value(); }}"),
+        );
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{setup} {result}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+    // A parameter hides the imported factory; a value parameter hides the const.
+    for source in [
+        "import { build } from './factory'; export function use(build) { const Value = build(); return new Value(); }",
+        "import { build } from './factory'; const Value = build(); export function use(Value) { return new Value(); }",
+    ] {
+        f.write("main.ts", source);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{source}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+    f.write("main.ts", "import { build } from './factory'; const Value = build(); export function use() { return new Value(); }");
+    for provider in [
+        "export interface build { new(): unknown; }",
+        "export async function build() { function Body() {} return Body; }",
+        "export function* build() { function Body() {} return Body; }",
+        "export function build() { return () => {}; }",
+        "export function build() { function Body() {} Body = other; return Body; }",
+        "export function build() { function Body() {} function change() { Body = other; } return Body; }",
+        "export function build(Body) { return Body; }",
+        "export function build() { function Body() {} if (flag) return Body; return Body; }",
+        "export function build() { function Body() {} return Body; } build = other;",
+    ] {
+        f.write("factory.ts", provider);
+        let graph = f.index();
+        let caller = node(&graph, "main.ts", "use");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == caller.id && e.relation == "calls"),
+            "{provider}"
+        );
+        assert!(f.unresolved(caller, "Value"));
+    }
+}
+
+#[test]
 fn javascript_imported_factory_proof_refreshes_without_promoting_the_interface() {
     let f = Fixture::new();
     f.write("main.ts", "import {Shape as Value, ordinary, Plain} from './provider';\nexport function use(value: Value): Value {\n Value();\n new Value();\n Value?.();\n Value[key]();\n ordinary(); new Plain(); return value;\n}\n");
