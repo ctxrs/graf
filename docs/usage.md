@@ -1,8 +1,8 @@
 # Graf usage
 
-This guide describes unreleased Graf 0.5.0. Build from this checkout to use its
-0.5 additions. Installers fetch the latest published release by default, which
-may not include the features described here.
+This guide describes Graf 0.5.0. Check `graf --version` before using its additions.
+Installers fetch the latest published release by default, which may precede this
+checkout; build from source if the features you need are not yet released.
 See the [README](../README.md#install) for release installation and
 [building from source](../README.md#build-from-source).
 
