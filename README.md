@@ -1,222 +1,107 @@
-# graf
+<img src="docs/assets/graf-readme-banner.svg" alt="Your codebase is a graph. Query it with graf. 7x faster indexing, 40x faster search, one native binary. Graphify, rebuilt." width="100%">
 
-A persistent local code graph, written in Rust. Index a project or import a
-Graphify snapshot, then find symbols, inspect callers, and follow dependencies
-from your terminal or an AI agent.
+Grep can find a name. **graf** tells you who calls it, what depends on it, what might break if it changes, and how it connects to the rest of the repository.
 
-Graf stores its graph in SQLite. By default, navigation queries use persistent
-search and adjacency indexes; they do not reload graph JSON, rebuild the graph,
-or scan for source changes. Run an explicit update when you want a new snapshot.
-
-Graf supports language and document extraction, graph analysis, exports, and
-agent integrations. See the [usage guide](docs/usage.md) for supported workflows
-and their limits.
-
-Graf 0.4.0 adds the workflows below. They require Graf 0.4.0 or a build from this
-checkout; installing 0.3.0 does not enable them:
-
-- [Provider discovery and setup](docs/usage.md#provider-discovery-and-setup),
-  with explicit selection, usage receipts, and bounded recovery.
-- [Saved answers and local reflection](docs/usage.md#save-answers-and-reflect),
-  with explicit limits on source verification and
-  [opt-in CLI/MCP annotations](docs/usage.md#read-learning-observations-during-navigation).
-- [Optional project tool hooks](docs/usage.md#optional-tool-guidance)
-  that suggest graph navigation while allowing source reads and searches.
-- [Read-only PR inspection](docs/usage.md#inspect-github-pull-requests)
-  and explicitly enabled GitHub MCP tools.
-- [Optional Leiden analysis](docs/usage.md#community-algorithms) alongside
-  Louvain, and [preserved imported communities](docs/usage.md#preserved-communities).
-- [Offline graph exploration](docs/usage.md#explore-an-html-graph) with
-  topology-based layout, clickable neighbors and recorded group outlines.
-  [Optional work-memory annotations](docs/usage.md#work-memory-annotations-in-exports)
-  show saved observations without changing the graph.
+Graf builds a persistent local graph from your source, docs, configuration, and database schemas. You and your agents can query it from the terminal without rebuilding the graph for every question. Static indexing is local and needs no API key, model, background service, or Python environment.
 
 ## Install
 
-On Linux or macOS:
+macOS and Linux:
 
-```sh
+```bash
 curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh
 ```
 
-On Windows x64, in PowerShell:
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 ```
 
-The installers fetch the latest published release by default, which may precede
-this checkout. They verify the signed release manifest and download hashes,
-decompress gzip releases, and verify the executable's signed hash and size before
-installing.
-Linux and macOS need `curl`, `openssl`, `gzip`, and standard shell utilities;
-Windows needs PowerShell 5.1 or newer. Linux and macOS default to `~/.local/bin`;
-Windows defaults to
-`%LOCALAPPDATA%\Graf\bin`. Add that directory to your `PATH` if needed; the
-installers do not change shell profiles. Run the installer again to upgrade.
+The installers verify the signed release before replacing anything. Run the same command again to upgrade. The default install directories are `~/.local/bin` and `%LOCALAPPDATA%\Graf\bin`; add that directory to `PATH` if needed. See [installation and downloads](docs/downloads.md) for supported platforms, manual verification, and custom directories.
 
-Release downloads cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows
-x64. See [installation and download verification](docs/downloads.md) for
-prerequisites, version selection, custom directories, and manual downloads from
-[Releases](https://github.com/ctxrs/graf/releases).
+## Try it
 
-For manual downloads, choose your platform's gzip file:
+From any project:
 
-| Platform | Download |
-| --- | --- |
-| Linux x64 | [graf-linux-x64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-linux-x64.gz) |
-| Linux ARM64 | [graf-linux-aarch64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-linux-aarch64.gz) |
-| macOS Intel | [graf-macos-x64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-macos-x64.gz) |
-| macOS Apple Silicon | [graf-macos-arm64.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-macos-arm64.gz) |
-| Windows x64 | [graf-windows-x64.exe.gz](https://github.com/ctxrs/graf/releases/latest/download/graf-windows-x64.exe.gz) |
-
-Follow the [download verification and extraction guide](docs/downloads.md#verify-the-download)
-before running a manual download. Each platform also has an SBOM and license
-notices. The installers continue to support older releases with raw executables.
-
-### Build from source
-
-Use Rust 1.90 or newer and a C compiler. From a Graf source checkout containing
-the features you need:
-
-```sh
-cargo install --path . --locked
-```
-
-The executable is `graf`. A build from this checkout includes the workflows in
-[the usage guide](docs/usage.md). Default static indexing and navigation need no
-API key, model, or background service. Explicit semantic extraction and external
-source adapters have their own requirements.
-
-## Quick start
-
-Graf indexes the language families and documents described in
-[input coverage](docs/usage.md#input-coverage).
-From your project directory:
-
-```sh
+```bash
 graf index .
-graf query authenticate
-graf callers authenticate
-graf callees authenticate
-graf impact authenticate
-graf path main authenticate
-graf show authenticate
 graf stats
+graf query authenticate
 ```
 
-Use the returned node ID when a name is ambiguous. `--json` produces structured
-results; `--db PATH` selects an explicit database. The default is
-`.graf/index.db`. Keep `.graf/` out of version control. Read commands find the
-nearest existing index in the current directory or its ancestors.
+Replace `authenticate` with a symbol from your project, then copy its exact ID into an impact query. That shows the symbol, the code that depends on it, and the relationship between them:
 
-```sh
-graf query authenticate --depth 2 --limit 50 --json
-# After editing, adding, or deleting source files:
+```text
+$ graf impact 'python:src/auth.py:authenticate@64'
+Generation 1 (indexed snapshot)
+python:src/auth.py:authenticate@64  function  authenticate  src/auth.py:4
+python:src/auth.py:login@136         function  login         src/auth.py:7
+python:src/auth.py:login@136 --calls--> python:src/auth.py:authenticate@64
+```
+
+Graf saves the graph at `.graf/index.db`. After changing code, update only what changed:
+
+```bash
 graf update
 ```
 
-Updates compare source hashes and replace changed facts in one coherent graph
-generation, including affected references in unchanged files. A no-op update
-preserves the generation. Queries continue to read the saved state until you
-update; they do not judge whether it is fresh.
+Use `--json` for structured output and an exact node ID when a name is ambiguous. The [usage guide](docs/usage.md) covers callers, callees, paths, filters, reports, exports, multiple projects, and supported inputs.
 
-Call edges describe what the extractors can resolve from source. Dynamic
-dispatch, ambiguous bindings, and unsupported constructs can remain unresolved.
-Inspect diagnostics and source locations: an empty caller list does not prove a
-function is unused. Graf does not run your project or replace its compiler.
+## Why Graf is better than Graphify
 
-## Switch from Graphify
+Graf is Graphify, but rebuilt properly in Rust: **7x faster indexing, 40x faster search, and one native binary.**
 
-From a project with `graphify-out/graph.json`:
+<img src="docs/assets/graf-indexing-speed.svg" alt="Graf indexing is 7 times faster than Graphify." width="100%">
 
-```sh
-graf switch graphify
-```
+<img src="docs/assets/graf-search-speed.svg" alt="Graf search is 40 times faster than Graphify." width="100%">
 
-Or install the released Graf and switch in one command on Linux or macOS:
+Graf was built from scratch around a persistent indexed graph. It updates the files that changed and answers navigation queries directly from SQLite. One native binary replaces the Python environment and dependency stack.
 
-```sh
+It is also stricter about correctness. Updates become visible as one complete generation, so a failed extraction cannot publish half a graph. When two symbols could be the answer, Graf returns the ambiguity and the source evidence instead of guessing.
+
+Graf is an independent implementation, not a fork or a drop-in replacement for Graphify's Python API. The numbers above round the geometric mean of 19 successful indexing cases from four public repos and 19 successful searches from seven; both tools had to return the expected graph for a case to count. Graf trades more disk space for those indexes, and a few cold-indexing cases remain slower. See the [benchmark method, per-case results, and full caveats](docs/benchmarks.md).
+
+## Migrate from Graphify
+
+Run this from a project that already has `graphify-out/graph.json`:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh | sh -s -- --from graphify
 ```
 
-Graf imports the snapshot into `.graf/index.db`, replaces the project's
-supported Graphify MCP connection with Graf, and verifies a query over MCP.
-Restart your agent client to load the new tools. The original graph, Graphify
-installation, generation skills, and hooks remain available.
+That installs Graf, imports the existing snapshot into `.graf/index.db`, switches a supported project MCP connection, and verifies the new server. It leaves Graphify, the original graph, skills, and hooks in place.
 
-The command finds project `.mcp.json`, `.cursor/mcp.json`, and `.vscode/mcp.json`
-configurations, or creates `.mcp.json` when none exists. Supported connections
-run `python -m graphify.serve` over stdio, including a Python executable path or
-`uv run`. Select ambiguous connections or other configuration paths explicitly:
+Already installed Graf?
 
-```sh
-graf switch graphify --config .cursor/mcp.json --server graphify
-graf switch graphify --project /path/to/project --graph exports/graph.json
-graf switch graphify --config /path/to/config.toml
+```bash
+graf switch graphify
 ```
 
-JSON must be strict JSON with `mcpServers` or VS Code's `servers` map; Codex TOML
-uses `mcp_servers`. TOML comments and unrelated configuration values are
-preserved. JSON with comments, HTTP servers, shell wrappers, and disabled
-connections are not switched automatically. Global configurations require an
-explicit `--config` path. Graf never runs the old server command.
+The migration is reversible:
 
-Repeating the switch verifies the migration without refreshing its graph. An
-existing `.graf/index.db` is never replaced. Undo restores the exact saved MCP
-configuration and retains the imported database:
-
-```sh
+```bash
 graf switch --undo
 ```
 
-Supply the same `--project` and `--config` when used for the switch. Undo refuses
-to overwrite later configuration edits. Backups remain under `.graf/` and are
-ignored by Git.
+See [migrating from Graphify](docs/migrate-from-graphify.md) for Windows, custom graph paths, MCP configuration selection, compatibility details, and undo behavior.
 
-Graf has its own CLI, analysis methods, and extraction behavior. Snapshot import
-and selected MCP compatibility names do not make it a drop-in replacement for
-Graphify's Python API or every workflow. There is no synchronization back to
-Graphify. See [snapshot import and compatibility](docs/usage.md#snapshots-and-graphify-compatibility)
-for explicit refresh, direction rules, and supported group records.
+## Use Graf with an agent
 
-## Use with an agent
+Install project guidance and a read-only MCP connection for Codex:
 
-Point an MCP client at Graf's read-only stdio server:
-
-```json
-{
-  "mcpServers": {
-    "graf": {
-      "command": "graf",
-      "args": ["--db", "/path/to/project/.graf/index.db", "serve"]
-    }
-  }
-}
+```bash
+graf install --platform codex --project . --skill --mcp
 ```
 
-The client launches the server. CLI and MCP navigation share the query engine;
-the server does not index, refresh, or call a model. Depth and result limits
-bound traversal, and `truncated` marks incomplete results. Default traversal
-returns examined edges, not every edge among returned nodes.
+Setup can be undone and does not overwrite unrelated configuration. See [agent setup and MCP](docs/usage.md#agent-setup-and-mcp) for Claude Code, Cursor, Gemini, VS Code, Aider, and other hosts.
 
-Graf also offers [reversible agent setup](docs/usage.md#agent-setup-and-mcp),
-optional Git refresh hooks, Streamable HTTP, and named project routing. In Graf 0.4.0,
-[Claude global MCP cleanup](docs/usage.md#claude-global-mcp-cleanup)
-preserves host-added settings when removing an unchanged Graf entry. Other
-commands cover [analysis and exports](docs/usage.md#analysis-and-exports),
-[stored cross-project graphs](docs/usage.md#multiple-projects), and
-[explicit database connectors](docs/usage.md#database-connectors).
+## Build from source
 
-## Development
+Graf requires Rust 1.90 or newer and a C compiler:
 
-```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+```bash
+cargo install --path . --locked
 ```
 
-Validation runs locally. GitHub Actions and Buildkite are not required.
-
-Licensed under Apache-2.0. Graf is an independent project inspired by
-[Graphify](https://github.com/Graphify-Labs/graphify).
+Graf is licensed under Apache-2.0. It is an independent project inspired by [Graphify](https://github.com/Graphify-Labs/graphify).
