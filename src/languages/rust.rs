@@ -30,7 +30,11 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         e,
         root,
         modules: HashMap::from([(0, module.clone())]),
-        types: vec![],
+        module_bindings: HashMap::new(),
+        module_aliases: HashMap::new(),
+        value_bindings: HashMap::new(),
+        local_uses: vec![],
+        paths: vec![],
         implementations: vec![],
         receivers: vec![],
     };
@@ -49,23 +53,142 @@ fn prefix(module: &str) -> String {
         format!("{module}::")
     }
 }
+struct LocalUse {
+    scope: usize,
+    name: String,
+    parts: Vec<String>,
+    key: String,
+    references: std::ops::Range<usize>,
+}
 struct Rust<'a> {
     e: Extractor<'a>,
     root: String,
     modules: HashMap<usize, String>,
-    types: Vec<(usize, usize, Vec<String>, String)>,
+    // Modules occupy the type namespace; a same-named function is a value.
+    module_bindings: HashMap<usize, HashMap<String, Option<String>>>,
+    // Only aliases of proven module heads belong here, never imported members.
+    module_aliases: HashMap<usize, HashMap<String, String>>,
+    // Unknown call targets can still be proven to occupy only the value namespace.
+    value_bindings: HashMap<usize, HashMap<String, bool>>,
+    local_uses: Vec<LocalUse>,
+    paths: Vec<(usize, usize, Vec<String>, String)>,
     implementations: Vec<(String, usize, Vec<String>, String)>,
     receivers: Vec<(String, usize, Vec<String>, String)>,
 }
 impl Rust<'_> {
+    fn callable_sequence(mut node: Syntax<'_>) -> bool {
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "block" if !children(parent).iter().any(|n| n.kind() == "label") => {}
+                "expression_statement" | "return_expression" => {}
+                "function_item" | "closure_expression" => {
+                    return parent.child_by_field_name("body") == Some(node);
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        false
+    }
+    fn record_binding(&mut self, scope: usize, name: &str, value_only: bool) {
+        self.value_bindings
+            .entry(scope)
+            .or_default()
+            .entry(name.trim_start_matches("r#").into())
+            .and_modify(|known| *known &= value_only)
+            .or_insert(value_only);
+    }
+    fn bind(&mut self, scope: usize, name: &str, binding: Binding, value_only: bool) {
+        let name = name.trim_start_matches("r#");
+        self.record_binding(scope, name, value_only);
+        self.e.bind(scope, name, binding);
+    }
     fn resolve_path(&self, scope: usize, parts: &[String], module: &str) -> Vec<String> {
         if parts.first().is_some_and(|p| {
             matches!(p.as_str(), "crate" | "super") || p == "self" && self.e.unbound(scope, "self")
         }) {
             self.absolute(parts, module, false).into_iter().collect()
         } else {
-            self.e.resolve(scope, parts)
+            self.module_candidates(scope, parts)
+                .unwrap_or_else(|| self.e.resolve(scope, parts))
         }
+    }
+    // Some means a known module, blocked name, or uncertain scope was found.
+    // None leaves ordinary paths to shared resolution, never proving a use.
+    fn module_candidates(&self, scope: usize, parts: &[String]) -> Option<Vec<String>> {
+        let name = parts.first()?;
+        let mut current = Some(scope);
+        while let Some(index) = current {
+            let lexical = &self.e.scopes[index];
+            if lexical.uncertain {
+                return Some(vec![]);
+            }
+            if !lexical.class {
+                let value_only =
+                    self.value_bindings.get(&index).and_then(|m| m.get(name)) == Some(&true);
+                if let Some(key) = self.module_bindings.get(&index).and_then(|m| m.get(name)) {
+                    // Imports and other type bindings can conflict with a module.
+                    // Value-only bindings cannot, even with unknown call targets.
+                    if lexical.bindings.contains_key(name) && !value_only {
+                        return Some(vec![]);
+                    }
+                    return Some(
+                        key.iter()
+                            .map(|key| {
+                                if parts.len() == 1 {
+                                    key.clone()
+                                } else {
+                                    format!("{key}::{}", parts[1..].join("::"))
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+                if let Some(key) = self.module_aliases.get(&index).and_then(|m| m.get(name)) {
+                    return Some(
+                        matches!(lexical.bindings.get(name), Some(Binding::Path(bound)) if bound == key)
+                            .then(|| {
+                                if parts.len() == 1 {
+                                    key.clone()
+                                } else {
+                                    format!("{key}::{}", parts[1..].join("::"))
+                                }
+                            })
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+                if !value_only && matches!(lexical.bindings.get(name), Some(Binding::Unknown)) {
+                    return Some(vec![]);
+                }
+                if lexical.bindings.contains_key(name) && !value_only || lexical.fallback.is_some()
+                {
+                    break;
+                }
+            }
+            current = lexical.parent;
+        }
+        None
+    }
+    fn local_use_origin(&self, import: &LocalUse) -> Option<(Vec<String>, bool)> {
+        let mut scope = import.scope;
+        let mut parts = import.parts.as_slice();
+        if parts.first()?.as_str() == "self" {
+            // self:: starts at the containing module, not a block-local binding.
+            loop {
+                if self.e.scopes[scope].uncertain {
+                    return Some((vec![], false));
+                }
+                if self.modules.contains_key(&scope) {
+                    break;
+                }
+                scope = self.e.scopes[scope].parent?;
+            }
+            parts = &parts[1..];
+        }
+        let keys = self.module_candidates(scope, parts)?;
+        // A member path can name a type or value; its module shape is unknown.
+        Some((keys, parts.len() == 1))
     }
     fn type_refs(&mut self, node: Syntax<'_>, scope: usize, module: &str, relation: &str) {
         if matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
@@ -79,7 +202,7 @@ impl Rust<'_> {
                     vec![],
                     "explicit Rust type is unavailable or ambiguous",
                 );
-                self.types.push((index, scope, parts, module.into()));
+                self.paths.push((index, scope, parts, module.into()));
             }
             return;
         }
@@ -171,7 +294,65 @@ impl Rust<'_> {
         self.path(owner)
     }
     fn finish(mut self) -> FileFacts {
-        for (index, scope, parts, module) in &self.types {
+        // Prove origins only after later declarations, attributes and imports
+        // have had a chance to invalidate them. Updating the binding here also
+        // carries the native path into deferred calls, types and impl owners.
+        let mut pending = std::mem::take(&mut self.local_uses);
+        while !pending.is_empty() {
+            let count = pending.len();
+            let mut unresolved = vec![];
+            for import in pending {
+                let origin = if !matches!(self.e.scopes[import.scope].bindings.get(&import.name),
+                    Some(Binding::Path(key)) if key == &import.key)
+                    || self
+                        .module_bindings
+                        .get(&import.scope)
+                        .is_some_and(|m| m.contains_key(&import.name))
+                {
+                    Some((vec![], false))
+                } else {
+                    self.local_use_origin(&import)
+                };
+                let Some((keys, is_module)) = origin else {
+                    unresolved.push(import);
+                    continue;
+                };
+                let [key] = keys.as_slice() else {
+                    // A blocked local origin must not fall through to a same-named
+                    // dependency. Unknown also blocks dependent named uses.
+                    self.e.scopes[import.scope]
+                        .bindings
+                        .insert(import.name, Binding::Unknown);
+                    for index in import.references {
+                        self.e.facts.references[index].candidate_keys.clear();
+                    }
+                    continue;
+                };
+                self.e.scopes[import.scope]
+                    .bindings
+                    .insert(import.name.clone(), Binding::Path(key.clone()));
+                if is_module {
+                    self.module_aliases
+                        .entry(import.scope)
+                        .or_default()
+                        .insert(import.name, key.clone());
+                }
+                for index in import.references {
+                    for candidate in &mut self.e.facts.references[index].candidate_keys {
+                        if candidate == &import.key {
+                            *candidate = key.clone();
+                        }
+                    }
+                }
+            }
+            // Each advancing pass consumes at least one use. Cycles and unknown
+            // origins stop without turning arbitrary imported paths into proof.
+            if unresolved.len() == count {
+                break;
+            }
+            pending = unresolved;
+        }
+        for (index, scope, parts, module) in &self.paths {
             self.e.facts.references[*index].candidate_keys =
                 self.resolve_path(*scope, parts, module);
         }
@@ -336,12 +517,12 @@ impl Rust<'_> {
                 if write {
                     self.e.invalidate(scope, name);
                 } else {
-                    self.e.bind(scope, name, Binding::Unknown);
+                    self.bind(scope, name, Binding::Unknown, true);
                 }
             }
             "type_parameter" | "const_parameter" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    self.e.bind(scope, self.e.text(name), Binding::Unknown);
+                    self.bind(scope, self.e.text(name), Binding::Unknown, false);
                 }
             }
             "parameter" | "let_declaration" => {
@@ -378,13 +559,14 @@ impl Rust<'_> {
                             p.start_byte()
                         );
                         self.receivers.push((marker.clone(), scope, parts, module));
-                        self.e.bind(
+                        self.bind(
                             scope,
                             self.e.text(p).trim_start_matches("r#"),
                             Binding::Namespace {
                                 prefixes: vec![format!("{marker}:")],
                                 separator: ".",
                             },
+                            true,
                         );
                     } else {
                         self.pattern(p, scope, write);
@@ -423,11 +605,12 @@ impl Rust<'_> {
         module: &str,
         before: &[String],
         exported: bool,
+        conditional: bool,
     ) {
         match node.kind() {
             "use_list" => {
                 for child in children(node) {
-                    self.use_item(child, scope, module, before, exported);
+                    self.use_item(child, scope, module, before, exported, conditional);
                 }
             }
             "scoped_use_list" => {
@@ -436,7 +619,7 @@ impl Rust<'_> {
                     p.extend(path);
                 }
                 if let Some(list) = node.child_by_field_name("list") {
-                    self.use_item(list, scope, module, &p, exported);
+                    self.use_item(list, scope, module, &p, exported, conditional);
                 }
             }
             "use_wildcard" => {
@@ -470,10 +653,16 @@ impl Rust<'_> {
                     .or_else(|| parts.last().cloned())
                     .unwrap_or_default();
                 let key = self.absolute(&parts, module, true);
-                self.e.bind(
+                let start = self.e.facts.references.len();
+                self.bind(
                     scope,
                     &local,
-                    key.clone().map_or(Binding::Unknown, Binding::Path),
+                    if conditional {
+                        Binding::Unknown
+                    } else {
+                        key.clone().map_or(Binding::Unknown, Binding::Path)
+                    },
+                    false,
                 );
                 if exported && local != "_" {
                     let child = self.e.define(node, scope, &local, "reexport", None, false);
@@ -495,9 +684,24 @@ impl Rust<'_> {
                     scope,
                     self.e.text(node).into(),
                     "imports",
-                    key.into_iter().collect(),
+                    key.clone().into_iter().collect(),
                     "use target is external, unavailable, or ambiguous",
                 );
+                if !conditional
+                    && !matches!(parts.first().map(String::as_str), Some("crate" | "super"))
+                    && !std::iter::successors(Some(node), |n| n.parent())
+                        .take_while(|n| n.kind() != "use_declaration")
+                        .any(|n| self.e.text(n).starts_with("::"))
+                    && let Some(key) = key
+                {
+                    self.local_uses.push(LocalUse {
+                        scope,
+                        name: local,
+                        parts,
+                        key,
+                        references: start..self.e.facts.references.len(),
+                    });
+                }
             }
         }
     }
@@ -535,6 +739,11 @@ impl Rust<'_> {
             key,
             !method && !closure,
         );
+        self.e.scopes[child].callable_capture = closure;
+        if !method && !closure {
+            // define registers the shared symbol; retain its namespace after invalidation.
+            self.record_binding(scope, &name, true);
+        }
         self.e.facts.nodes.last_mut().unwrap().metadata["public"] =
             public(node, self.e.source).into();
         self.e.facts.nodes.last_mut().unwrap().metadata["trait_receiver"] = node
@@ -558,9 +767,9 @@ impl Rust<'_> {
         }
         if let Some(ty) = implementation.filter(|t| !t.is_empty()) {
             self.e.facts.nodes.last_mut().unwrap().metadata["impl_type"] = ty.into();
-            self.e.bind(child, "Self", Binding::Path(ty.into()));
+            self.bind(child, "Self", Binding::Path(ty.into()), false);
         } else if method {
-            self.e.bind(child, "Self", Binding::Unknown);
+            self.bind(child, "Self", Binding::Unknown, false);
         }
         for field in ["type_parameters", "parameters"] {
             if let Some(params) = node.child_by_field_name(field) {
@@ -598,14 +807,23 @@ impl Rust<'_> {
         implementation: Option<&str>,
     ) {
         match node.kind() {
-            "source_file" | "declaration_list" => {
+            "source_file" | "declaration_list" | "block" => {
+                let scope = if node.kind() == "block" {
+                    self.e.block(scope, node)
+                } else {
+                    scope
+                };
                 let mut conditional = false;
+                let mut cfg_only = true;
                 for item in children(node) {
+                    if matches!(item.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
                     if item.kind() == "attribute_item" {
                         if let Some(attribute) = item.named_child(0).and_then(|n| n.named_child(0))
                         {
                             // Attribute macros and cfg can remove or replace declarations.
-                            conditional |= !matches!(
+                            let changes_item = !matches!(
                                 self.e.text(attribute),
                                 "allow"
                                     | "warn"
@@ -621,18 +839,52 @@ impl Rust<'_> {
                                     | "no_mangle"
                                     | "link_name"
                             );
+                            conditional |= changes_item;
+                            cfg_only &= !changes_item || self.e.text(attribute) == "cfg";
                         }
                         continue;
                     }
                     let start = self.e.facts.nodes.len();
-                    self.visit(item, scope, module, implementation);
-                    if conditional {
-                        if item.kind() == "use_declaration" {
+                    let import_start = self.local_uses.len();
+                    if conditional && item.kind() == "use_declaration" {
+                        // A named conditional import affects only its imported names.
+                        // Wildcards still make the whole scope uncertain in use_item.
+                        if !cfg_only {
+                            // An attribute macro may replace the entire import.
                             self.e.scopes[scope].uncertain = true;
                         }
+                        if let Some(arg) = item.child_by_field_name("argument") {
+                            self.use_item(
+                                arg,
+                                scope,
+                                module,
+                                &[],
+                                public(item, self.e.source),
+                                true,
+                            );
+                        }
+                    } else {
+                        self.visit(item, scope, module, implementation);
+                    }
+                    if conditional {
+                        self.local_uses.truncate(import_start);
+                        // An attributed statement can remove/replace local writes.
+                        // Keep ordinary extraction intact; reject only value flow.
+                        self.e.escape_callable_local(scope, None);
                         if let Some(name) = item.child_by_field_name("name") {
-                            self.e
-                                .invalidate(scope, self.e.text(name).trim_start_matches("r#"));
+                            let name = self.e.text(name).trim_start_matches("r#");
+                            if item.kind() == "mod_item" {
+                                self.module_bindings
+                                    .entry(scope)
+                                    .or_default()
+                                    .insert(name.into(), None);
+                            } else {
+                                if !cfg_only {
+                                    // An attribute macro may replace a value declaration with a type.
+                                    self.record_binding(scope, name, false);
+                                }
+                                self.e.invalidate(scope, name);
+                            }
                         }
                         for definition in &mut self.e.facts.nodes[start..] {
                             definition.binding_key = None;
@@ -640,12 +892,13 @@ impl Rust<'_> {
                         }
                     }
                     conditional = false;
+                    cfg_only = true;
                 }
                 return;
             }
             "use_declaration" => {
                 if let Some(arg) = node.child_by_field_name("argument") {
-                    self.use_item(arg, scope, module, &[], public(node, self.e.source));
+                    self.use_item(arg, scope, module, &[], public(node, self.e.source), false);
                 }
                 return;
             }
@@ -660,11 +913,12 @@ impl Rust<'_> {
                 let name = self.e.text(name).trim_start_matches("r#");
                 let next = format!("{}{name}", prefix(module));
                 let key = format!("rust:module:{}:{next}", self.root);
-                self.e.bind(
-                    scope,
-                    name,
-                    Binding::Path(format!("rust:{}:{next}", self.root)),
-                );
+                self.module_bindings
+                    .entry(scope)
+                    .or_default()
+                    .entry(name.into())
+                    .and_modify(|key| *key = None)
+                    .or_insert_with(|| Some(format!("rust:{}:{next}", self.root)));
                 if let Some(body) = node.child_by_field_name("body") {
                     let child = self.e.define(node, scope, name, "module", Some(key), false);
                     self.e.facts.nodes.last_mut().unwrap().metadata["public"] =
@@ -760,9 +1014,9 @@ impl Rust<'_> {
                     self.e.facts.nodes.last_mut().unwrap().metadata["generic_type_arity"] =
                         params.len().into();
                 }
-                self.e.bind(scope, name, Binding::Path(key.clone()));
+                self.bind(scope, name, Binding::Path(key.clone()), false);
                 self.e.scopes[child].class = false;
-                self.e.bind(child, "Self", Binding::Path(key));
+                self.bind(child, "Self", Binding::Path(key), false);
                 if let Some(params) = node.child_by_field_name("type_parameters") {
                     self.pattern(params, child, false);
                 }
@@ -818,11 +1072,11 @@ impl Rust<'_> {
                     .into();
                 if let Some(ty) = implementation.filter(|t| !t.is_empty()) {
                     item.metadata["impl_type"] = ty.into();
-                    self.e.bind(child, "Self", Binding::Path(ty.into()));
+                    self.bind(child, "Self", Binding::Path(ty.into()), false);
                 }
                 // Keep the declaration navigable without evaluating its stored value.
                 if name != "_" {
-                    self.e.bind(scope, name, Binding::Unknown);
+                    self.bind(scope, name, Binding::Unknown, true);
                 }
                 if let Some(ty) = node.child_by_field_name("type") {
                     self.type_refs(ty, child, module, "references_type");
@@ -833,6 +1087,17 @@ impl Rust<'_> {
                 return;
             }
             "let_declaration" => {
+                if let Some(name) = node
+                    .child_by_field_name("pattern")
+                    .filter(|n| n.kind() == "identifier")
+                    && node
+                        .child_by_field_name("value")
+                        .is_some_and(|n| n.kind() == "identifier")
+                    && node.child_by_field_name("alternative").is_none()
+                {
+                    self.e
+                        .declare_callable_local(scope, self.e.text(name).trim_start_matches("r#"));
+                }
                 self.pattern(node, scope, false);
                 if let Some(ty) = node.child_by_field_name("type") {
                     self.type_refs(ty, scope, module, "references_type");
@@ -869,11 +1134,47 @@ impl Rust<'_> {
                             "static path is unavailable or ambiguous",
                         );
                     } else {
-                        self.e.call(node, scope, target, parts);
+                        let mut path = target;
+                        while matches!(path.kind(), "generic_function" | "parenthesized_expression")
+                        {
+                            let Some(inner) = path
+                                .child_by_field_name("function")
+                                .or_else(|| path.named_child(0))
+                            else {
+                                break;
+                            };
+                            path = inner;
+                        }
+                        if path.kind() == "scoped_identifier"
+                            && let Some(parts) = parts
+                        {
+                            let index = self.e.facts.references.len();
+                            self.e.reference(
+                                node,
+                                scope,
+                                self.e.text(target).into(),
+                                "calls",
+                                vec![],
+                                "static path is unavailable or ambiguous",
+                            );
+                            self.paths.push((index, scope, parts, module.into()));
+                        } else if target.kind() == "identifier"
+                            && Self::callable_sequence(node)
+                            && node.child_by_field_name("arguments").is_some_and(|args| {
+                                children(args)
+                                    .iter()
+                                    .all(|n| matches!(n.kind(), "line_comment" | "block_comment"))
+                            })
+                        {
+                            self.e.call_with_callable_local(node, scope, target, parts);
+                        } else {
+                            self.e.call(node, scope, target, parts);
+                        }
                     }
                 }
             }
             "macro_invocation" => {
+                self.e.escape_callable_local(scope, None);
                 self.e.reference(
                     node,
                     scope,
@@ -884,6 +1185,13 @@ impl Rust<'_> {
                 );
                 return;
             }
+            "reference_expression" => {
+                let parts = node.child_by_field_name("value").and_then(|n| self.path(n));
+                self.e.escape_callable_local(
+                    scope,
+                    parts.as_ref().and_then(|p| p.first()).map(String::as_str),
+                );
+            }
             "macro_definition" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     self.e
@@ -891,7 +1199,7 @@ impl Rust<'_> {
                 }
                 return;
             }
-            "block" | "for_expression" | "match_arm" | "if_expression" | "while_expression" => {
+            "for_expression" | "match_arm" | "if_expression" | "while_expression" => {
                 let child = self.e.block(scope, node);
                 if let Some(p) = node.child_by_field_name("pattern") {
                     self.pattern(p, child, false);
@@ -913,6 +1221,23 @@ impl Rust<'_> {
         }
         for n in children(node) {
             self.visit(n, scope, module, implementation);
+        }
+        if matches!(node.kind(), "let_declaration" | "assignment_expression") {
+            let declaration = node.kind() == "let_declaration";
+            if let Some(name) = node
+                .child_by_field_name(if declaration { "pattern" } else { "left" })
+                .filter(|n| n.kind() == "identifier")
+            {
+                let rhs = node
+                    .child_by_field_name(if declaration { "value" } else { "right" })
+                    .filter(|n| n.kind() == "identifier" && Self::callable_sequence(node))
+                    .map(|n| self.e.text(n).trim_start_matches("r#"));
+                self.e.assign_callable_local(
+                    scope,
+                    self.e.text(name).trim_start_matches("r#"),
+                    rhs,
+                );
+            }
         }
     }
 }

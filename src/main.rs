@@ -84,6 +84,8 @@ enum Command {
     },
     /// Compare local source fingerprints without model or converter calls.
     CheckUpdate,
+    /// Reclaim unused database space without reading sources or changing graph facts.
+    Compact,
     /// Explicit foreground polling; queries themselves never refresh the graph.
     Watch {
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..=3_600_000))]
@@ -1103,6 +1105,21 @@ fn run(cli: Cli) -> Result<()> {
         Command::CheckUpdate => {
             return print_value(&index::check_update(&native_root(&db)?, &db)?, cli.json);
         }
+        Command::Compact => {
+            let report = Store::open(&db)?.compact()?;
+            if cli.json {
+                return print_value(&report, true);
+            }
+            println!(
+                "Compacted database: {} -> {} bytes of database pages.",
+                report.pages_before * report.page_size,
+                report.pages_after * report.page_size
+            );
+            if report.checkpoint_busy {
+                println!("Another connection is delaying disk-space reclamation.");
+            }
+            return Ok(());
+        }
         Command::Watch {
             interval_ms,
             iterations,
@@ -1301,6 +1318,17 @@ fn main() -> std::process::ExitCode {
             eprintln!("graf: {}", human(&format!("{error:#}")));
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn complete_cli_schema_has_no_conflicting_arguments_or_groups() {
+        Cli::command().debug_assert();
     }
 }
 

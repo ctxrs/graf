@@ -26,6 +26,294 @@ fn key(n: &Node) -> &str {
 }
 
 #[test]
+fn swift_protocol_requirements_keep_signature_types_and_distinct_conformers() {
+    use graf::model::{Direction, QueryOptions};
+    use std::collections::BTreeSet;
+
+    let source = r#"// π keeps byte ranges distinct from character counts.
+struct Receipt {}
+protocol Delivery {
+    func accept() -> Receipt
+    func cancel()
+}
+struct Courier: Delivery {
+    func accept() -> Receipt { return Receipt() }
+    func cancel() {}
+}
+protocol Gauge {
+    func ratio() -> Double
+}
+"#;
+    let file = facts("Delivery.swift", source);
+    let contract = node(&file, "Delivery").id.clone();
+    let courier = node(&file, "Courier").id.clone();
+    let receipt = node(&file, "Receipt").id.clone();
+    let owned = |owner: &str| {
+        file.nodes
+            .iter()
+            .filter(|n| {
+                n.kind == "method"
+                    && file
+                        .edges
+                        .iter()
+                        .any(|e| e.relation == "contains" && e.source == owner && e.target == n.id)
+            })
+            .collect::<Vec<_>>()
+    };
+    let requirements = owned(&contract);
+    let implementations = owned(&courier);
+    for members in [&requirements, &implementations] {
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members
+                .iter()
+                .map(|n| n.label.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["accept", "cancel"])
+        );
+    }
+    assert!(requirements.iter().all(|n| n.binding_key.is_none()));
+    assert!(
+        requirements
+            .iter()
+            .all(|r| implementations.iter().all(|i| r.id != i.id))
+    );
+    let accept = requirements.iter().find(|n| n.label == "accept").unwrap();
+    let ratio = node(&file, "ratio");
+    let mut signature_refs = vec![];
+    for (member, label, line) in [(*accept, "Receipt", 4), (ratio, "Double", 12)] {
+        let evidence = member.metadata["type_references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["context"] == "return_type" && r["label"] == label)
+            .unwrap();
+        let start = evidence["start_byte"].as_u64().unwrap() as usize;
+        let end = evidence["end_byte"].as_u64().unwrap() as usize;
+        assert_eq!(&source[start..end], label);
+        assert_eq!(evidence["line"], line);
+        let reference = file
+            .references
+            .iter()
+            .find(|r| Some(r.id.as_str()) == evidence["reference_id"].as_str())
+            .unwrap();
+        assert_eq!(reference.source, member.id);
+        assert_eq!(reference.relation, "references");
+        assert_eq!(reference.line, line);
+        if label == "Receipt" {
+            assert_eq!(reference.candidate_keys, [key(node(&file, "Receipt"))]);
+        }
+        signature_refs.push(reference.clone());
+    }
+    assert!(!file.nodes.iter().any(|n| n.label == "Double"));
+    let ratio_id = ratio.id.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native(
+            "fixture",
+            compiled_context(vec![file]),
+            vec![],
+            Coverage::default(),
+        )
+        .unwrap();
+    let graph = store.snapshot().unwrap();
+    let local = &signature_refs[0];
+    let edges: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.source == local.source && e.relation == "references")
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].target, receipt);
+    assert_eq!(edges[0].line, Some(4));
+    assert_eq!(edges[0].metadata["reference_id"], local.id);
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| { e.source == courier && e.target == contract && e.relation == "implements" })
+    );
+    let external = store
+        .neighbors(
+            &ratio_id,
+            &QueryOptions {
+                direction: Direction::Outgoing,
+                relation: Some("references".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(external.edges.is_empty());
+    assert_eq!(external.unresolved.len(), 1);
+    let unresolved = &external.unresolved[0];
+    assert_eq!(
+        (
+            &unresolved.source,
+            unresolved.label.as_str(),
+            unresolved.file.as_str(),
+            unresolved.line
+        ),
+        (&ratio_id, "Double", "Delivery.swift", 12)
+    );
+    assert!(!unresolved.reason.is_empty());
+    assert!(!graph.nodes.iter().any(|n| n.label == "Double"));
+}
+
+#[test]
+fn java_enum_body_keeps_constructor_fields_methods_and_call_owner() {
+    use std::collections::BTreeSet;
+
+    let file = facts(
+        "Phase.java",
+        r#"package sample;
+enum Phase {
+    OPEN(2), CLOSED(0);
+    private final int budget;
+    Phase(int budget) { this.budget = budget; }
+    public int cost() { return budget; }
+    public int charge() { return cost(); }
+}
+final class Alternate { public int cost() { return 99; } }
+"#,
+    );
+    let phase = file
+        .nodes
+        .iter()
+        .find(|n| n.kind == "enum" && n.label == "Phase")
+        .unwrap();
+    let members: Vec<_> = file
+        .nodes
+        .iter()
+        .filter(|n| {
+            file.edges
+                .iter()
+                .any(|e| e.relation == "contains" && e.source == phase.id && e.target == n.id)
+        })
+        .collect();
+    assert_eq!(members.len(), 6);
+    assert_eq!(
+        members
+            .iter()
+            .map(|n| (n.label.as_str(), n.kind.as_str()))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            ("OPEN", "enum_case"),
+            ("CLOSED", "enum_case"),
+            ("budget", "field"),
+            ("Phase", "method"),
+            ("cost", "method"),
+            ("charge", "method")
+        ])
+    );
+    for member in &members {
+        let owners: Vec<_> = file
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains" && e.target == member.id)
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].source, phase.id);
+    }
+    let case_ids: BTreeSet<_> = members
+        .iter()
+        .filter(|n| n.kind == "enum_case")
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(
+        file.edges
+            .iter()
+            .filter(|e| e.source == phase.id && e.relation == "case_of")
+            .map(|e| e.target.clone())
+            .collect::<BTreeSet<_>>(),
+        case_ids
+    );
+    let cost = members.iter().find(|n| n.label == "cost").unwrap();
+    let charge = members.iter().find(|n| n.label == "charge").unwrap();
+    let reference = calls(&file, "cost")
+        .into_iter()
+        .find(|r| r.source == charge.id)
+        .unwrap();
+    assert_eq!(reference.candidate_keys, [key(cost)]);
+    assert_eq!(reference.line, 7);
+    let other_cost = file
+        .nodes
+        .iter()
+        .find(|n| n.label == "cost" && n.id != cost.id)
+        .unwrap();
+    assert_ne!(other_cost.binding_key, cost.binding_key);
+    let (cost_id, charge_id, reference_id) =
+        (cost.id.clone(), charge.id.clone(), reference.id.clone());
+    let graph = compiled_snapshot(vec![file]);
+    let edges: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.source == charge_id && e.relation == "calls")
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].target, cost_id);
+    assert_eq!(edges[0].file.as_deref(), Some("Phase.java"));
+    assert_eq!(edges[0].line, Some(7));
+    assert_eq!(edges[0].metadata["reference_id"], reference_id);
+}
+
+#[test]
+fn java_enum_overloads_stay_unresolved_without_hiding_unique_sibling_calls() {
+    use graf::model::{Direction, QueryOptions};
+
+    let file = facts(
+        "Phase.java",
+        r#"package sample;
+enum Phase {
+    OPEN;
+    int cost() { return 1; }
+    int cost(int units) { return units; }
+    int charge() { return cost(); }
+    int receipt() { return 3; }
+    int ordinary() { return receipt(); }
+}
+"#,
+    );
+    assert_eq!(
+        file.nodes
+            .iter()
+            .filter(|n| n.label == "cost" && n.kind == "method")
+            .count(),
+        2
+    );
+    let charge = node(&file, "charge").id.clone();
+    let ordinary = node(&file, "ordinary").id.clone();
+    let receipt = node(&file, "receipt").id.clone();
+    assert_eq!(calls(&file, "cost").len(), 1);
+    assert_eq!(calls(&file, "cost")[0].source, charge);
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native("fixture", vec![file], vec![], Coverage::default())
+        .unwrap();
+    let options = QueryOptions {
+        direction: Direction::Outgoing,
+        relation: Some("calls".into()),
+        ..Default::default()
+    };
+    let ambiguous = store.neighbors(&charge, &options).unwrap();
+    assert!(ambiguous.edges.is_empty());
+    assert_eq!(ambiguous.unresolved.len(), 1);
+    assert_eq!(
+        (
+            &ambiguous.unresolved[0].source,
+            ambiguous.unresolved[0].label.as_str(),
+            ambiguous.unresolved[0].line
+        ),
+        (&charge, "cost", 6)
+    );
+    let unique = store.neighbors(&ordinary, &options).unwrap();
+    assert_eq!(unique.edges.len(), 1);
+    assert_eq!(unique.edges[0].target, receipt);
+    assert!(unique.unresolved.is_empty());
+}
+
+#[test]
 fn extensions_paths_unicode_and_malformed_sources() {
     for ext in [
         "c", "h", "cc", "cpp", "cxx", "C", "hpp", "hh", "hxx", "H", "java", "cs", "kt", "kts",

@@ -546,6 +546,95 @@ fn updates_hash_content_remove_facts_and_restore_incoming_references() {
 }
 
 #[test]
+fn python_terminal_add_delete_rebinds_without_reparsing_unchanged_files() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::write(root.path().join("target.py"), "def target():\n    pass\n").unwrap();
+    fs::write(
+        root.path().join("consumer.py"),
+        "from target import target\ndef caller():\n    target()\n",
+    )
+    .unwrap();
+    let first = index::run(root.path(), &db).unwrap();
+    assert_eq!(first.parsed_files, 2);
+    assert_eq!(callees(&Store::open(&db).unwrap(), "caller").edges.len(), 1);
+
+    fs::write(root.path().join("added.py"), "def added():\n    pass\n").unwrap();
+    let added = index::run(root.path(), &db).unwrap();
+    assert_eq!((added.parsed_files, added.unchanged_files), (1, 2));
+    assert_eq!(callees(&Store::open(&db).unwrap(), "caller").edges.len(), 1);
+
+    fs::remove_file(root.path().join("added.py")).unwrap();
+    let deleted = index::run(root.path(), &db).unwrap();
+    assert_eq!((deleted.parsed_files, deleted.unchanged_files), (0, 2));
+    assert_eq!(callees(&Store::open(&db).unwrap(), "caller").edges.len(), 1);
+}
+
+#[test]
+fn python_terminal_target_deletion_and_restore_keep_consumer_facts() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let target = root.path().join("target.py");
+    fs::write(&target, "def target(): pass\n").unwrap();
+    fs::write(
+        root.path().join("consumer.py"),
+        "from target import target\ndef caller(): target()\n",
+    )
+    .unwrap();
+    index::run(root.path(), &db).unwrap();
+    let consumer_stamp = || {
+        Store::open_read_only(&db)
+            .unwrap()
+            .file_stamps()
+            .unwrap()
+            .into_iter()
+            .find(|stamp| stamp.path == "consumer.py")
+            .unwrap()
+            .hash
+    };
+    let original_stamp = consumer_stamp();
+    for present in [false, true, false, true] {
+        if present {
+            fs::write(&target, "def target(): pass\n").unwrap();
+        } else {
+            fs::remove_file(&target).unwrap();
+        }
+        assert!(
+            !index::check_update(root.path(), &db)
+                .unwrap()
+                .changed
+                .contains(&"consumer.py".into())
+        );
+        let update = index::run(root.path(), &db).unwrap();
+        assert_eq!(update.parsed_files, usize::from(present));
+        assert_eq!(update.unchanged_files, 1);
+        assert_eq!(consumer_stamp(), original_stamp);
+        let graph = callees(&Store::open_read_only(&db).unwrap(), "caller");
+        assert_eq!(graph.edges.len(), usize::from(present));
+        assert_eq!(graph.unresolved.len(), usize::from(!present));
+        assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 0);
+    }
+}
+
+#[test]
+fn python_star_import_keeps_context_invalidation_on_add() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::write(
+        root.path().join("consumer.py"),
+        "from target import *\ndef caller():\n    target()\n",
+    )
+    .unwrap();
+    let first = index::run(root.path(), &db).unwrap();
+    assert_eq!(first.parsed_files, 1);
+
+    fs::write(root.path().join("target.py"), "def target():\n    pass\n").unwrap();
+    let added = index::run(root.path(), &db).unwrap();
+    assert_eq!((added.parsed_files, added.unchanged_files), (2, 0));
+    assert_eq!(callees(&Store::open(&db).unwrap(), "caller").edges.len(), 1);
+}
+
+#[test]
 fn ignores_apply_without_git_and_database_files_are_excluded() {
     let root = tempdir().unwrap();
     let db = root.path().join("graph.db");
@@ -739,9 +828,8 @@ fn old_extractor_stamps_refresh_unchanged_and_oversized_files() {
         let stamps = store.file_stamps().unwrap();
         let normal = &stamps.iter().find(|s| s.path == "module.py").unwrap().hash;
         let oversized = &stamps.iter().find(|s| s.path == "large.py").unwrap().hash;
-        let revision = normal.strip_suffix(&content_hash).unwrap();
-        assert!(!revision.is_empty());
-        assert_eq!(oversized, &format!("{revision}oversized:4MiB"));
+        assert!(normal.ends_with(&content_hash));
+        assert_eq!(oversized, "python-v12:terminal-v2:oversized:4MiB");
         let unchanged = index::run(root.path(), &db).unwrap();
         assert_eq!(unchanged.generation, updated.generation);
         assert_eq!(unchanged.unchanged_files, 2);
@@ -854,4 +942,72 @@ fn unreadable_ignore_rules_preserve_generation_and_recover() {
         assert_eq!(after.parsed_files, 1);
         assert_eq!(Store::open(&db).unwrap().stats().unwrap().files, 1);
     }
+}
+
+#[test]
+fn failed_inventory_preserves_whole_graph_then_valid_shrink_keeps_unchanged_sources() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let active = root.path().join("active.py");
+    let provider = root.path().join("provider.py");
+    fs::write(&provider, "def retained():\n    pass\n").unwrap();
+    fs::write(
+        &active,
+        "from provider import retained\ndef old():\n    retained()\ndef removed_one():\n    pass\ndef removed_two():\n    pass\n",
+    )
+    .unwrap();
+    index::run(root.path(), &db).unwrap();
+    let before = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+    let retained: Vec<_> = before
+        .nodes
+        .iter()
+        .filter(|node| node.file == "provider.py")
+        .map(|node| serde_json::to_value(node).unwrap())
+        .collect();
+    assert!(!retained.is_empty());
+
+    fs::write(
+        &active,
+        "from provider import retained\ndef replacement():\n    retained()\n",
+    )
+    .unwrap();
+    let rules = root.path().join(".grafignore");
+    fs::write(&rules, [0xff]).unwrap();
+    assert!(index::run(root.path(), &db).is_err());
+    assert_eq!(
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+
+    fs::write(&rules, "").unwrap();
+    let report = index::run(root.path(), &db).unwrap();
+    assert_eq!((report.parsed_files, report.unchanged_files), (1, 1));
+    let store = Store::open_read_only(&db).unwrap();
+    let after = store.snapshot().unwrap();
+    assert_eq!(after.generation, before.generation + 1);
+    assert!(after.nodes.len() < before.nodes.len());
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .filter(|node| node.file == "provider.py")
+            .map(|node| serde_json::to_value(node).unwrap())
+            .collect::<Vec<_>>(),
+        retained
+    );
+    assert!(
+        after
+            .nodes
+            .iter()
+            .all(|node| !["old", "removed_one", "removed_two"].contains(&node.label.as_str()))
+    );
+    let graph = callees(&store, "replacement");
+    assert_eq!(graph.edges.len(), 1);
+    assert!(graph.nodes.iter().any(|node| node.label == "retained"));
+    drop(store);
+    let unchanged = index::run(root.path(), &db).unwrap();
+    assert_eq!(
+        (unchanged.parsed_files, unchanged.generation),
+        (0, after.generation)
+    );
 }

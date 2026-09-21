@@ -11,7 +11,7 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         _ => tree_sitter_javascript::LANGUAGE.into(),
     };
     let mut e = Extractor::new(path, source, hash, "javascript", module_path(path));
-    let Some(tree) = tree(language, source, &mut e.facts)? else {
+    let Some(tree) = javascript_tree(language, source, &mut e.facts)? else {
         return Ok(e.facts);
     };
     let root = tree.root_node();
@@ -28,7 +28,11 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
         type_bindings: HashMap::new(),
         type_references: vec![],
         component_references: HashSet::new(),
+        callback_arguments: HashSet::new(),
         member_calls: vec![],
+        callee_calls: HashMap::new(),
+        callee_declarations: HashMap::new(),
+        factory_returns: vec![],
         namespaces: HashMap::new(),
         receivers: HashMap::new(),
         classes: HashMap::new(),
@@ -44,6 +48,111 @@ pub(super) fn parse(path: &str, source: &str, hash: &str) -> Result<FileFacts> {
     js.aliases(root);
     js.comments(root);
     Ok(js.finish())
+}
+
+fn javascript_tree(
+    language: tree_sitter::Language,
+    source: &str,
+    facts: &mut FileFacts,
+) -> Result<Option<tree_sitter::Tree>> {
+    let parsed = tree(language.clone(), source, facts)?;
+    if parsed.is_some()
+        || source.len() > crate::parser::MAX_SOURCE_BYTES
+        || !matches!(
+            facts.path.rsplit('.').next(),
+            Some("ts" | "tsx" | "mts" | "cts")
+        )
+    {
+        return Ok(parsed);
+    }
+    // The bundled TypeScript grammar lacks variance modifiers. Recover only
+    // declaration type parameters, then require a completely clean reparse.
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language)?;
+    let Some(raw) = parser.parse(source, None) else {
+        return Ok(None);
+    };
+    let Some(normalized) = variance_source(raw.root_node(), source) else {
+        return Ok(None);
+    };
+    let diagnostics = facts.diagnostics.len();
+    let recovered = tree(language, &normalized, facts)?;
+    if recovered.is_some() {
+        facts.diagnostics.clear();
+    } else {
+        facts.diagnostics.truncate(diagnostics);
+    }
+    Ok(recovered)
+}
+
+fn variance_source(root: Syntax<'_>, source: &str) -> Option<String> {
+    let mut masked = source.as_bytes().to_vec();
+    let mut changed = false;
+    let mut pending = vec![(root, 0)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > 256 {
+            return None;
+        }
+        pending.extend(children(node).into_iter().map(|n| (n, depth + 1)));
+        if node.kind() != "type_parameters"
+            || !node.parent().is_some_and(|p| {
+                matches!(
+                    p.kind(),
+                    "interface_declaration"
+                        | "type_alias_declaration"
+                        | "class_declaration"
+                        | "abstract_class_declaration"
+                        | "class"
+                ) && p.child_by_field_name("type_parameters") == Some(node)
+            })
+        {
+            continue;
+        }
+        // Only commas owned by this parameter list split parameters. Commas
+        // inside constraints/defaults, strings and comments cannot start one.
+        let mut cursor = node.walk();
+        let items: Vec<_> = node.children(&mut cursor).collect();
+        for parameter in items.split(|n| matches!(n.kind(), "<" | "," | ">")) {
+            let mut leaves = vec![];
+            let mut stack: Vec<_> = parameter.iter().rev().map(|n| (*n, 0)).collect();
+            while let Some((n, depth)) = stack.pop() {
+                if depth > 256 {
+                    return None;
+                }
+                if n.kind() == "comment" {
+                    continue;
+                }
+                if n.child_count() == 0 {
+                    leaves.push(n);
+                    if leaves.len() == 3 {
+                        break;
+                    }
+                } else {
+                    let mut cursor = n.walk();
+                    let children: Vec<_> = n.children(&mut cursor).collect();
+                    stack.extend(children.into_iter().rev().map(|n| (n, depth + 1)));
+                }
+            }
+            let spelling = |i: usize| leaves.get(i).map(|n| &source[n.byte_range()]);
+            let count = match (spelling(0), spelling(1)) {
+                (Some("in"), Some("out")) => 2,
+                (Some("in" | "out"), _) => 1,
+                _ => continue,
+            };
+            if !leaves
+                .get(count)
+                .is_some_and(|n| matches!(n.kind(), "identifier" | "type_identifier"))
+            {
+                continue;
+            }
+            for modifier in &leaves[..count] {
+                masked[modifier.byte_range()].fill(b' ');
+                changed = true;
+            }
+        }
+    }
+    // Only ASCII modifier bytes change; all source offsets and line breaks stay.
+    changed.then(|| String::from_utf8(masked).unwrap())
 }
 // Identifier escapes denote the same lexical binding as their literal spelling.
 pub(super) fn identifier(raw: &str) -> String {
@@ -89,6 +198,10 @@ fn token(node: Syntax<'_>, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|n| !n.is_named() && n.kind() == kind)
+}
+fn optional_chain(node: Syntax<'_>) -> bool {
+    // JavaScript names this field; TypeScript optional calls use a bare token.
+    node.child_by_field_name("optional_chain").is_some() || token(node, "?.")
 }
 fn module_key(module: &str) -> String {
     module.strip_prefix("import:").map_or_else(
@@ -163,9 +276,17 @@ struct CjsExport {
     target: ExportTarget,
 }
 enum Receiver {
-    Written { scope: usize, parts: Vec<String> },
+    FactoryValue,
+    Written {
+        scope: usize,
+        parts: Vec<String>,
+    },
     Constructed(String),
-    This { class: usize, static_member: bool },
+    This {
+        class: usize,
+        static_member: bool,
+        property_written: bool,
+    },
 }
 struct ClassMembers {
     id: String,
@@ -173,6 +294,19 @@ struct ClassMembers {
     dynamic_members: bool,
     methods: HashMap<(bool, String), Option<String>>,
     fields: HashMap<String, Option<Vec<String>>>,
+}
+// This suffix denotes a value declaration, never a runtime call target.
+const DECLARED_CALLEE: &str = "#declared_callee";
+struct CalleeDeclaration {
+    node: usize,
+    key: String,
+    probe: String,
+    initializer: String,
+}
+struct FactoryReturn {
+    factory: usize,
+    returned: usize,
+    probe: Option<String>,
 }
 struct Javascript<'a> {
     e: Extractor<'a>,
@@ -186,12 +320,62 @@ struct Javascript<'a> {
     type_bindings: HashMap<(usize, String), Binding>,
     type_references: Vec<(usize, usize, Vec<String>)>,
     component_references: HashSet<String>,
+    callback_arguments: HashSet<String>,
     member_calls: Vec<(String, String, Vec<String>)>,
+    callee_calls: HashMap<String, String>,
+    callee_declarations: HashMap<String, CalleeDeclaration>,
+    factory_returns: Vec<FactoryReturn>,
     namespaces: HashMap<usize, (String, HashSet<String>)>,
     receivers: HashMap<String, Receiver>,
     classes: HashMap<usize, ClassMembers>,
 }
 impl Javascript<'_> {
+    fn callable_sequence(mut node: Syntax<'_>) -> bool {
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "statement_block"
+                | "expression_statement"
+                | "return_statement"
+                | "lexical_declaration"
+                | "variable_declaration" => {}
+                "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition" => {
+                    return parent.child_by_field_name("body") == Some(node);
+                }
+                _ => return false,
+            }
+            node = parent;
+        }
+        false
+    }
+    fn declare_callable(&mut self, node: Syntax<'_>, scope: usize) {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier")
+            && node
+                .child_by_field_name("value")
+                .is_some_and(|n| n.kind() == "identifier")
+        {
+            self.e.declare_callable_local(scope, self.e.text(name));
+        }
+    }
+    fn assign_callable(&mut self, node: Syntax<'_>, scope: usize) {
+        let declaration = node.kind() == "variable_declarator";
+        if let Some(name) = node
+            .child_by_field_name(if declaration { "name" } else { "left" })
+            .filter(|n| n.kind() == "identifier")
+        {
+            let rhs = node
+                .child_by_field_name(if declaration { "value" } else { "right" })
+                .filter(|n| n.kind() == "identifier" && Self::callable_sequence(node))
+                .map(|n| self.e.text(n));
+            self.e.assign_callable_local(scope, self.e.text(name), rhs);
+        }
+    }
     fn receiver(&mut self, scope: usize, name: &str, at: usize, evidence: Receiver) {
         let marker = format!("javascript:receiver:{}:{scope}:{at}", self.e.facts.path);
         self.receivers.insert(marker.clone(), evidence);
@@ -246,6 +430,90 @@ impl Javascript<'_> {
             return false;
         };
         self.receiver(scope, self.e.text(name), name.start_byte(), evidence);
+        true
+    }
+    fn factory_binding(&mut self, node: Syntax<'_>, scope: usize) -> bool {
+        let Some(name) = node.child_by_field_name("name") else {
+            return false;
+        };
+        let Some(value) = node.child_by_field_name("value") else {
+            return false;
+        };
+        if name.kind() != "identifier"
+            || !node
+                .parent()
+                .is_some_and(|p| p.kind() == "lexical_declaration" && token(p, "const"))
+            || value.kind() != "call_expression"
+            || optional_chain(value)
+        {
+            return false;
+        }
+        let Some(mut target) = value.child_by_field_name("function") else {
+            return false;
+        };
+        // Only ordinary named factories. Return proofs are joined separately;
+        // computed/optional selection and call chains remain unsupported.
+        while target.kind() == "member_expression" {
+            if optional_chain(target)
+                || !target
+                    .child_by_field_name("property")
+                    .is_some_and(|n| n.kind() == "property_identifier")
+            {
+                return false;
+            }
+            let Some(object) = target.child_by_field_name("object") else {
+                return false;
+            };
+            target = object;
+        }
+        if target.kind() != "identifier" {
+            return false;
+        }
+        // Keep explicit receiver annotations available for existing member
+        // navigation; the extra evidence concerns only this const binding.
+        if !self.typed_binding(name, node.child_by_field_name("type"), None, scope, scope) {
+            self.receiver(
+                scope,
+                self.e.text(name),
+                name.start_byte(),
+                Receiver::FactoryValue,
+            );
+        }
+        let key = format!("{}{DECLARED_CALLEE}", self.key(scope, self.e.text(name)));
+        let exact_key = self.exact_key(&key);
+        let index = self.e.facts.nodes.len();
+        self.e
+            .define(node, scope, self.e.text(name), "constant", Some(key), false);
+        let probe = format!(
+            "call:{}:{}-{}",
+            self.e.scopes[scope].owner,
+            name.start_byte(),
+            name.end_byte()
+        );
+        self.e.call(
+            name,
+            scope,
+            name,
+            Some(vec![self.e.text(name).into(), DECLARED_CALLEE.into()]),
+        );
+        self.callee_declarations.insert(
+            format!(
+                "javascript:receiver:{}:{scope}:{}",
+                self.e.facts.path,
+                name.start_byte()
+            ),
+            CalleeDeclaration {
+                node: index,
+                key: exact_key,
+                probe,
+                initializer: format!(
+                    "call:{}:{}-{}",
+                    self.e.scopes[scope].owner,
+                    value.start_byte(),
+                    value.end_byte()
+                ),
+            },
+        );
         true
     }
     fn class_fields(&mut self, class: usize, body: Syntax<'_>) {
@@ -1218,10 +1486,32 @@ impl Javascript<'_> {
             .iter()
             .map(|r| (r.id.clone(), r.candidate_keys.clone()))
             .collect();
+        let valid_callees: HashMap<_, _> = self
+            .callee_declarations
+            .iter()
+            .filter(|(marker, declaration)| {
+                probes
+                    .get(&declaration.probe)
+                    .is_some_and(|keys| keys == &[format!("{marker}:{DECLARED_CALLEE}")])
+            })
+            .map(|(marker, declaration)| (marker.clone(), declaration))
+            .collect();
+        for (marker, declaration) in &self.callee_declarations {
+            let node = &mut facts.nodes[declaration.node];
+            if valid_callees.contains_key(marker) {
+                node.metadata["declared_callee_binding"] = true.into();
+                node.metadata["factory_initializer"] = declaration.initializer.clone().into();
+            } else {
+                node.binding_key = None;
+            }
+        }
         let remove: HashSet<_> = self
             .member_calls
             .iter()
             .map(|(_, probe, _)| probe.clone())
+            .chain(self.callee_calls.values().cloned())
+            .chain(self.callee_declarations.values().map(|d| d.probe.clone()))
+            .chain(self.factory_returns.iter().filter_map(|r| r.probe.clone()))
             .collect();
         let members: HashMap<_, _> = self
             .member_calls
@@ -1248,6 +1538,27 @@ impl Javascript<'_> {
         facts.references.retain(|r| !remove.contains(&r.id));
         let mut declarations = vec![];
         for reference in &mut facts.references {
+            if let Some(probe) = self.callee_calls.get(&reference.id) {
+                let keys: Vec<_> = probes
+                    .get(probe)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|key| key.rsplit_once(':'))
+                    .filter(|(_, member)| *member == DECLARED_CALLEE)
+                    .filter_map(|(marker, _)| valid_callees.get(marker))
+                    .map(|declaration| declaration.key.clone())
+                    .collect();
+                if !keys.is_empty() {
+                    // Clone the written callsite, not the internal binding probe.
+                    reference.candidate_keys.clear();
+                    let mut declaration = reference.clone();
+                    declaration.id.push_str(":declared_callee");
+                    declaration.relation = "declared_callee".into();
+                    declaration.candidate_keys = keys;
+                    declaration.reason = "written immutable callee binding; factory result and runtime dispatch are unresolved".into();
+                    declarations.push(declaration);
+                }
+            }
             let mut replaced = false;
             let mut declared_keys = vec![];
             reference.candidate_keys = reference
@@ -1283,9 +1594,10 @@ impl Javascript<'_> {
                         Receiver::This {
                             class,
                             static_member,
+                            property_written,
                         } if valid_classes.contains(&self.classes[class].id) => {
                             if let Some((field, target)) = member.split_once('.') {
-                                if *static_member || target.contains('.') {
+                                if *property_written || *static_member || target.contains('.') {
                                     return vec![];
                                 }
                                 field_types
@@ -1295,13 +1607,21 @@ impl Javascript<'_> {
                                     .map(|key| format!("{key}#instance.{target}"))
                                     .collect()
                             } else {
-                                self.classes[class]
+                                let keys: Vec<_> = self.classes[class]
                                     .methods
                                     .get(&(*static_member, identifier(member)))
                                     .into_iter()
                                     .flatten()
                                     .cloned()
-                                    .collect()
+                                    .collect();
+                                if *property_written {
+                                    if reference.relation == "calls" {
+                                        declared_keys.extend(keys);
+                                    }
+                                    vec![]
+                                } else {
+                                    keys
+                                }
                             }
                         }
                         _ => vec![],
@@ -1318,7 +1638,7 @@ impl Javascript<'_> {
                 declaration.relation = "declared_member".into();
                 declaration.candidate_keys = declared_keys;
                 declaration.reason =
-                    "written interface member; runtime dispatch is unresolved".into();
+                    "written receiver member declaration; runtime dispatch is unresolved".into();
                 declarations.push(declaration);
             }
         }
@@ -1461,10 +1781,76 @@ impl Javascript<'_> {
         if forward && !self.cjs_forward.is_empty() {
             facts.nodes[0].metadata["commonjs_reexports"] = serde_json::json!(self.cjs_forward);
         }
+        for returned in &self.factory_returns {
+            let factory = &facts.nodes[returned.factory];
+            let body = &facts.nodes[returned.returned];
+            if factory.binding_key.is_none()
+                || body.binding_key.is_none()
+                || returned.probe.as_ref().is_some_and(|probe| {
+                    probes.get(probe).is_none_or(|keys| {
+                        keys.as_slice() != [body.binding_key.as_ref().unwrap().clone()]
+                    })
+                })
+            {
+                continue;
+            }
+            let key = format!(
+                "javascript:local:{}:#factory-return:{}",
+                facts.path, body.id
+            );
+            let proof = serde_json::json!({"target": body.id, "key": key});
+            let body = &mut facts.nodes[returned.returned];
+            if !body.metadata["binding_aliases"].is_array() {
+                body.metadata["binding_aliases"] = serde_json::json!([]);
+            }
+            body.metadata["binding_aliases"]
+                .as_array_mut()
+                .unwrap()
+                .push(key.into());
+            facts.nodes[returned.factory].metadata["factory_return"] = proof;
+        }
+        if !self.callback_arguments.is_empty() {
+            // The shared deferred resolver has now applied all lexical writes and
+            // shadows. Only a source-proved function value gets a target; imports
+            // and factory results do not establish callability here.
+            let local = format!("javascript:local:{}:", facts.path);
+            let exact = format!("javascript:file:{}:", facts.path);
+            let functions: HashSet<_> = facts
+                .nodes
+                .iter()
+                .filter(|n| n.kind == "function" && n.binding_key.is_some())
+                .flat_map(|n| {
+                    n.binding_key.as_deref().into_iter().chain(
+                        n.metadata["binding_aliases"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str),
+                    )
+                })
+                .filter(|key| key.starts_with(&local) || key.starts_with(&exact))
+                .collect();
+            for reference in &mut facts.references {
+                if self.callback_arguments.contains(&reference.id) {
+                    reference.id = reference.id.replacen("call:", "references:", 1);
+                    reference.relation = "references".into();
+                    reference
+                        .candidate_keys
+                        .retain(|key| functions.contains(key.as_str()));
+                    reference.reason = if reference.candidate_keys.is_empty() {
+                        "callback argument; function binding is unproved, shadowed, or reassigned; invocation is not implied"
+                    } else {
+                        "callback argument; written function value, invocation is not implied"
+                    }
+                    .into();
+                }
+            }
+        }
         facts
     }
     fn pattern(&mut self, node: Syntax<'_>, scope: usize, write: bool) {
         match node.kind() {
+            "this" if write && self.write_this_property(scope) => {}
             "identifier" | "shorthand_property_identifier_pattern" | "this" => {
                 if write {
                     if matches!(
@@ -1518,6 +1904,28 @@ impl Javascript<'_> {
             _ => {}
         }
     }
+    fn write_this_property(&mut self, scope: usize) -> bool {
+        let mut current = Some(scope);
+        while let Some(i) = current {
+            if let Some(binding) = self.e.scopes[i].bindings.get("this") {
+                if let Binding::Namespace { prefixes, .. } = binding
+                    && prefixes.len() == 1
+                    && let Some(marker) = prefixes[0].strip_suffix(':')
+                    && let Some(Receiver::This {
+                        property_written, ..
+                    }) = self.receivers.get_mut(marker)
+                {
+                    // A property write cannot replace lexical `this`. Retain its
+                    // declaration owner, but stop claiming runtime call targets.
+                    *property_written = true;
+                    return true;
+                }
+                return false;
+            }
+            current = self.e.scopes[i].parent;
+        }
+        false
+    }
     fn dotted(&self, node: Syntax<'_>) -> Option<Vec<String>> {
         match node.kind() {
             "identifier" | "this" => Some(vec![self.e.text(node).into()]),
@@ -1540,6 +1948,22 @@ impl Javascript<'_> {
         target: Syntax<'_>,
         parts: Option<Vec<String>>,
     ) {
+        if let Some(parts) = parts.as_ref().filter(|p| p.len() == 1)
+            && matches!(node.kind(), "call_expression" | "new_expression")
+            && !optional_chain(node)
+        {
+            let owner = &self.e.scopes[scope].owner;
+            self.callee_calls.insert(
+                format!("call:{owner}:{}-{}", node.start_byte(), node.end_byte()),
+                format!("call:{owner}:{}-{}", target.start_byte(), target.end_byte()),
+            );
+            self.e.call(
+                target,
+                scope,
+                target,
+                Some(vec![parts[0].clone(), DECLARED_CALLEE.into()]),
+            );
+        }
         if let Some(parts) = parts.as_ref().filter(|p| p.len() > 1) {
             // Named imported namespaces still use symbol bindings. Probe their head
             // through the shared deferred shadow/write checks before adding members.
@@ -1556,7 +1980,85 @@ impl Javascript<'_> {
                 Some(parts[..parts.len() - 1].to_vec()),
             );
         }
-        self.e.call(node, scope, target, parts);
+        if node.kind() == "call_expression"
+            && target.kind() == "identifier"
+            && Self::callable_sequence(node)
+            && !optional_chain(node)
+            && node
+                .child_by_field_name("arguments")
+                .is_some_and(|args| children(args).iter().all(|n| n.kind() == "comment"))
+        {
+            self.e.call_with_callable_local(node, scope, target, parts);
+        } else {
+            self.e.call(node, scope, target, parts);
+        }
+    }
+    fn single_factory_return<'a>(&self, node: Syntax<'a>) -> Option<(Syntax<'a>, Syntax<'a>)> {
+        if !matches!(node.kind(), "function_declaration" | "function_expression")
+            || token(node, "async")
+        {
+            return None;
+        }
+        let body = node.child_by_field_name("body")?;
+        let statements = children(body);
+        let last = *statements.iter().rfind(|n| n.kind() != "comment")?;
+        if last.kind() != "return_statement" {
+            return None;
+        }
+        // Nested callable/class bodies have their own returns. Any other return,
+        // including a conditional one, invalidates this deliberately small proof.
+        let mut pending = statements.clone();
+        while let Some(statement) = pending.pop() {
+            if statement.kind() == "with_statement" {
+                return None;
+            }
+            if matches!(
+                statement.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "generator_function_declaration"
+                    | "generator_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class"
+            ) {
+                continue;
+            }
+            if statement.kind() == "return_statement" {
+                if statement != last {
+                    return None;
+                }
+            } else {
+                pending.extend(children(statement));
+            }
+        }
+        let mut value = last.named_child(0)?;
+        while matches!(
+            value.kind(),
+            "as_expression" | "parenthesized_expression" | "satisfies_expression"
+        ) {
+            value = value.named_child(0)?;
+        }
+        let target = if value.kind() == "identifier" {
+            let mut targets = statements.iter().filter(|n| {
+                n.kind() == "function_declaration"
+                    && !token(**n, "async")
+                    && n.child_by_field_name("name").is_some_and(|name| {
+                        identifier(self.e.text(name)) == identifier(self.e.text(value))
+                    })
+            });
+            let target = *targets.next()?;
+            if targets.next().is_some() {
+                return None;
+            }
+            target
+        } else if value.kind() == "function_expression" && !token(value, "async") {
+            value
+        } else {
+            return None;
+        };
+        Some((value, target))
     }
     fn function(&mut self, node: Syntax<'_>, scope: usize, assigned: Option<&str>) {
         let name_node = node.child_by_field_name("name");
@@ -1614,6 +2116,7 @@ impl Javascript<'_> {
                 self.visit(n, scope);
             }
         }
+        let factory = self.e.facts.nodes.len();
         let child = self.e.define(
             node,
             scope,
@@ -1640,6 +2143,7 @@ impl Javascript<'_> {
                 Receiver::This {
                     class: scope,
                     static_member,
+                    property_written: false,
                 },
             );
         } else if node.kind() != "arrow_function" {
@@ -1670,7 +2174,35 @@ impl Javascript<'_> {
             }
         }
         if let Some(body) = node.child_by_field_name("body") {
+            let body_scope = self.e.scopes.len();
             self.visit(body, child);
+            if let Some((value, target)) = self.single_factory_return(node)
+                && let Some(returned) = self.e.facts.nodes.iter().position(|n| {
+                    n.kind == "function" && n.metadata["start_byte"] == target.start_byte()
+                })
+            {
+                let probe = if value.kind() == "identifier" {
+                    self.e.call(
+                        value,
+                        body_scope,
+                        value,
+                        Some(vec![self.e.text(value).into()]),
+                    );
+                    Some(format!(
+                        "call:{}:{}-{}",
+                        self.e.scopes[body_scope].owner,
+                        value.start_byte(),
+                        value.end_byte()
+                    ))
+                } else {
+                    None
+                };
+                self.factory_returns.push(FactoryReturn {
+                    factory,
+                    returned,
+                    probe,
+                });
+            }
         }
     }
     fn import(&mut self, node: Syntax<'_>, scope: usize) {
@@ -2082,6 +2614,7 @@ impl Javascript<'_> {
                     function_scope = self.e.scopes[function_scope].parent.unwrap_or(0);
                 }
                 for var in children(node) {
+                    self.declare_callable(var, function_scope);
                     if let (Some(name), Some(value)) = (
                         var.child_by_field_name("name"),
                         var.child_by_field_name("value"),
@@ -2104,10 +2637,12 @@ impl Javascript<'_> {
                     if let Some(value) = var.child_by_field_name("value") {
                         self.visit(value, scope);
                     }
+                    self.assign_callable(var, scope);
                 }
                 return;
             }
             "variable_declarator" => {
+                self.declare_callable(node, scope);
                 if let (Some(name), Some(value)) = (
                     node.child_by_field_name("name"),
                     node.child_by_field_name("value"),
@@ -2127,13 +2662,15 @@ impl Javascript<'_> {
                         self.function(value, scope, Some(self.e.text(name)));
                         return;
                     }
-                    if !self.typed_binding(
-                        name,
-                        node.child_by_field_name("type"),
-                        node.child_by_field_name("value"),
-                        scope,
-                        scope,
-                    ) {
+                    if !self.factory_binding(node, scope)
+                        && !self.typed_binding(
+                            name,
+                            node.child_by_field_name("type"),
+                            node.child_by_field_name("value"),
+                            scope,
+                            scope,
+                        )
+                    {
                         self.pattern(name, scope, false);
                     }
                 }
@@ -2152,6 +2689,27 @@ impl Javascript<'_> {
                 }
             }
             "call_expression" | "new_expression" => {
+                if let Some(arguments) = node.child_by_field_name("arguments") {
+                    for argument in children(arguments)
+                        .into_iter()
+                        .filter(|n| n.kind() == "identifier")
+                    {
+                        self.callback_arguments.insert(format!(
+                            "call:{}:{}-{}",
+                            self.e.scopes[scope].owner,
+                            argument.start_byte(),
+                            argument.end_byte()
+                        ));
+                        // Reuse the final lexical/write resolver without treating
+                        // the argument as an invocation in the returned facts.
+                        self.e.call(
+                            argument,
+                            scope,
+                            argument,
+                            Some(vec![self.e.text(argument).into()]),
+                        );
+                    }
+                }
                 if let Some(target) = node
                     .child_by_field_name("function")
                     .or_else(|| node.child_by_field_name("constructor"))
@@ -2284,6 +2842,9 @@ impl Javascript<'_> {
         }
         for n in children(node) {
             self.visit(n, scope);
+        }
+        if matches!(node.kind(), "variable_declarator" | "assignment_expression") {
+            self.assign_callable(node, scope);
         }
     }
 }

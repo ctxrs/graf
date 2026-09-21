@@ -1297,12 +1297,22 @@ fn real_hook_refresh_handles_executable_metacharacters_and_preserves_staging() {
     fs::copy(env!("CARGO_BIN_EXE_graf"), &exe).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = s.command(&exe);
-    success(
-        command
-            .args(["--json", "hook", "install"])
-            .output()
-            .unwrap(),
-    );
+    command.args(["--json", "hook", "install"]);
+    // A concurrent test's fork may briefly retain the copy's writable fd
+    // until exec closes it. Retry only that pre-execution Unix error.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let output = loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => break result.unwrap(),
+        }
+    };
+    success(output);
     write(
         &s.project.join("sample.py"),
         "def new_symbol():\n    pass\n",

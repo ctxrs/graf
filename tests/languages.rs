@@ -1373,3 +1373,254 @@ fn rust_restricted_impl_headers_do_not_erase_type_constraints() {
         );
     }
 }
+
+#[test]
+fn go_interface_requirements_keep_direct_members_and_embeds() {
+    use graf::{model::Coverage, store::Store};
+    use std::collections::BTreeSet;
+
+    let file = facts(
+        "poll/api.go",
+        "package poll\ntype Packet struct {}\ntype Poller interface { Poll() Packet; Reset() }\ntype SealedPoller interface { Poller; Seal() }\ntype Numeric interface { ~int | ~int64 }\n",
+    );
+    let poller = node(&file, "Poller").id.clone();
+    let sealed = node(&file, "SealedPoller").id.clone();
+    let numeric = node(&file, "Numeric").id.clone();
+    for (owner, expected) in [(&poller, vec!["Poll", "Reset"]), (&sealed, vec!["Seal"])] {
+        let members: Vec<_> =
+            file.nodes
+                .iter()
+                .filter(|n| {
+                    n.kind == "method"
+                        && file.edges.iter().any(|e| {
+                            e.relation == "contains" && &e.source == owner && e.target == n.id
+                        })
+                })
+                .collect();
+        assert_eq!(members.len(), expected.len());
+        assert_eq!(
+            members
+                .iter()
+                .map(|n| n.label.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(members.iter().all(|n| n.binding_key.is_none()));
+    }
+    assert!(file.references.iter().any(|r| {
+        r.source == node(&file, "Poll").id
+            && r.relation == "references_type"
+            && r.candidate_keys == [key(node(&file, "Packet"))]
+    }));
+    assert!(
+        !file
+            .references
+            .iter()
+            .any(|r| r.source == numeric && r.relation == "embeds")
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native("fixture", vec![file], vec![], Coverage::default())
+        .unwrap();
+    let graph = store.snapshot().unwrap();
+    let embeds: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.relation == "embeds")
+        .collect();
+    assert_eq!(embeds.len(), 1);
+    assert_eq!((&embeds[0].source, &embeds[0].target), (&sealed, &poller));
+}
+
+#[test]
+fn go_receiver_methods_browse_incoming_types_without_duplicate_ownership() {
+    use graf::{
+        model::{Coverage, Direction, QueryOptions},
+        store::Store,
+    };
+    use std::collections::BTreeSet;
+
+    let types = facts(
+        "poll/types.go",
+        "package poll\ntype Packet struct {}\ntype Poller interface { Poll() Packet }\ntype Device struct {}\ntype Other struct {}\n",
+    );
+    let methods = facts(
+        "poll/methods.go",
+        r#"package poll
+func (value Device) Poll() Packet { return Packet{} }
+func (value *Device) Reset() {}
+func (value Other) Poll() Packet { return Packet{} }
+func invoke(value Poller) Packet { return value.Poll() }
+func shadow(value Poller) { { value := struct { Poll func() Packet }{}; value.Poll() } }
+func changed(value Poller, other Poller) { value = other; value.Poll() }
+func unknown(value interface { Poll() Packet }) { value.Poll() }
+"#,
+    );
+    let device = node(&types, "Device").id.clone();
+    let contract = node(&types, "Poller").id.clone();
+    let requirement = node(&types, "Poll").id.clone();
+    let method_ids: BTreeSet<_> = ["go:poll:poll:Device.Poll", "go:poll:poll:Device.Reset"]
+        .into_iter()
+        .map(|binding| {
+            methods
+                .nodes
+                .iter()
+                .find(|n| n.binding_key.as_deref() == Some(binding))
+                .unwrap()
+                .id
+                .clone()
+        })
+        .collect();
+    assert!(!method_ids.contains(&requirement));
+    assert!(node(&types, "Poll").binding_key.is_none());
+    assert!(
+        types.edges.iter().any(|e| {
+            e.relation == "contains" && e.source == contract && e.target == requirement
+        })
+    );
+    let file_owner = methods.nodes[0].id.clone();
+    for method in &method_ids {
+        let owners: Vec<_> = methods
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains" && &e.target == method)
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].source, file_owner);
+        assert!(methods.references.iter().any(|r| {
+            &r.source == method
+                && r.relation == "receiver_type"
+                && r.candidate_keys == [key(node(&types, "Device"))]
+        }));
+    }
+    let invoke = node(&methods, "invoke").id.clone();
+    let negatives: Vec<_> = ["shadow", "changed", "unknown"]
+        .into_iter()
+        .map(|name| node(&methods, name).id.clone())
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&directory.path().join("graph.db")).unwrap();
+    store
+        .apply_native("fixture", vec![types, methods], vec![], Coverage::default())
+        .unwrap();
+    let incoming = QueryOptions {
+        direction: Direction::Incoming,
+        relation: Some("receiver_type".into()),
+        ..Default::default()
+    };
+    let browse = store.neighbors(&device, &incoming).unwrap();
+    assert!(!browse.truncated);
+    assert_eq!(browse.edges.len(), method_ids.len());
+    assert_eq!(
+        browse
+            .edges
+            .iter()
+            .map(|e| e.source.clone())
+            .collect::<BTreeSet<_>>(),
+        method_ids
+    );
+    assert!(
+        browse
+            .edges
+            .iter()
+            .all(|e| e.target == device && e.relation == "receiver_type")
+    );
+    let graph = store.snapshot().unwrap();
+    for method in &method_ids {
+        let owners: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains" && &e.target == method)
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].source, file_owner);
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.source == device && &e.target == method)
+        );
+    }
+    let navigation: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| {
+            e.source == invoke && matches!(e.relation.as_str(), "calls" | "declared_member")
+        })
+        .collect();
+    assert_eq!(navigation.len(), 1);
+    assert_eq!(navigation[0].relation, "declared_member");
+    assert_eq!(navigation[0].target, requirement);
+    for source in std::iter::once(&invoke).chain(negatives.iter()) {
+        let unresolved = store
+            .neighbors(
+                source,
+                &QueryOptions {
+                    direction: Direction::Outgoing,
+                    relation: Some("calls".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(unresolved.edges.is_empty());
+        assert!(
+            unresolved
+                .unresolved
+                .iter()
+                .any(|r| &r.source == source && r.label == "value.Poll")
+        );
+    }
+    assert!(!graph.edges.iter().any(|e| negatives.contains(&e.source)
+        && matches!(e.relation.as_str(), "calls" | "declared_member")));
+
+    // A second receiver declaration removes the browsing link; lexical owners survive.
+    let duplicate = facts("poll/duplicate.go", "package poll\ntype Device struct {}\n");
+    let duplicate_id = node(&duplicate, "Device").id.clone();
+    store
+        .apply_native("fixture", vec![duplicate], vec![], Coverage::default())
+        .unwrap();
+    for receiver in [&device, &duplicate_id] {
+        assert!(
+            store
+                .neighbors(receiver, &incoming)
+                .unwrap()
+                .edges
+                .is_empty()
+        );
+    }
+    for method in &method_ids {
+        let unresolved = store
+            .neighbors(
+                method,
+                &QueryOptions {
+                    direction: Direction::Outgoing,
+                    relation: Some("receiver_type".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(unresolved.unresolved.len(), 1);
+        assert!(unresolved.edges.is_empty());
+        assert!(unresolved.unresolved[0].reason.contains("ambiguous"));
+    }
+    store
+        .apply_native(
+            "fixture",
+            vec![],
+            vec!["poll/duplicate.go".into()],
+            Coverage::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .neighbors(&device, &incoming)
+            .unwrap()
+            .edges
+            .iter()
+            .map(|e| e.source.clone())
+            .collect::<BTreeSet<_>>(),
+        method_ids
+    );
+}
