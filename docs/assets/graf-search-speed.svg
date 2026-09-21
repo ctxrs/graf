@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">Search speed</title>
+  <desc id="desc">Graf is forty times faster than Graphify in the measured search comparison.</desc>
+  <rect width="1200" height="320" fill="#070b0a"/>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+    <text x="48" y="68" fill="#f2f7f4" font-size="30" font-weight="700">Search speed</text>
+    <text x="962" y="66" fill="#93a49b" font-size="18">higher is faster</text>
+    <text x="48" y="150" fill="#f2f7f4" font-size="24" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">graf</text>
+    <text x="48" y="238" fill="#f2f7f4" font-size="24">Graphify</text>
+    <rect x="250" y="132" width="760" height="24" rx="12" fill="#18201d"/>
+    <rect x="250" y="220" width="760" height="24" rx="12" fill="#18201d"/>
+    <rect x="250" y="132" width="760" height="24" rx="12" fill="#ff7a45"/>
+    <rect x="250" y="220" width="19" height="24" rx="9" fill="#80aaff"/>
+    <text x="1040" y="158" fill="#ff7a45" font-size="34" font-weight="700">40×</text>
+    <text x="1040" y="244" fill="#80aaff" font-size="28" font-weight="700">1×</text>
+  </g>
+</svg>
