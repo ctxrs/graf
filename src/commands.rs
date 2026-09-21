@@ -94,6 +94,14 @@ pub struct AnalysisArgs {
     /// Community detection backend. Leiden uses a deterministic seeded native implementation.
     #[arg(long, value_enum, default_value_t = analysis::CommunityAlgorithm::default())]
     pub community_algorithm: analysis::CommunityAlgorithm,
+    /// Leiden starts: 1 stops on repeated membership; 4 uses four fixed allocations
+    /// within the shared 100-iteration CLI budget.
+    ///
+    /// Four can cost more and does not guarantee better semantic communities.
+    /// A positive initial graph uses the whole budget, leaving no size/cohesion
+    /// retries; unmet soft targets are reported in unsatisfied_community_constraints.
+    #[arg(long, default_value_t = 1, value_parser = community_starts)]
+    pub community_starts: u32,
     /// Reproducible Leiden random seed.
     #[arg(long, default_value_t = 42)]
     pub community_seed: u64,
@@ -115,6 +123,14 @@ pub struct AnalysisArgs {
     /// Include file/container/builtin noise in hub ranks and community labels.
     #[arg(long)]
     pub include_noise: bool,
+}
+
+fn community_starts(text: &str) -> Result<u32, String> {
+    match text {
+        "1" => Ok(1),
+        "4" => Ok(4),
+        _ => Err("community starts must be 1 or 4".into()),
+    }
 }
 
 fn positive_float(text: &str) -> Result<f64, String> {
@@ -151,6 +167,7 @@ impl AnalysisArgs {
     fn options(&self) -> AnalysisOptions {
         AnalysisOptions {
             community_algorithm: self.community_algorithm,
+            community_starts: self.community_starts,
             community_seed: self.community_seed,
             community_local_max_passes: self.community_local_max_passes,
             resolution: self.resolution,
@@ -1210,6 +1227,7 @@ fn diagnose(args: &DiagnoseArgs, db: Option<&Path>, json_output: bool) -> Result
         snapshot: args.snapshot.clone(),
         analysis: AnalysisArgs {
             community_algorithm: analysis::CommunityAlgorithm::default(),
+            community_starts: 1,
             community_seed: 42,
             community_local_max_passes: 100,
             resolution: 1.0,

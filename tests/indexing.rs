@@ -829,7 +829,7 @@ fn old_extractor_stamps_refresh_unchanged_and_oversized_files() {
         let normal = &stamps.iter().find(|s| s.path == "module.py").unwrap().hash;
         let oversized = &stamps.iter().find(|s| s.path == "large.py").unwrap().hash;
         assert!(normal.ends_with(&content_hash));
-        assert_eq!(oversized, "python-v11:terminal-v2:oversized:4MiB");
+        assert_eq!(oversized, "python-v12:terminal-v2:oversized:4MiB");
         let unchanged = index::run(root.path(), &db).unwrap();
         assert_eq!(unchanged.generation, updated.generation);
         assert_eq!(unchanged.unchanged_files, 2);

@@ -80,6 +80,21 @@ struct PendingReference {
     context: &'static str,
 }
 
+struct CallableWrite {
+    start: usize,
+    end: usize,
+    name: String,
+    value: Option<String>,
+}
+
+#[derive(Default)]
+struct CallableFlow {
+    writes: Vec<CallableWrite>,
+    calls: HashSet<usize>,
+    blocked: HashSet<String>,
+    opaque: bool,
+}
+
 struct Extractor<'a> {
     source: &'a str,
     facts: FileFacts,
@@ -90,6 +105,7 @@ struct Extractor<'a> {
     stars: Vec<(String, usize, u32)>,
     all: Value,
     receiver_writes: BTreeMap<usize, BTreeSet<String>>,
+    callable_flows: HashMap<usize, CallableFlow>,
 }
 
 /// Extract static Python facts without executing source or guessing dynamic targets.
@@ -229,6 +245,7 @@ pub fn parse_python_with_source_root(
         stars: vec![],
         all: static_python_all(root, source),
         receiver_writes: BTreeMap::new(),
+        callable_flows: HashMap::new(),
         scopes: vec![Scope {
             parent: None,
             kind: ScopeKind::Module,
@@ -1076,6 +1093,259 @@ impl Extractor<'_> {
                 self.visit(n, scope, conditional);
             }
         }
+        if !class {
+            self.collect_callable_flow(node, body, child);
+        }
+    }
+
+    // Separate from public bindings: only same-frame, straight-line value
+    // reads can use assignment history. Nothing here becomes an export alias.
+    fn collect_callable_flow(&mut self, definition: Syntax<'_>, body: Syntax<'_>, scope: usize) {
+        let mut flow = CallableFlow::default();
+        let mut plain = HashSet::new();
+        if let Some(parameters) = definition.child_by_field_name("parameters") {
+            flow.blocked.extend(
+                parameter_names(parameters)
+                    .into_iter()
+                    .map(|n| identifier(self.text(n))),
+            );
+        }
+        flow.opaque = definition.child(0).is_some_and(|n| n.kind() == "async");
+        let mut cursor = body.walk();
+        let statements: Vec<_> = body.named_children(&mut cursor).collect();
+        for statement in &statements {
+            if statement.kind() == "expression_statement"
+                && let Some(assignment) = statement.named_child(0)
+                && assignment.kind() == "assignment"
+                && assignment.child_by_field_name("type").is_none()
+                && let Some(left) = assignment.child_by_field_name("left")
+                && left.kind() == "identifier"
+                && let Some(right) = assignment.child_by_field_name("right")
+                && right.kind() != "assignment"
+            {
+                plain.insert(assignment.id());
+                flow.writes.push(CallableWrite {
+                    start: assignment.start_byte(),
+                    end: assignment.end_byte(),
+                    name: identifier(self.text(left)),
+                    value: (right.kind() == "identifier").then(|| identifier(self.text(right))),
+                });
+            }
+        }
+        if flow.writes.is_empty() {
+            return;
+        }
+        for statement in statements {
+            if !matches!(
+                statement.kind(),
+                "expression_statement" | "return_statement"
+            ) {
+                continue;
+            }
+            let mut pending = vec![statement];
+            while let Some(node) = pending.pop() {
+                if matches!(
+                    node.kind(),
+                    "lambda"
+                        | "list_comprehension"
+                        | "set_comprehension"
+                        | "dictionary_comprehension"
+                        | "generator_expression"
+                        | "conditional_expression"
+                        | "boolean_operator"
+                ) {
+                    continue;
+                }
+                if node.kind() == "call" {
+                    flow.calls.insert(node.start_byte());
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+        }
+        // Reads in nested scopes are captures even without a nonlocal write:
+        // an escaping closure may run after a later assignment. Value escapes
+        // (arguments, returns, containers, member access) likewise veto history.
+        let mut pending = vec![(body, false)];
+        while let Some((node, nested)) = pending.pop() {
+            let nested = nested
+                || matches!(
+                    node.kind(),
+                    "function_definition"
+                        | "class_definition"
+                        | "lambda"
+                        | "list_comprehension"
+                        | "set_comprehension"
+                        | "dictionary_comprehension"
+                        | "generator_expression"
+                );
+            if matches!(node.kind(), "yield" | "await" | "exec_statement") {
+                flow.opaque = true;
+            }
+            if node.kind() == "call"
+                && let Some(function) = node.child_by_field_name("function")
+                && let Some(parts) = self.call_parts(function)
+                && parts.len() == 1
+                && matches!(
+                    identifier(&parts[0]).as_str(),
+                    "eval" | "exec" | "globals" | "locals"
+                )
+            {
+                flow.opaque = true;
+            }
+            if node.kind() == "identifier"
+                && let Some(parent) = node.parent()
+            {
+                let field = |name| {
+                    parent
+                        .child_by_field_name(name)
+                        .is_some_and(|n| n.id() == node.id())
+                };
+                let local_read = !nested
+                    && ((parent.kind() == "call"
+                        && field("function")
+                        && flow.calls.contains(&parent.start_byte()))
+                        || (plain.contains(&parent.id()) && (field("left") || field("right"))));
+                if !(local_read || (parent.kind() == "attribute" && field("attribute"))) {
+                    flow.blocked.insert(identifier(self.text(node)));
+                }
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor).map(|n| (n, nested)));
+        }
+        // A copied function value can escape or be mutated through either
+        // name. Propagate local-write vetoes through copies in both directions,
+        // conservatively across rebindings too. Definition names alone are not
+        // seeds: declaring a same-frame function is not an escape of its copies.
+        let mut copies: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut pending = Vec::new();
+        for write in &flow.writes {
+            if flow.blocked.contains(&write.name) {
+                pending.push(write.name.as_str());
+            }
+            if let Some(value) = write.value.as_deref() {
+                copies.entry(&write.name).or_default().push(value);
+                copies.entry(value).or_default().push(&write.name);
+            }
+        }
+        let mut visited = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if visited.insert(name) {
+                flow.blocked.insert(name.to_owned());
+                if let Some(neighbors) = copies.get(name) {
+                    pending.extend(neighbors.iter().copied());
+                }
+            }
+        }
+        flow.writes.sort_by_key(|write| write.end);
+        self.callable_flows.insert(scope, flow);
+    }
+
+    fn callable_keys(&self) -> HashMap<usize, String> {
+        let mut keys = HashMap::new();
+        // Star-dependent definitions are published later by PythonContext.
+        // A local value must not bypass that existing ambiguity proof.
+        if self.callable_flows.is_empty() || !self.stars.is_empty() {
+            return keys;
+        }
+        let mut counts = HashMap::new();
+        for key in self
+            .facts
+            .nodes
+            .iter()
+            .filter_map(|n| n.binding_key.as_deref())
+        {
+            *counts.entry(key).or_insert(0_usize) += 1;
+        }
+        let functions: HashSet<_> = self
+            .facts
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.kind == "function"
+                    && n.binding_key
+                        .as_deref()
+                        .is_some_and(|k| counts.get(k) == Some(&1))
+            })
+            .map(|n| n.id.as_str())
+            .collect();
+        let mut calls: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (index, call) in self.calls.iter().enumerate() {
+            calls.entry(call.scope).or_default().push(index);
+        }
+        for (scope, flow) in &self.callable_flows {
+            if flow.opaque || self.scopes[*scope].uncertain {
+                continue;
+            }
+            let Some(calls) = calls.get_mut(scope) else {
+                continue;
+            };
+            calls.sort_by_key(|index| self.calls[*index].start);
+            let mut values: HashMap<&str, String> = HashMap::new();
+            let mut writes = flow.writes.iter().peekable();
+            for index in calls {
+                let call = &self.calls[*index];
+                while writes.peek().is_some_and(|write| write.end <= call.start) {
+                    let write = writes.next().unwrap();
+                    let key = write.value.as_deref().and_then(|name| {
+                        values.get(name).cloned().or_else(|| {
+                            self.callable_definition(*scope, name, write.start, &functions)
+                        })
+                    });
+                    values.remove(write.name.as_str());
+                    if !flow.blocked.contains(&write.name)
+                        && let Some(key) = key
+                    {
+                        values.insert(&write.name, key);
+                    }
+                }
+                if flow.calls.contains(&call.start) && call.parts.len() == 1 {
+                    let name = identifier(&call.parts[0]);
+                    if !(self.class_context(*scope) && private_name(&name))
+                        && let Some(key) = values.get(name.as_str())
+                    {
+                        keys.insert(*index, key.clone());
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    fn callable_definition(
+        &self,
+        scope: usize,
+        name: &str,
+        position: usize,
+        functions: &HashSet<&str>,
+    ) -> Option<String> {
+        if self.class_context(scope) && (private_name(name) || name == "__class__") {
+            return None;
+        }
+        let mut current = Some(scope);
+        while let Some(index) = current {
+            let owner = &self.scopes[index];
+            if owner.kind != ScopeKind::Class {
+                if owner.uncertain {
+                    return None;
+                }
+                if let Some(binding) = owner.bindings.get(name) {
+                    // No captured/future function guess across execution frames.
+                    return match binding {
+                        Binding::Definition { id, key, start }
+                            if (index == scope || owner.kind == ScopeKind::Module)
+                                && *start <= position
+                                && functions.contains(id.as_str()) =>
+                        {
+                            Some(key.clone())
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            current = owner.parent;
+        }
+        None
     }
 
     fn relative_module(&self, name: &str) -> Option<String> {
@@ -1637,8 +1907,12 @@ impl Extractor<'_> {
                 ),
             });
         }
-        for call in &self.calls {
-            let key = self.call_key(call);
+        let callable_keys = self.callable_keys();
+        for (index, call) in self.calls.iter().enumerate() {
+            let key = callable_keys
+                .get(&index)
+                .cloned()
+                .or_else(|| self.call_key(call));
             let reference_id = format!(
                 "call:{}:{}-{}",
                 self.scopes[call.scope].owner, call.start, call.end

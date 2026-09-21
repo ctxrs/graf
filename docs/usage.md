@@ -36,9 +36,10 @@ format is unchanged.
 An upgrade or a large deletion can leave reusable space inside the database
 file. Run `graf compact` to reclaim it explicitly. This reads no source files
 and preserves graph facts and generation; it works on native and imported
-indexes in the current storage format. Refresh an older index before compacting
-it. Compaction can require temporary free space up to twice the database's
-current size and can fail while another writer holds the database. Another
+indexes using storage format 2 or 3, without upgrading either. Refresh a
+format-1 index before compacting it. Compaction can require temporary free space
+up to twice the database's current size and can fail while another writer holds
+the database. Another
 connection can delay disk-space reclamation; the report says when this happens.
 `graf compact --json` reports database page counts, not total disk usage including
 SQLite coordination files. Ordinary queries and updates never run compaction.
@@ -62,6 +63,9 @@ then try Unicode/accent-normalized names, prefixes, and substrings. Punctuation
 stays literal and ambiguous matches remain errors. Convenience lookup refuses
 incomplete results when its work or byte budget is exhausted; use an exact ID
 or narrower `--file`/`--kind` scope in that case. File paths stay exact.
+With explicit `file::Type.member` scope, a complete qualified-name ending
+outranks a longer prefix or substring; duplicate complete names still require
+disambiguation. The choice never depends on whether a candidate has a path.
 
 `graf watch --interval-ms 1000` is an explicit foreground polling loop. It runs
 updates when local fingerprints change; it is not installed as a service.
@@ -190,6 +194,12 @@ records a `references` dependency at that argument. It does not assert that the
 recipient invokes the function. Shadowed, reassigned, or unproved function
 values remain unresolved.
 
+For straightforward local assignments, Graf can follow a named function value
+through reassignment to a zero-argument call in Python, JavaScript/TypeScript,
+Go, Rust, and Swift. Each call retains the target proved at that point in the
+source. Conditional writes, captured mutations, escaping values, and unknown
+factory results can prevent resolution; this is bounded static analysis.
+
 Graf discovers ordinary literal SwiftPM `Sources/` and `Tests/` targets and
 declared local dependencies from an indexed `Package.swift`. Supply module
 membership explicitly when the package uses nonliteral or otherwise opaque
@@ -285,8 +295,8 @@ same allowance; validated cache hits do not. These caps count reservations,
 including the native Claude turn allowances described below, and reserved
 output tokens. The usage receipts separately report counters
 returned by the provider. Advanced JSON settings include temperature,
-thinking, and permitted extra request fields; Graf retains control of input,
-authentication, and output limits.
+thinking, and permitted extra request fields. These fields cannot override
+Graf's owned input, authentication, or output-limit request fields.
 
 Inspect a cache without provider calls using `graf cache inspect DIRECTORY`.
 Remove a reported invalid entry with `graf cache remove DIRECTORY KEY`, then
@@ -411,6 +421,11 @@ caps must also have that capacity remaining. A retry needs another full
 allowance. Unused turns are not refunded; `semantic_usage.calls` counts reserved
 generations, not observed model turns or subprocesses.
 
+A custom CLI adapter must pass the requested limits to its provider. Graf
+bounds its process time and captured bytes, but cannot enforce a token or
+billing ceiling on model work hidden inside that executable. One adapter
+attempt may make multiple model requests.
+
 Set per-file options in provider JSON or nested `ingest.semantic` within
 `--config FILE`. Recovery is disabled by default. Configured retries handle
 empty responses and recognized transient failures. Configured splitting handles
@@ -496,6 +511,16 @@ Nontrivial Leiden runs report `community_converged=false` and
 its local cap was exhausted. An unchanged partition alone does not certify
 convergence. Inspect these fields and the unmet-constraint report when using a
 capped result. The community seed and local-pass option do not change Louvain.
+
+Use `--community-starts 4` with Leiden to try four fresh starting partitions
+within the same 100-iteration budget and retain the highest modularity found.
+The default, `--community-starts 1`, stops when consecutive partitions agree.
+Four starts can take substantially more work; higher modularity does not
+guarantee more meaningful communities. When the initial clustering projection
+has positive edge weight, four starts spend the budget, leaving no additional
+splitting attempts for size/cohesion targets. Inspect
+`unsatisfied_community_constraints`.
+The four-start mode is explicit and does not change stored graph facts.
 
 ### Export formats and saved labels
 

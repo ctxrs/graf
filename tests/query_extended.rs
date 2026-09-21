@@ -1965,7 +1965,7 @@ fn search_migration_is_write_only_atomic_and_advances_generation_once() {
     assert_eq!(
         sql.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -2065,4 +2065,455 @@ fn dfs_revisits_shorter_routes_without_losing_depth_bounded_neighbors() {
     assert_eq!(ids(&result.graph), ["a", "b", "c", "x", "y"]);
     assert_eq!(result.graph.edges.len(), 5);
     assert!(!result.graph.truncated);
+}
+
+#[path = "support/storage_legacy.rs"]
+mod endpoint_legacy;
+
+fn qualified_node(id: &str, label: &str, qualified: &str, kind: &str) -> Node {
+    let mut value = node(id, label, "scope.rs");
+    value.qualified_name = Some(qualified.into());
+    value.kind = kind.into();
+    value
+}
+
+#[test]
+fn scoped_qualified_tail_prefers_complete_names_and_keeps_partial_fallback() {
+    let (_dir, graph) = store(
+        vec![
+            qualified_node("z-method", "run", "impl Widget.run", "method"),
+            qualified_node(
+                "b-internal",
+                "run_internal",
+                "impl Widget.run_internal",
+                "method",
+            ),
+            qualified_node(
+                "a-closure",
+                "anonymous",
+                "impl Widget.run_internal.<closure@9>",
+                "function",
+            ),
+            qualified_node("longer", "runner", "impl Widget.runner", "method"),
+            qualified_node("other-owner", "run", "impl OtherWidget.run", "method"),
+            qualified_node("c-prefix", "prefix", "Widget.runLater", "method"),
+            qualified_node("id-Widget.run", "opaque", "Unrelated", "function"),
+            qualified_node("label-tail", "label Widget.run", "Unrelated", "function"),
+            qualified_node("nested", "stop", "module.Widget.stop", "method"),
+            qualified_node("whitespace", "pause", "impl\tWidget.pause", "method"),
+            qualified_node("literal", "punctuation", "impl Widget.run_%\\X", "method"),
+            qualified_node(
+                "literal-decoy",
+                "punctuation",
+                "impl Widget.runZZX",
+                "method",
+            ),
+        ],
+        vec![],
+    );
+    let options = SearchOptions::default();
+    for (text, expected) in [
+        ("scope.rs::Widget.run", "z-method"),
+        ("./scope.rs::WIDGET.RUN", "z-method"),
+        ("scope.rs::Widget.run_internal", "b-internal"),
+        ("scope.rs::Widget.stop", "nested"),
+        ("scope.rs::Widget.pause", "whitespace"),
+        ("scope.rs::Widget.run_%\\X", "literal"),
+        // An incomplete component keeps the existing prefix ranking.
+        ("scope.rs::Widget.ru", "c-prefix"),
+        // The added tier is explicitly scoped; unscoped priority is unchanged.
+        ("Widget.run", "c-prefix"),
+    ] {
+        assert_eq!(
+            graph.resolve_endpoint(text, &options).unwrap().id,
+            expected,
+            "{text}"
+        );
+    }
+    for text in ["missing.rs::Widget.run", "scope.rs::Widget.run()"] {
+        assert!(graph.resolve_endpoint(text, &options).is_err(), "{text}");
+    }
+    for options in [
+        SearchOptions {
+            files: vec!["other.rs".into()],
+            ..Default::default()
+        },
+        SearchOptions {
+            kinds: vec!["class".into()],
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            graph
+                .resolve_endpoint("scope.rs::Widget.run", &options)
+                .is_err()
+        );
+    }
+    // Without a complete match a unique literal substring still works.
+    let (_dir, graph) = store(
+        vec![qualified_node(
+            "partial",
+            "run_internal",
+            "impl Widget.run_internal",
+            "method",
+        )],
+        vec![],
+    );
+    assert_eq!(
+        graph
+            .resolve_endpoint("scope.rs::Widget.run", &options)
+            .unwrap()
+            .id,
+        "partial"
+    );
+    // Empty dot components do not gain the new tier.
+    let (_dir, graph) = store(
+        vec![
+            qualified_node("tail", "empty", "impl Widget..run", "method"),
+            qualified_node("prefix", "empty", "Widget..runner", "method"),
+        ],
+        vec![],
+    );
+    assert_eq!(
+        graph
+            .resolve_endpoint("scope.rs::Widget..run", &options)
+            .unwrap()
+            .id,
+        "prefix"
+    );
+}
+
+#[test]
+fn scoped_qualified_tail_preserves_raw_exact_union_and_id_precedence() {
+    let options = SearchOptions::default();
+    let tail = qualified_node("tail", "run", "impl Widget.run", "method");
+    for (exact, text) in [
+        (
+            qualified_node("exact", "other", "Widget.run", "method"),
+            "scope.rs::Widget.run",
+        ),
+        (
+            qualified_node("exact", "WIDGET.RUN", "Other", "function"),
+            "scope.rs::Widget.run",
+        ),
+        (
+            qualified_node("exact", "Widget.run", "Other", "function"),
+            "scope.rs::Widget.run",
+        ),
+    ] {
+        let (_dir, graph) = store(vec![tail.clone(), exact], vec![]);
+        assert_eq!(graph.resolve_endpoint(text, &options).unwrap().id, "exact");
+    }
+    // Exact label and qualified-name matches still form one ambiguity set.
+    let (_dir, graph) = store(
+        vec![
+            tail.clone(),
+            qualified_node("label", "Widget.run", "Other", "function"),
+            qualified_node("qualified", "other", "Widget.run", "method"),
+        ],
+        vec![],
+    );
+    let error = graph
+        .resolve_endpoint("scope.rs::Widget.run", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("ambiguous") && error.contains("label, qualified"),
+        "{error}"
+    );
+
+    for literal_id in [false, true] {
+        let mut literal = if literal_id {
+            node("scope.rs::Widget.run", "literal", "other.rs")
+        } else {
+            node("literal", "scope.rs::Widget.run", "other.rs")
+        };
+        literal.qualified_name = Some("Unrelated".into());
+        let expected = literal.id.clone();
+        let (_dir, graph) = store(vec![tail.clone(), literal], vec![]);
+        assert_eq!(
+            graph
+                .resolve_endpoint("scope.rs::Widget.run", &options)
+                .unwrap()
+                .id,
+            expected
+        );
+        if literal_id {
+            // An excluded exact ID cannot become the otherwise eligible tail.
+            assert!(
+                graph
+                    .resolve_endpoint(
+                        "scope.rs::Widget.run",
+                        &SearchOptions {
+                            files: vec!["scope.rs".into()],
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+    // Normalized equality ties outrank, and cannot be broken by, a tail match.
+    let (_dir, graph) = store(
+        vec![
+            qualified_node("tail", "run", "impl Widget.resume", "method"),
+            qualified_node("accent", "Widget.Résumé", "Other", "function"),
+            qualified_node("plain", "WIDGET.RESUME", "Other", "function"),
+        ],
+        vec![],
+    );
+    let error = graph
+        .resolve_endpoint("scope.rs::Widget.resume", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("ambiguous") && error.contains("accent, plain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scoped_qualified_tail_retains_duplicates_and_finds_late_higher_tiers() {
+    for reverse in [false, true] {
+        let mut nodes = vec![
+            qualified_node("first", "run", "Left.Widget.run", "method"),
+            qualified_node("last", "run", "Right.Widget.run", "method"),
+        ];
+        if reverse {
+            nodes.reverse();
+        }
+        let (_dir, graph) = store(nodes, vec![]);
+        for limit in [1, 500] {
+            let options = SearchOptions {
+                graph: QueryOptions {
+                    limit,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let error = graph
+                .resolve_endpoint("scope.rs::Widget.run", &options)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("ambiguous") && error.contains("first, last"),
+                "{error}"
+            );
+        }
+    }
+    // Late candidates exceed the traversal cap, but fit the catalog budget.
+    for full_equality in [false, true] {
+        let mut nodes = vec![qualified_node("a-tail", "run", "impl Widget.run", "method")];
+        if full_equality {
+            // Two tail rivals must not terminate the scan before a full match.
+            nodes.push(qualified_node(
+                "b-tail",
+                "run",
+                "module.Widget.run",
+                "method",
+            ));
+        }
+        nodes.extend((0..6_000).map(|i| node(&format!("m-{i:05}"), "Unrelated", "scope.rs")));
+        nodes.push(if full_equality {
+            qualified_node("z-last", "WIDGET.RUN", "Other", "function")
+        } else {
+            qualified_node("z-last", "run", "impl Widget.run", "method")
+        });
+        let (_dir, graph) = store(nodes, vec![]);
+        let result = graph.resolve_endpoint("scope.rs::Widget.run", &SearchOptions::default());
+        if full_equality {
+            assert_eq!(result.unwrap().id, "z-last");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("ambiguous") && error.contains("a-tail, z-last"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scoped_qualified_tail_never_guesses_kind_or_overload_intent() {
+    let (_dir, graph) = store(
+        vec![
+            qualified_node("module", "dispatch", "dispatch", "module_declaration"),
+            qualified_node("function", "dispatch", "dispatch", "function"),
+            qualified_node("method-a", "select", "Owner.select", "method"),
+            qualified_node("method-b", "select", "select", "method"),
+            qualified_node("factory", "select", "select", "function"),
+            qualified_node("interface", "Maybe", "Maybe", "interface"),
+            qualified_node("constant", "Maybe", "Maybe", "constant"),
+        ],
+        // Connectivity must not select a winner from exact-name rivals.
+        vec![edge("tempting", "function", "constant", "calls")],
+    );
+    for term in ["dispatch", "select", "Maybe"] {
+        let error = graph
+            .resolve_endpoint(&format!("scope.rs::{term}"), &SearchOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{term}: {error}");
+    }
+    for (term, kind, expected) in [
+        ("dispatch", "module_declaration", "module"),
+        ("dispatch", "function", "function"),
+        ("select", "function", "factory"),
+        ("Maybe", "interface", "interface"),
+        ("Maybe", "constant", "constant"),
+    ] {
+        let options = SearchOptions {
+            kinds: vec![kind.into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            graph
+                .resolve_endpoint(&format!("scope.rs::{term}"), &options)
+                .unwrap()
+                .id,
+            expected
+        );
+    }
+    let error = graph
+        .resolve_endpoint(
+            "scope.rs::select",
+            &SearchOptions {
+                kinds: vec!["method".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("ambiguous") && error.contains("method-a, method-b"),
+        "{error}"
+    );
+    assert_eq!(
+        graph
+            .resolve_endpoint("constant", &SearchOptions::default())
+            .unwrap()
+            .id,
+        "constant"
+    );
+}
+
+#[test]
+fn scoped_qualified_tail_preserves_layouts_consumers_and_read_only_bytes() {
+    let mut baseline = None;
+    for legacy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        let mut writer = Store::create(&path).unwrap();
+        writer
+            .import_graph(ImportedGraph {
+                nodes: vec![
+                    qualified_node("source", "run", "impl Widget.run", "method"),
+                    qualified_node("target", "finish", "impl Widget.finish", "method"),
+                    qualified_node(
+                        "decoy",
+                        "run_internal",
+                        "impl Widget.run_internal",
+                        "method",
+                    ),
+                    qualified_node(
+                        "closure",
+                        "anonymous",
+                        "impl Widget.finish.<closure@9>",
+                        "function",
+                    ),
+                    node("fts-prefix", "Coder", "scope.rs"),
+                    node("fts-substring", "UsefulDestination", "scope.rs"),
+                ],
+                edges: vec![edge("written-call", "source", "target", "calls")],
+                metadata: Value::Null,
+            })
+            .unwrap();
+        let generation = writer.stats().unwrap().generation;
+        drop(writer);
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        if legacy {
+            endpoint_legacy::restore_legacy(&sql, false).unwrap();
+        }
+        let version: i64 = sql
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, if legacy { 1 } else { 3 });
+        drop(sql);
+        let before = std::fs::read(&path).unwrap();
+        let graph = Store::open_read_only(&path).unwrap();
+        let options = SearchOptions::default();
+        let start = "scope.rs::Widget.run";
+        let end = "scope.rs::Widget.finish";
+        assert_eq!(
+            graph.resolve_endpoint(start, &options).unwrap().id,
+            "source"
+        );
+        assert_eq!(graph.resolve_endpoint(end, &options).unwrap().id, "target");
+        // Alphanumeric FTS prefix and catalog substring fallback keep their tiers.
+        assert_eq!(
+            graph.resolve_endpoint("cod", &options).unwrap().id,
+            "fts-prefix"
+        );
+        assert_eq!(
+            graph.resolve_endpoint("Destination", &options).unwrap().id,
+            "fts-substring"
+        );
+        assert!(graph.neighbors_extended(start, &options).is_err());
+        assert!(
+            graph
+                .neighbors_extended("scope.rs::impl Widget.run", &options)
+                .is_ok()
+        );
+        let show = graph.neighbors_resolved(start, &options).unwrap();
+        assert_eq!(show.seeds, ["source"]);
+        assert_eq!(show.graph.edges.len(), 1);
+        assert_eq!(show.graph.edges[0].id, "written-call");
+        let route = graph.path_extended(start, end, &options).unwrap();
+        assert!(route.found);
+        assert_eq!(route.result.graph.edges.len(), 1);
+        assert_eq!(route.result.graph.edges[0].source, "source");
+        assert_eq!(route.result.graph.edges[0].target, "target");
+        let impact = graph
+            .impact_extended(end, &ImpactOptions::default())
+            .unwrap();
+        assert_eq!(impact.seeds, ["target"]);
+        assert_eq!(impact.graph.edges.len(), 1);
+        assert_eq!(impact.graph.edges[0].id, "written-call");
+        let absent = graph
+            .path_extended(start, "scope.rs::Widget.run_internal", &options)
+            .unwrap();
+        assert!(!absent.found);
+        let results = json!([show, route, impact, absent]);
+        if let Some(expected) = &baseline {
+            assert_eq!(&results, expected);
+        } else {
+            baseline = Some(results);
+        }
+        assert_eq!(graph.stats().unwrap().generation, generation);
+        drop(graph);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn scoped_qualified_tail_refuses_incomplete_normalization_scan() {
+    let label = "x".repeat(8 * 1024 * 1024);
+    let (_dir, graph) = store(
+        vec![
+            qualified_node("a-tail", "run", "impl Widget.run", "method"),
+            node("z-oversized", &label, "scope.rs"),
+        ],
+        vec![],
+    );
+    let options = SearchOptions::default();
+    let error = graph
+        .resolve_endpoint("scope.rs::Widget.run", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("normalization byte budget"), "{error}");
+    assert_eq!(
+        graph.resolve_endpoint("a-tail", &options).unwrap().id,
+        "a-tail"
+    );
+    assert_eq!(graph.stats().unwrap().nodes, 2);
 }

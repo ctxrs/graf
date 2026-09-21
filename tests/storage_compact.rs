@@ -114,7 +114,7 @@ fn snapshot(path: &Path) -> anyhow::Result<Value> {
     )?)
 }
 fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
-    let compact = version(conn)? == 2;
+    let compact = matches!(version(conn)?, 2 | 3);
     let sql = if compact {
         [
             "SELECT json_array(fkey,path,hash,module,diagnostics) FROM files ORDER BY path",
@@ -268,7 +268,7 @@ fn reference_source_index_changes_only_in_a_successful_explicit_write() -> anyho
 
     let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
     assert_eq!(report.generation, before["generation"].as_u64().unwrap());
-    assert_eq!(version(&sql)?, 2);
+    assert_eq!(version(&sql)?, 3);
     assert_reference_indices(&sql)?;
     assert_eq!(persisted(&sql)?, rows);
     assert_eq!(snapshot(&db)?, before);
@@ -311,7 +311,7 @@ fn new_compact_stores_keep_public_payloads_and_lexical_order() -> anyhow::Result
     let db = temp.path().join("compact.db");
     seed(&db)?;
     let sql = Connection::open(&db)?;
-    assert_eq!(version(&sql)?, 2);
+    assert_eq!(version(&sql)?, 3);
     assert_reference_indices(&sql)?;
     for (table, key) in [("files", "fkey"), ("nodes", "nkey"), ("refs", "rkey")] {
         let is_integer_pk: bool = sql.query_row(
@@ -424,7 +424,7 @@ fn real_legacy_layouts_read_without_mutation_then_upgrade_without_graph_change()
         let generation = writer.stats()?.generation;
         let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
         assert_eq!(report.generation, generation);
-        assert_eq!(version(&sql)?, 2);
+        assert_eq!(version(&sql)?, 3);
         assert_reference_indices(&sql)?;
         assert_eq!(persisted(&sql)?, old_rows);
         assert_eq!(snapshot(&db)?, before);
@@ -474,7 +474,7 @@ fn old_wal_snapshot_and_preopened_handles_survive_a_format_only_commit() -> anyh
     assert_eq!(persisted(&old_sql)?, old_rows);
     assert_eq!(serde_json::to_value(reader.snapshot()?)?, before);
     old_sql.execute_batch("COMMIT")?;
-    assert_eq!(version(&old_sql)?, 2);
+    assert_eq!(version(&old_sql)?, 3);
     assert_eq!(persisted(&old_sql)?, old_rows);
     // Generation did not change, so this old handle remains a legitimate writer.
     preopened_writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
@@ -622,7 +622,7 @@ fn failed_copy_and_late_write_restore_schema_graph_postings_and_version() -> any
             // Metadata survives table replacement; a trigger on old nodes would not.
             sql.execute_batch(
                 "CREATE TRIGGER reject_commit BEFORE UPDATE OF generation ON metadata BEGIN
-                SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=2
+                SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=3
                   AND EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='nkey')
                   AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='node_search_content')
                   AND EXISTS(SELECT 1 FROM sqlite_master WHERE name='node_search')
@@ -669,7 +669,7 @@ fn failed_copy_and_late_write_restore_schema_graph_postings_and_version() -> any
             sql.execute_batch("DROP TRIGGER reject_commit")?;
         }
         writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
-        assert_eq!(version(&sql)?, 2);
+        assert_eq!(version(&sql)?, 3);
         assert_integrity(&sql)?;
     }
     Ok(())
@@ -773,7 +773,7 @@ fn imported_null_ownership_and_metadata_references_are_not_fabricated_links() ->
     );
     assert_eq!(version(&sql)?, 1);
     writer.refresh_import(imported())?;
-    assert_eq!(version(&sql)?, 2);
+    assert_eq!(version(&sql)?, 3);
     assert_eq!(
         strings(&sql, "SELECT CAST(count(*) AS TEXT) FROM files")?,
         ["0"]
@@ -882,7 +882,7 @@ fn independent_previous_writer_fixture_upgrades_with_exact_records_and_no_genera
     assert_eq!(version(&sql)?, 1);
     let report = Store::open(&db)?.apply_native("fixture", vec![], vec![], coverage)?;
     assert_eq!(report.generation, stats.generation);
-    assert_eq!(version(&sql)?, 2);
+    assert_eq!(version(&sql)?, 3);
     assert_reference_indices(&sql)?;
     assert_eq!(persisted(&sql)?, old_rows);
     assert_eq!(serde_json::to_value(old_reader.snapshot()?)?, before);
@@ -995,7 +995,7 @@ fn unsupported_physical_version_and_mismatched_layout_fail_without_repair() -> a
     let db = temp.path().join("unsupported.db");
     seed(&db)?;
     let sql = Connection::open(&db)?;
-    for bad in [3, 1] {
+    for bad in [4, 1] {
         sql.pragma_update(None, "user_version", bad)?;
         let before = schema(&sql)?;
         assert!(Store::open(&db).is_err());
@@ -1004,7 +1004,7 @@ fn unsupported_physical_version_and_mismatched_layout_fail_without_repair() -> a
         assert_eq!(version(&sql)?, bad);
         assert_eq!(schema(&sql)?, before);
     }
-    sql.pragma_update(None, "user_version", 2)?;
+    sql.pragma_update(None, "user_version", 3)?;
     assert_eq!(Store::open_read_only(&db)?.snapshot()?.schema_version, 1);
     Ok(())
 }
@@ -1068,7 +1068,7 @@ fn vacuum_refuses_legacy_then_preserves_signed_keys_payloads_and_postings() -> a
         report.pages_after * report.page_size
     );
     assert_eq!(schema(&sql)?, compact_schema);
-    assert_eq!(version(&sql)?, 2);
+    assert_eq!(version(&sql)?, 3);
     assert_eq!(snapshot(&db)?, before);
     assert_eq!(persisted(&sql)?, rows);
     assert_eq!(postings(&sql)?, fts);

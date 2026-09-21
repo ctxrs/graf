@@ -19,8 +19,9 @@ pub(crate) fn storage_layout(conn: &Connection) -> Result<StorageLayout> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         1 => Ok(StorageLayout::Legacy),
-        2 => Ok(StorageLayout::Compact),
-        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1 or 2"),
+        // Format 3 projects refs.id from payload; its read columns are identical.
+        2 | 3 => Ok(StorageLayout::Compact),
+        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1, 2 or 3"),
     }
 }
 
@@ -65,8 +66,16 @@ CREATE TABLE compact_nodes (
     file TEXT NOT NULL, owner_key INTEGER REFERENCES compact_files(fkey) ON DELETE CASCADE,
     payload TEXT NOT NULL, search TEXT NOT NULL
 );
+CREATE TABLE compact_node_aliases (
+    node_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
+    binding_key TEXT NOT NULL, PRIMARY KEY(node_key, binding_key)
+) WITHOUT ROWID;
+"#;
+
+const COMPACT_REFERENCE_TABLES: &str = r#"
 CREATE TABLE compact_refs (
-    rkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    rkey INTEGER PRIMARY KEY,
+    id TEXT GENERATED ALWAYS AS (json_extract(payload,'$.id')) VIRTUAL NOT NULL UNIQUE,
     source_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
     owner_key INTEGER NOT NULL REFERENCES compact_files(fkey) ON DELETE CASCADE,
     relation TEXT NOT NULL, payload TEXT NOT NULL,
@@ -76,10 +85,6 @@ CREATE TABLE compact_ref_keys (
     ref_key INTEGER NOT NULL REFERENCES compact_refs(rkey) ON DELETE CASCADE,
     priority INTEGER NOT NULL, binding_key TEXT NOT NULL,
     PRIMARY KEY(ref_key, priority)
-) WITHOUT ROWID;
-CREATE TABLE compact_node_aliases (
-    node_key INTEGER NOT NULL REFERENCES compact_nodes(nkey) ON DELETE CASCADE,
-    binding_key TEXT NOT NULL, PRIMARY KEY(node_key, binding_key)
 ) WITHOUT ROWID;
 CREATE TABLE compact_edges (
     id TEXT PRIMARY KEY,
@@ -95,21 +100,10 @@ CREATE TABLE compact_edges (
 const COMPACT_PUBLISH: &str = r#"
 ALTER TABLE compact_files RENAME TO files;
 ALTER TABLE compact_nodes RENAME TO nodes;
-ALTER TABLE compact_refs RENAME TO refs;
-ALTER TABLE compact_ref_keys RENAME TO ref_keys;
 ALTER TABLE compact_node_aliases RENAME TO node_aliases;
-ALTER TABLE compact_edges RENAME TO edges;
 CREATE INDEX nodes_label ON nodes(label, id);
 CREATE INDEX nodes_file ON nodes(file, id);
-CREATE INDEX refs_owner ON refs(owner_key);
-CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
 CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
-CREATE INDEX edges_source ON edges(source_key, id);
-CREATE INDEX edges_target ON edges(target_key, id);
-CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
-CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
 CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
 INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
 CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
@@ -118,6 +112,20 @@ END;
 CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
     DELETE FROM node_search WHERE rowid=old.nkey;
 END;
+"#;
+
+const COMPACT_REFERENCE_PUBLISH: &str = r#"
+ALTER TABLE compact_refs RENAME TO refs;
+ALTER TABLE compact_ref_keys RENAME TO ref_keys;
+ALTER TABLE compact_edges RENAME TO edges;
+CREATE INDEX refs_owner ON refs(owner_key);
+CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
+CREATE INDEX edges_source ON edges(source_key, id);
+CREATE INDEX edges_target ON edges(target_key, id);
+CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
+CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
 "#;
 
 // Shared by fresh databases and explicit-write migration; these indexes do
@@ -198,10 +206,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(COMPACT_TABLES)?;
+            tx.execute_batch(COMPACT_REFERENCE_TABLES)?;
             tx.execute_batch(COMPACT_PUBLISH)?;
+            tx.execute_batch(COMPACT_REFERENCE_PUBLISH)?;
             ensure_storage_indices(&tx)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-            tx.pragma_update(None, "user_version", 2)?;
+            tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
         validate(&conn)?;
@@ -242,7 +252,7 @@ impl Store {
         })
     }
 
-    /// Explicitly repack an existing format-2 database without changing facts
+    /// Explicitly repack an existing format-2 or format-3 database without changing facts
     /// or the write baseline. SQLite serializes VACUUM with other writers; a
     /// stale handle compacts current data but remains stale for fact writes.
     pub fn compact(&mut self) -> Result<CompactionReport> {
@@ -275,7 +285,7 @@ impl Store {
             counts
         };
         // VACUUM owns its transaction; never wrap it in a write transaction or
-        // replace the database path. Format 2 has explicit parent INTEGER PKs.
+        // replace the database path. Formats 2/3 have explicit parent INTEGER PKs.
         self.conn
             .execute_batch("VACUUM main")
             .context("cannot compact Graf database")?;
@@ -743,8 +753,8 @@ impl Store {
                 insert_edge(&tx, edge, Some(&facts.path), None)?;
             }
             for reference in &facts.references {
-                tx.execute("INSERT INTO refs(id,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason) VALUES(?1,(SELECT nkey FROM nodes WHERE id=?2),(SELECT fkey FROM files WHERE path=?3),?4,?5,NULL,?6)",
-                    params![reference.id, reference.source, facts.path, reference.relation, serde_json::to_string(reference)?, reference.reason])?;
+                tx.execute("INSERT INTO refs(source_key,owner_key,relation,payload,resolved_target_key,resolution_reason) VALUES((SELECT nkey FROM nodes WHERE id=?1),(SELECT fkey FROM files WHERE path=?2),?3,?4,NULL,?5)",
+                    params![reference.source, facts.path, reference.relation, serde_json::to_string(reference)?, reference.reason])?;
                 for (priority, key) in reference.candidate_keys.iter().enumerate() {
                     tx.execute(
                         "INSERT INTO ref_keys(ref_key,priority,binding_key) VALUES((SELECT rkey FROM refs WHERE id=?1),?2,?3)",
@@ -966,7 +976,7 @@ fn validate(conn: &Connection) -> Result<()> {
     // Prepare without scanning or writing. An incomplete schema is not usable.
     conn.prepare(match layout {
         StorageLayout::Legacy => "SELECT n.payload,n.owner_file,e.payload,e.source,e.target,e.owner_file,e.ref_id,r.payload,r.source,r.owner_file,r.resolved_target,k.ref_id,k.priority,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
-        StorageLayout::Compact => "SELECT n.nkey,n.payload,n.owner_key,e.payload,e.source_key,e.target_key,e.owner_key,e.ref_key,r.rkey,r.payload,r.source_key,r.owner_key,r.resolved_target_key,k.ref_key,k.priority,f.fkey,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
+        StorageLayout::Compact => "SELECT n.nkey,n.payload,n.owner_key,e.payload,e.source_key,e.target_key,e.owner_key,e.ref_key,r.rkey,r.id,r.payload,r.source_key,r.owner_key,r.resolved_target_key,k.ref_key,k.priority,f.fkey,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
     })?;
     conn.prepare("SELECT rowid FROM node_search LIMIT 0")?;
     tx.commit()?;
@@ -1052,6 +1062,22 @@ fn ensure_storage_indices(tx: &Transaction<'_>) -> Result<()> {
 // a new graph generation. Backfilled aliases must reach the caller's rebind set.
 fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<bool> {
     let layout = storage_layout(tx)?;
+    let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 3 {
+        // A projection must preserve the old public identity exactly, not
+        // silently substitute a missing, coerced, or different payload value.
+        let invalid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM refs WHERE typeof(id)!='text'
+             OR json_type(payload,'$.id') IS NOT 'text'
+             OR id IS NOT json_extract(payload,'$.id'))",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !invalid,
+            "storage upgrade reference payload identity mismatch"
+        );
+    }
     // Legacy replacement builds FTS once, after the copied nodes are published.
     let search_changed = ensure_search(tx, layout == StorageLayout::Compact)?;
     if layout == StorageLayout::Legacy {
@@ -1061,14 +1087,15 @@ fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> 
             |row| row.get(0),
         )?;
         tx.execute_batch(COMPACT_TABLES)?;
+        tx.execute_batch(COMPACT_REFERENCE_TABLES)?;
         tx.execute_batch(
             "INSERT INTO compact_files(fkey,path,hash,module,diagnostics)
                  SELECT rowid,path,hash,module,diagnostics FROM files;
              INSERT INTO compact_nodes(nkey,id,label,qualified_name,binding_key,file,owner_key,payload,search)
                  SELECT rowid,id,label,qualified_name,binding_key,file,
                      (SELECT fkey FROM compact_files WHERE path=nodes.owner_file),payload,search FROM nodes;
-             INSERT INTO compact_refs(rkey,id,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason)
-                 SELECT rowid,id,(SELECT nkey FROM compact_nodes WHERE id=refs.source),
+             INSERT INTO compact_refs(rkey,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason)
+                 SELECT rowid,(SELECT nkey FROM compact_nodes WHERE id=refs.source),
                      (SELECT fkey FROM compact_files WHERE path=refs.owner_file),relation,payload,
                      (SELECT nkey FROM compact_nodes WHERE id=refs.resolved_target),resolution_reason FROM refs;
              INSERT INTO compact_ref_keys(ref_key,priority,binding_key)
@@ -1127,15 +1154,46 @@ fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> 
              DROP TABLE files;",
         )?;
         tx.execute_batch(COMPACT_PUBLISH)?;
+        tx.execute_batch(COMPACT_REFERENCE_PUBLISH)?;
         if !aliases {
             backfill_aliases(tx, keys)?;
         }
+    } else if version == 2 {
+        // Reuse the same reference schema with the already-published parents.
+        // Copy FK children before dropping them; foreign_keys stays enabled.
+        tx.execute_batch(
+            &COMPACT_REFERENCE_TABLES
+                .replace("compact_nodes", "nodes")
+                .replace("compact_files", "files"),
+        )?;
+        tx.execute_batch(
+            "INSERT INTO compact_refs(rkey,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason)
+                 SELECT rkey,source_key,owner_key,relation,payload,resolved_target_key,resolution_reason FROM refs;
+             INSERT INTO compact_ref_keys(ref_key,priority,binding_key)
+                 SELECT ref_key,priority,binding_key FROM ref_keys;
+             INSERT INTO compact_edges(rowid,id,source_key,target_key,relation,directed,owner_key,ref_key,payload)
+                 SELECT rowid,id,source_key,target_key,relation,directed,owner_key,ref_key,payload FROM edges;",
+        )?;
+        for table in ["refs", "ref_keys", "edges"] {
+            let equal: bool = tx.query_row(
+                &format!(
+                    "SELECT (SELECT count(*) FROM {table})=(SELECT count(*) FROM compact_{table})"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            ensure!(equal, "storage upgrade row count mismatch for {table}");
+        }
+        tx.execute_batch("DROP TABLE edges; DROP TABLE ref_keys; DROP TABLE refs;")?;
+        tx.execute_batch(COMPACT_REFERENCE_PUBLISH)?;
+    }
+    if version < 3 {
         let violations: i64 =
             tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
             })?;
         ensure!(violations == 0, "storage upgrade foreign key check failed");
-        tx.pragma_update(None, "user_version", 2)?;
+        tx.pragma_update(None, "user_version", 3)?;
     }
     ensure_aliases(tx, keys)?;
     ensure_storage_indices(tx)?;
