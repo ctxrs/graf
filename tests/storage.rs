@@ -333,6 +333,77 @@ fn bounded_snapshots_include_unresolved_evidence_and_check_payload_before_loadin
 }
 
 #[test]
+fn multiple_reference_resolutions_preserve_bindings_and_call_sites() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("index.db");
+    let mut store = Store::create(&db)?;
+    let mut last = reference("c-last", &["last"]);
+    last.source = "other-caller".into();
+    last.relation = "uses".into();
+    last.line = 8;
+    store.apply_native(
+        "repo",
+        vec![
+            file(
+                "caller.py",
+                vec![
+                    node("caller", "caller.py", "caller"),
+                    node("other-caller", "caller.py", "other-caller"),
+                ],
+                // Resolution order is by ID, independent of insertion order.
+                vec![
+                    last,
+                    reference("b-missing", &["missing"]),
+                    reference("a-first", &["first"]),
+                ],
+            ),
+            file(
+                "targets.py",
+                vec![
+                    node("first", "targets.py", "first"),
+                    node("last", "targets.py", "last"),
+                ],
+                vec![],
+            ),
+        ],
+        vec![],
+        Coverage::default(),
+    )?;
+    let graph = store.snapshot()?;
+    assert_eq!(
+        graph
+            .edges
+            .iter()
+            .map(|e| json!([e.id, e.source, e.target, e.relation, e.line]))
+            .collect::<Vec<_>>(),
+        vec![
+            json!(["reference:a-first", "caller", "first", "calls", 2]),
+            json!(["reference:c-last", "other-caller", "last", "uses", 8]),
+        ]
+    );
+    let conn = rusqlite::Connection::open(&db)?;
+    let resolutions = conn
+        .prepare("SELECT r.id,n.id,r.resolution_reason FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key ORDER BY r.id")?
+        .query_map([], |row| {
+            Ok(json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?
+            ]))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(
+        resolutions,
+        vec![
+            json!(["a-first", "first", ""]),
+            json!(["b-missing", null, "missing target"]),
+            json!(["c-last", "last", ""]),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn deltas_revisit_negative_and_ambiguous_bindings_without_losing_call_sites() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;

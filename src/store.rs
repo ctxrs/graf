@@ -1,6 +1,6 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, Transaction, params};
 use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 use unicode_normalization::UnicodeNormalization;
 
@@ -797,8 +797,22 @@ impl Store {
                 affected.insert(reference.id);
             }
         }
-        for id in affected {
-            resolve_reference(&tx, &id)?;
+        if !affected.is_empty() {
+            let mut payload_statement = tx.prepare("SELECT payload FROM refs WHERE id=?1")?;
+            let mut delete_edges =
+                tx.prepare("DELETE FROM edges WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1)")?;
+            let mut candidate_keys = tx.prepare("SELECT binding_key FROM ref_keys WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1) ORDER BY priority")?;
+            let mut update_resolution = tx.prepare("UPDATE refs SET resolved_target_key=(SELECT nkey FROM nodes WHERE id=?1),resolution_reason=?2 WHERE id=?3")?;
+            for id in affected {
+                resolve_reference(
+                    &tx,
+                    &id,
+                    &mut payload_statement,
+                    &mut delete_edges,
+                    &mut candidate_keys,
+                    &mut update_resolution,
+                )?;
+            }
         }
         let previous_coverage: Coverage = serde_json::from_str(&tx.query_row(
             "SELECT coverage FROM metadata WHERE singleton=1",
@@ -1466,22 +1480,24 @@ fn insert_edge(
     Ok(())
 }
 
-fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
-    let payload: String =
-        tx.query_row("SELECT payload FROM refs WHERE id=?1", [id], |r| r.get(0))?;
+fn resolve_reference(
+    tx: &Transaction<'_>,
+    id: &str,
+    payload_statement: &mut Statement<'_>,
+    delete_edges: &mut Statement<'_>,
+    candidate_keys: &mut Statement<'_>,
+    update_resolution: &mut Statement<'_>,
+) -> Result<()> {
+    let payload: String = payload_statement.query_row([id], |r| r.get(0))?;
     let reference: Reference = serde_json::from_str(&payload)?;
-    tx.execute(
-        "DELETE FROM edges WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1)",
-        [id],
-    )?;
+    delete_edges.execute([id])?;
     let mut target = None;
     let mut reason = if reference.reason.is_empty() {
         "no matching binding".to_owned()
     } else {
         reference.reason.clone()
     };
-    let keys = tx
-        .prepare("SELECT binding_key FROM ref_keys WHERE ref_key=(SELECT rkey FROM refs WHERE id=?1) ORDER BY priority")?
+    let keys = candidate_keys
         .query_map([id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for key in &keys {
@@ -1506,10 +1522,7 @@ fn resolve_reference(tx: &Transaction<'_>, id: &str) -> Result<()> {
             }
         }
     }
-    tx.execute(
-        "UPDATE refs SET resolved_target_key=(SELECT nkey FROM nodes WHERE id=?1),resolution_reason=?2 WHERE id=?3",
-        params![target, reason, id],
-    )?;
+    update_resolution.execute(params![target, reason, id])?;
     if let Some(target) = target {
         let mut metadata = serde_json::json!({"reference_id": reference.id});
         let source_payload: String = tx.query_row(
