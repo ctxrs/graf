@@ -1,4 +1,4 @@
-<img src="docs/assets/graf-readme-banner.svg" alt="graf is graphify, rebuilt in rust for 40x faster search" width="100%">
+<img src="docs/assets/graf-readme-banner.svg" alt="graf is graphify, rebuilt in rust for 1000x faster search" width="100%">
 
 Grep can find a name. **graf** tells you who calls it, what depends on it, what might break if it changes, and how it connects to the rest of the repository.
 
@@ -50,17 +50,15 @@ Use `--json` for structured output and an exact node ID when a name is ambiguous
 
 ## Why Graf is better than Graphify
 
-Graf is Graphify, but rebuilt properly in Rust: **7x faster indexing, 40x faster search, and one native binary.**
+Graf is Graphify, but rebuilt properly in Rust: **1000x faster search, 89x faster updates, and one native binary.**
 
-<img src="docs/assets/graf-indexing-speed.svg" alt="Graf indexing is 7 times faster than Graphify." width="100%">
-
-<img src="docs/assets/graf-search-speed.svg" alt="Graf search is 40 times faster than Graphify." width="100%">
+<img src="docs/assets/graf-vscode-performance.svg" alt="On the full VS Code repository, Graf searched in 13 milliseconds instead of 13.26 seconds and updated an unchanged graph in 880 milliseconds instead of 77.97 seconds." width="100%">
 
 Graf was built from scratch around a persistent indexed graph. It updates the files that changed and answers navigation queries directly from SQLite. One native binary replaces the Python environment and dependency stack.
 
 It is also stricter about correctness. Updates become visible as one complete generation, so a failed extraction cannot publish half a graph. When two symbols could be the answer, Graf returns the ambiguity and the source evidence instead of guessing.
 
-Graf is an independent implementation, not a fork or a drop-in replacement for Graphify's Python API. The numbers above round the geometric mean of 19 successful indexing cases from four public repos and 19 successful searches from seven; both tools had to return the expected graph for a case to count. Graf trades more disk space for those indexes, and a few cold-indexing cases remain slower. See the [benchmark method, per-case results, and full caveats](docs/benchmarks.md).
+Graf is an independent implementation, not a fork or a drop-in replacement for Graphify's Python API. The chart uses the complete 19,036-file VS Code repository on an M1 Mac mini. Cold indexing was effectively tied, while Graf produced 2.4x as many nodes and 1.7x as many edges with 31% less peak memory. See the [benchmark method, results, and tradeoffs](docs/benchmarks.md).
 
 ## Migrate from Graphify
 
