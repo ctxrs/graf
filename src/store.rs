@@ -232,6 +232,27 @@ impl Store {
         })
     }
 
+    /// Prepare a native index publish for a large all-or-nothing write.
+    ///
+    /// Native indexing owns the database while it publishes a scan. Rollback
+    /// journaling keeps the old pages in a temporary journal instead of
+    /// retaining every newly written page in a WAL until the publish commits.
+    /// Ordinary Store writes stay in WAL mode for concurrent readers.
+    pub(crate) fn prepare_native_index_write(&self) -> Result<()> {
+        ensure!(
+            self.conn.is_autocommit(),
+            "cannot change native index journal mode inside a transaction"
+        );
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        ensure!(
+            mode.eq_ignore_ascii_case("delete"),
+            "cannot prepare native index write while the database is busy (journal mode remained {mode})"
+        );
+        Ok(())
+    }
+
     /// Open without write permission or migrations. Normal SQLite WAL locking
     /// remains enabled so later committed generations stay visible.
     pub fn open_read_only(path: &Path) -> Result<Self> {

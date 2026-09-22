@@ -374,6 +374,9 @@ fn run_prepared(
         );
         preserve_snapshot(&root, &store)?;
     }
+    if !changed.is_empty() || !deleted.is_empty() {
+        store.prepare_native_index_write()?;
+    }
     let mut report = store.apply_native_with_options(
         root_text,
         changed,
