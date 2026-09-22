@@ -1426,8 +1426,11 @@ fn typescript_config(
     let Some(source) = javascript_config(inventory, path, observations)? else {
         return Ok(TypescriptConfig::default());
     };
+    // Empty and comment-only tsconfig/jsconfig files are common fixtures and
+    // carry no mapping information. Treat them like `{}` instead of aborting
+    // an otherwise valid repository-wide index.
     let value = jsonc_parser::parse_to_serde_value(&source, &Default::default())?
-        .context("empty TypeScript configuration")?;
+        .unwrap_or_else(|| serde_json::json!({}));
     ensure!(
         value.is_object(),
         "TypeScript configuration must be an object"

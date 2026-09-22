@@ -4,6 +4,7 @@ use graf::{
     index,
     model::*,
     parser::{PythonContext, parse_python},
+    sources,
     store::Store,
 };
 use tempfile::tempdir;
@@ -37,6 +38,16 @@ fn callees(store: &Store, name: &str) -> GraphResult {
             },
         )
         .unwrap()
+}
+
+fn scan_manifest(db: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db.as_os_str().to_owned();
+    path.push(".scan-manifest.json");
+    path.into()
+}
+
+fn context_discoveries() -> usize {
+    index::project_context_discoveries_for_tests()
 }
 
 #[test]
@@ -617,7 +628,7 @@ fn python_terminal_target_deletion_and_restore_keep_consumer_facts() {
 }
 
 #[test]
-fn native_index_uses_rollback_journal_for_nonempty_publish() {
+fn native_initial_publish_restores_wal_without_retaining_publish_pages() {
     let root = tempdir().unwrap();
     let db = root.path().join("graph.db");
     fs::write(root.path().join("app.py"), "def entry():\n    return 1\n").unwrap();
@@ -628,7 +639,8 @@ fn native_index_uses_rollback_journal_for_nonempty_publish() {
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(mode, "delete");
+    assert_eq!(mode, "wal");
+    drop(conn);
     assert!(!db.with_file_name("graph.db-wal").exists());
     assert!(Store::open_read_only(&db).unwrap().stats().unwrap().files > 0);
 }
@@ -1027,4 +1039,298 @@ fn failed_inventory_preserves_whole_graph_then_valid_shrink_keeps_unchanged_sour
         (unchanged.parsed_files, unchanged.generation),
         (0, after.generation)
     );
+}
+
+#[test]
+fn scan_manifest_skips_context_and_matches_index_and_check_update_outputs() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let source = root.path().join("app.py");
+    fs::write(&source, "def original():\n    pass\n").unwrap();
+
+    let first = index::run(root.path(), &db).unwrap();
+    let graph =
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap();
+    let before = context_discoveries();
+    let unchanged = index::run(root.path(), &db).unwrap();
+    assert_eq!(context_discoveries(), before);
+    assert_eq!(
+        (
+            unchanged.generation,
+            unchanged.parsed_files,
+            unchanged.unchanged_files,
+            unchanged.nodes,
+            unchanged.edges,
+        ),
+        (first.generation, 0, 1, first.nodes, first.edges,)
+    );
+    assert_eq!(
+        serde_json::to_value(&unchanged.diagnostics).unwrap(),
+        serde_json::to_value(&first.diagnostics).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+        graph
+    );
+
+    let fresh = index::check_update(root.path(), &db).unwrap();
+    assert!(fresh.fresh);
+    assert!(fresh.added.is_empty() && fresh.changed.is_empty() && fresh.deleted.is_empty());
+    assert_eq!(context_discoveries(), before);
+
+    fs::write(&source, "def updated():\n    pass\n").unwrap();
+    let stale = index::check_update(root.path(), &db).unwrap();
+    assert!(!stale.fresh);
+    assert_eq!(stale.changed, ["app.py"]);
+    assert_eq!(context_discoveries(), before + 1);
+    let updated = index::run(root.path(), &db).unwrap();
+    assert_eq!(updated.parsed_files, 1);
+    assert!(
+        !Store::open_read_only(&db)
+            .unwrap()
+            .query("updated", &QueryOptions::default())
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+    let after_update = context_discoveries();
+    assert!(index::check_update(root.path(), &db).unwrap().fresh);
+    assert_eq!(context_discoveries(), after_update);
+}
+
+#[test]
+fn scan_manifest_invalidates_inventory_rules_options_and_generation() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let app = root.path().join("app.py");
+    fs::write(&app, "def app():\n    pass\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+
+    let mut count = context_discoveries();
+    fs::write(root.path().join("added.py"), "def added():\n    pass\n").unwrap();
+    assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 1);
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    fs::write(&app, "def changed():\n    pass\n").unwrap();
+    assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 1);
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    fs::remove_file(root.path().join("added.py")).unwrap();
+    assert_eq!(index::run(root.path(), &db).unwrap().deleted_files, 1);
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    let rules = root.path().join(".grafignore");
+    fs::write(&rules, "# first\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    fs::write(&rules, "# second\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    let cargo = root.path().join("Cargo.toml");
+    fs::write(&cargo, "[package]\nname='first'\nversion='0.1.0'\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    fs::write(&cargo, "[package]\nname='second'\nversion='0.1.0'\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    let mut options = index::stored_options(&db).unwrap();
+    options.no_gitignore = true;
+    index::run_with_options(root.path(), &db, &options).unwrap();
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    let root_text = root.path().canonicalize().unwrap();
+    let manual = parse_python("app.py", "def manual():\n    pass\n", "manual-stamp").unwrap();
+    let coverage = Store::open_read_only(&db)
+        .unwrap()
+        .stats()
+        .unwrap()
+        .coverage;
+    Store::open(&db)
+        .unwrap()
+        .apply_native(root_text.to_str().unwrap(), vec![manual], vec![], coverage)
+        .unwrap();
+    let repaired = index::run(root.path(), &db).unwrap();
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+    assert_eq!(repaired.parsed_files, 1);
+    assert!(
+        !Store::open_read_only(&db)
+            .unwrap()
+            .query("changed", &QueryOptions::default())
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+}
+
+#[test]
+fn scan_manifest_observes_ignored_project_context_inputs() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::write(root.path().join(".grafignore"), "/tsconfig.json\n").unwrap();
+    fs::write(
+        root.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"target":["one.ts"]}}}"#,
+    )
+    .unwrap();
+    fs::write(root.path().join("one.ts"), "export function work() {}\n").unwrap();
+    fs::write(root.path().join("two.ts"), "export function work() {}\n").unwrap();
+    fs::write(
+        root.path().join("main.ts"),
+        "import {work} from 'target'; export function Main(){work();}\n",
+    )
+    .unwrap();
+
+    index::run(root.path(), &db).unwrap();
+    let linked_to = |path: &str| {
+        let graph = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+        graph.edges.iter().any(|edge| {
+            edge.relation == "calls"
+                && graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == edge.source && node.file == "main.ts")
+                && graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.file == path)
+        })
+    };
+    assert!(linked_to("one.ts"));
+    let discoveries = context_discoveries();
+    assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 0);
+    assert_eq!(context_discoveries(), discoveries);
+
+    fs::write(
+        root.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"target":["two.ts"]}}}"#,
+    )
+    .unwrap();
+    assert!(index::run(root.path(), &db).unwrap().parsed_files > 0);
+    assert_eq!(context_discoveries(), discoveries + 1);
+    assert!(linked_to("two.ts"));
+    assert!(!linked_to("one.ts"));
+}
+
+#[test]
+fn scan_manifest_bad_files_and_failed_indexes_are_safe_misses() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let source = root.path().join("app.py");
+    fs::write(&source, "def before():\n    pass\n").unwrap();
+    index::run(root.path(), &db).unwrap();
+    let manifest = scan_manifest(&db);
+    assert!(manifest.is_file());
+
+    let mut count = context_discoveries();
+    fs::remove_file(&manifest).unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    fs::write(&manifest, b"{").unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    fs::File::create(&manifest)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    index::run(root.path(), &db).unwrap();
+    count += 1;
+    assert_eq!(context_discoveries(), count);
+
+    #[cfg(unix)]
+    {
+        let target = root.path().join("manifest-target");
+        fs::write(&target, b"{}").unwrap();
+        fs::remove_file(&manifest).unwrap();
+        std::os::unix::fs::symlink(&target, &manifest).unwrap();
+        index::run(root.path(), &db).unwrap();
+        count += 1;
+        assert_eq!(context_discoveries(), count);
+        assert!(
+            !fs::symlink_metadata(&manifest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    fs::write(&source, "def after():\n    pass\n").unwrap();
+    fs::write(root.path().join(".grafignore"), [0xff]).unwrap();
+    assert!(index::run(root.path(), &db).is_err());
+    fs::remove_file(root.path().join(".grafignore")).unwrap();
+    let recovered = index::run(root.path(), &db).unwrap();
+    assert_eq!(recovered.parsed_files, 1);
+    assert!(
+        !Store::open_read_only(&db)
+            .unwrap()
+            .query("after", &QueryOptions::default())
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+}
+
+#[test]
+fn scan_manifest_binds_managed_sources_and_database_identity() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    let source = "fixture://managed";
+    let relative = sources::relative_path(source, "managed.py").unwrap();
+    sources::save(
+        root.path(),
+        source,
+        parse_python(&relative, "def first():\n    pass\n", "first").unwrap(),
+    )
+    .unwrap();
+    index::run(root.path(), &db).unwrap();
+    let count = context_discoveries();
+    assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 0);
+    assert_eq!(context_discoveries(), count);
+
+    sources::save(
+        root.path(),
+        source,
+        parse_python(&relative, "def second():\n    pass\n", "second").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(index::run(root.path(), &db).unwrap().parsed_files, 1);
+    assert_eq!(context_discoveries(), count + 1);
+    assert!(
+        !Store::open_read_only(&db)
+            .unwrap()
+            .query("second", &QueryOptions::default())
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+
+    #[cfg(unix)]
+    {
+        let replacement = root.path().join(".graf/replacement.db");
+        index::run(root.path(), &replacement).unwrap();
+        let replacement_graph = serde_json::to_value(
+            Store::open_read_only(&replacement)
+                .unwrap()
+                .snapshot()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::rename(&replacement, &db).unwrap();
+        let before = context_discoveries();
+        let report = index::run(root.path(), &db).unwrap();
+        assert_eq!(context_discoveries(), before + 1);
+        assert_eq!(report.parsed_files, 0);
+        assert_eq!(
+            serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap(),
+            replacement_graph
+        );
+    }
 }

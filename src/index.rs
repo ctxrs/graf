@@ -18,6 +18,88 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 const EXTRACTOR_REVISION: u32 = 12;
+const SCAN_MANIFEST_VERSION: u32 = 2;
+const MAX_SCAN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SCAN_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanManifest {
+    version: u32,
+    root: String,
+    database: DatabaseIdentity,
+    generation: u64,
+    stored_options: serde_json::Value,
+    index_options: serde_json::Value,
+    extractor_revision: u32,
+    language_revision: String,
+    ingest_fingerprint: String,
+    scan: ScanProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseIdentity {
+    length: u64,
+    modified: String,
+    file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanProof {
+    supported_files: usize,
+    unsupported_files: usize,
+    ignore_fingerprint: String,
+    sources: Vec<SourceProof>,
+    managed_sources: Vec<SourceProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceProof {
+    path: String,
+    digest: String,
+}
+
+struct Discovery {
+    files: Vec<(PathBuf, String)>,
+    coverage: Coverage,
+    ignore_files: Option<Vec<(Vec<u8>, String)>>,
+    context_files: Option<Vec<(PathBuf, String)>>,
+}
+
+struct PreparedScan {
+    files: Vec<(PathBuf, String)>,
+    coverage: Coverage,
+    managed: Vec<FileFacts>,
+    proof: Option<ScanProof>,
+    cached_sources: Option<HashMap<String, CachedSource>>,
+}
+
+struct CachedSource {
+    digest: String,
+    content: Option<Vec<u8>>,
+    version: SourceVersion,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SourceVersion {
+    length: u64,
+    modified: std::time::SystemTime,
+    file_id: String,
+}
+
+thread_local! {
+    static PROJECT_CONTEXT_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A debug-build seam used by integration tests to prove the manifest bypasses context parsing.
+#[doc(hidden)]
+pub fn project_context_discoveries_for_tests() -> usize {
+    PROJECT_CONTEXT_DISCOVERIES.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -208,18 +290,50 @@ fn run_prepared(
         stats.root.as_deref().is_none_or(|old| old == root_text),
         "index root differs from the stored root"
     );
+    let db = db.canonicalize()?;
+    let index_options = serde_json::to_value(options)?;
+    let stored_options = stored_options_value(&store)?;
     let mut old: HashMap<_, _> = store
         .file_stamps()?
         .into_iter()
         .map(|f| (f.path, f.hash))
         .collect();
-    let (files, mut coverage) = discover(&root, &db.canonicalize()?, options)?;
-    let mut context = ProjectContext::discover_with_swift_modules(
+    let scan = prepare_scan(&root, &db, options, true)?;
+    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
+    if !options.force
+        && let Some(proof) = &scan.proof
+        && let Some(database) = database_identity(&db)
+        && manifest_matches(
+            &scan_manifest_path(&db),
+            &ScanManifest {
+                version: SCAN_MANIFEST_VERSION,
+                root: root_text.to_owned(),
+                database,
+                generation: stats.generation,
+                stored_options: stored_options.clone(),
+                index_options: index_options.clone(),
+                extractor_revision: EXTRACTOR_REVISION,
+                language_revision: languages::revision().into(),
+                ingest_fingerprint: ingest_fingerprint.clone(),
+                scan: proof.clone(),
+            },
+        )
+    {
+        return unchanged_report(&stats, options, started);
+    }
+    let initial_proof = scan.proof.clone();
+    let PreparedScan {
+        files,
+        mut coverage,
+        managed,
+        mut cached_sources,
+        ..
+    } = scan;
+    let mut context = discover_project_context(
         &root,
         &files.iter().map(|f| f.1.clone()).collect::<Vec<_>>(),
         &options.swift_modules,
     )?;
-    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
     let mut python = python_inventory(&files, options, &old, &context, &ingest_fingerprint)?;
     #[cfg(test)]
     tests::after_python_inventory();
@@ -234,7 +348,14 @@ fn run_prepared(
         } else {
             options.ingest.max_input_bytes
         };
-        let (content_hash, content) = read_source(&path, maximum)?;
+        let cached = cached_sources
+            .as_mut()
+            .and_then(|sources| sources.remove(&relative))
+            .filter(|source| source_version(&path).as_ref() == Some(&source.version));
+        let cached_version = cached.as_ref().map(|source| source.version.clone());
+        let (content_hash, content) = cached
+            .map(|source| Ok((source.digest, source.content)))
+            .unwrap_or_else(|| read_source(&path, maximum))?;
         context.validate_source(&relative, &content_hash)?;
         python.validate_source(&relative, &content_hash)?;
         let hash = stamp(
@@ -344,11 +465,17 @@ fn run_prepared(
             staged.flush()?;
             ingest::extract(staged.path(), &relative, &hash, &options.ingest)?
         };
+        if let Some(version) = cached_version {
+            ensure!(
+                source_version(&path).as_ref() == Some(&version),
+                "source changed during cached extraction; retry indexing"
+            );
+        }
         context.apply(&mut facts);
         add_document_aliases(&mut facts);
         changed.push(facts);
     }
-    for mut facts in crate::sources::read(&root)? {
+    for mut facts in managed {
         coverage.supported_files += 1;
         if old
             .remove(&facts.path)
@@ -363,6 +490,15 @@ fn run_prepared(
     changed.sort_by(|a, b| a.path.cmp(&b.path));
     let mut deleted: Vec<_> = old.into_keys().collect();
     deleted.sort();
+    #[cfg(test)]
+    tests::before_publish_validation();
+    if let Some(initial_proof) = &initial_proof {
+        let current = prepare_scan(&root, &db, options, false)?;
+        ensure!(
+            current.proof.as_ref() == Some(initial_proof),
+            "source tree changed during indexing; previous graph retained"
+        );
+    }
     let extract_ms = extracting.elapsed().as_secs_f64() * 1000.0;
     let committing = std::time::Instant::now();
     let losses = store.semantic_losses(&changed)?;
@@ -374,16 +510,22 @@ fn run_prepared(
         );
         preserve_snapshot(&root, &store)?;
     }
-    if !changed.is_empty() || !deleted.is_empty() {
+    let prepared_native_write = stats.kind == "empty" && !changed.is_empty();
+    if prepared_native_write {
         store.prepare_native_index_write()?;
     }
-    let mut report = store.apply_native_with_options(
+    let applied = store.apply_native_with_options(
         root_text,
         changed,
         deleted,
         coverage,
-        serde_json::to_value(options)?,
-    )?;
+        index_options.clone(),
+    );
+    let mut report = if prepared_native_write {
+        store.finish_native_index_write(applied)?
+    } else {
+        applied?
+    };
     report.semantic_usage = options
         .ingest
         .semantic
@@ -406,6 +548,28 @@ fn run_prepared(
             total_ms: started.elapsed().as_secs_f64() * 1000.0,
             capture_ms: None,
         });
+    }
+    drop(store);
+    if let Some(initial_proof) = initial_proof
+        && let Some(database) = database_identity(&db)
+    {
+        let manifest = ScanManifest {
+            version: SCAN_MANIFEST_VERSION,
+            root: root_text.to_owned(),
+            database,
+            generation: report.generation,
+            stored_options: index_options.clone(),
+            index_options,
+            extractor_revision: EXTRACTOR_REVISION,
+            language_revision: languages::revision().into(),
+            ingest_fingerprint,
+            scan: initial_proof,
+        };
+        if serde_json::to_vec(&manifest)
+            .is_ok_and(|bytes| bytes.len() as u64 <= MAX_SCAN_MANIFEST_BYTES)
+        {
+            let _ = write_manifest(&scan_manifest_path(&db), &manifest);
+        }
     }
     Ok(report)
 }
@@ -509,6 +673,273 @@ pub(crate) fn preserve_backup(root: &Path, prefix: &str, bytes: &[u8]) -> Result
     Ok(destination)
 }
 
+fn discover_project_context(
+    root: &Path,
+    files: &[String],
+    swift_modules: &BTreeMap<String, String>,
+) -> Result<ProjectContext> {
+    PROJECT_CONTEXT_DISCOVERIES.with(|count| count.set(count.get() + 1));
+    ProjectContext::discover_with_swift_modules(root, files, swift_modules)
+}
+
+fn source_maximum(relative: &str, options: &IndexOptions) -> u64 {
+    if (is_code(relative) || content_probe(relative)) && !relative.ends_with(".dmi") {
+        MAX_SOURCE_BYTES as u64
+    } else {
+        options.ingest.max_input_bytes
+    }
+}
+
+fn prepare_scan(
+    root: &Path,
+    db: &Path,
+    options: &IndexOptions,
+    cache_sources: bool,
+) -> Result<PreparedScan> {
+    let Discovery {
+        files,
+        coverage,
+        ignore_files,
+        context_files,
+    } = discover(root, db, options)?;
+    let mut cacheable = ignore_files.is_some() && context_files.is_some();
+    let mut sources = BTreeMap::new();
+    let source_paths: BTreeSet<_> = files.iter().map(|(_, relative)| relative.clone()).collect();
+    let mut inputs = BTreeMap::new();
+    for (path, relative) in files
+        .iter()
+        .chain(context_files.as_deref().unwrap_or_default())
+    {
+        inputs
+            .entry(relative.clone())
+            .or_insert_with(|| path.clone());
+    }
+    let mut cached_sources = cache_sources.then(HashMap::new);
+    let mut cached_bytes = 0usize;
+    for (relative, path) in inputs {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            cacheable = false;
+            continue;
+        }
+        let version = source_version_from_metadata(&metadata);
+        let (digest, content) = read_source(&path, source_maximum(&relative, options))?;
+        cacheable &= content.is_some();
+        if source_paths.contains(&relative) && cached_sources.is_some() {
+            cached_bytes = cached_bytes.saturating_add(content.as_ref().map_or(0, Vec::len));
+            if cached_bytes <= MAX_SCAN_CACHE_BYTES
+                && let Some(version) =
+                    version.filter(|version| source_version(&path).as_ref() == Some(version))
+            {
+                cached_sources.as_mut().unwrap().insert(
+                    relative.clone(),
+                    CachedSource {
+                        digest: digest.clone(),
+                        content,
+                        version,
+                    },
+                );
+            } else if cached_bytes > MAX_SCAN_CACHE_BYTES {
+                cached_sources = None;
+            }
+        }
+        sources.insert(
+            relative.clone(),
+            SourceProof {
+                path: relative,
+                digest,
+            },
+        );
+    }
+    let managed = crate::sources::read(root)?;
+    let managed_sources = managed
+        .iter()
+        .map(|facts| SourceProof {
+            path: facts.path.clone(),
+            digest: facts.hash.clone(),
+        })
+        .collect();
+    let proof = cacheable.then(|| ScanProof {
+        supported_files: coverage.supported_files + managed.len(),
+        unsupported_files: coverage.unsupported_files,
+        ignore_fingerprint: ignore_fingerprint(ignore_files.unwrap()),
+        sources: sources.into_values().collect(),
+        managed_sources,
+    });
+    if proof.is_none() {
+        cached_sources = None;
+    }
+    Ok(PreparedScan {
+        files,
+        coverage,
+        managed,
+        proof,
+        cached_sources,
+    })
+}
+
+fn source_version(path: &Path) -> Option<SourceVersion> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    source_version_from_metadata(&metadata)
+}
+
+fn source_version_from_metadata(metadata: &std::fs::Metadata) -> Option<SourceVersion> {
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(windows)]
+    let file_id = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.creation_time().to_string()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file_id = String::new();
+    Some(SourceVersion {
+        length: metadata.len(),
+        modified: metadata.modified().ok()?,
+        file_id,
+    })
+}
+
+fn ignore_fingerprint(mut files: Vec<(Vec<u8>, String)>) -> String {
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"graf-ignore-v1");
+    for (path, digest) in files {
+        hash.update(&(path.len() as u64).to_le_bytes());
+        hash.update(&path);
+        hash.update(digest.as_bytes());
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+fn stored_options_value(store: &Store) -> Result<serde_json::Value> {
+    Ok(store
+        .graph_metadata()?
+        .get("graf_index_options")
+        .cloned()
+        .unwrap_or(serde_json::to_value(IndexOptions::default())?))
+}
+
+fn scan_manifest_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(".scan-manifest.json");
+    PathBuf::from(name)
+}
+
+fn database_identity(db: &Path) -> Option<DatabaseIdentity> {
+    let metadata = std::fs::symlink_metadata(db).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .to_string();
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(windows)]
+    let file_id = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.creation_time().to_string()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file_id = modified.clone();
+    Some(DatabaseIdentity {
+        length: metadata.len(),
+        modified,
+        file_id,
+    })
+}
+
+fn manifest_matches(path: &Path, expected: &ScanManifest) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_SCAN_MANIFEST_BYTES
+    {
+        return false;
+    }
+    let Ok((_, Some(bytes))) = read_source(path, MAX_SCAN_MANIFEST_BYTES) else {
+        return false;
+    };
+    serde_json::from_slice::<ScanManifest>(&bytes).is_ok_and(|actual| actual == *expected)
+}
+
+fn write_manifest(path: &Path, manifest: &ScanManifest) -> Result<()> {
+    let bytes = serde_json::to_vec(manifest)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_SCAN_MANIFEST_BYTES,
+        "scan manifest exceeds size limit"
+    );
+    let parent = path.parent().context("scan manifest has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("cannot publish scan manifest")?;
+    Ok(())
+}
+
+fn unchanged_report(
+    stats: &Stats,
+    options: &IndexOptions,
+    started: std::time::Instant,
+) -> Result<IndexReport> {
+    let semantic_usage = options
+        .ingest
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.runtime_budget.as_ref())
+        .map(|budget| budget.usage())
+        .transpose()?;
+    let provider_usage = options
+        .ingest
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.runtime_usage.as_ref())
+        .map(|recorder| recorder.snapshot())
+        .transpose()?;
+    let timings = options.timing.then(|| {
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        IndexTimings {
+            detect_ms: total_ms,
+            extract_ms: 0.0,
+            commit_ms: 0.0,
+            total_ms,
+            capture_ms: None,
+        }
+    });
+    Ok(IndexReport {
+        schema_version: stats.schema_version,
+        generation: stats.generation,
+        parsed_files: 0,
+        unchanged_files: stats.coverage.supported_files,
+        deleted_files: 0,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        diagnostics: stats.diagnostics.clone(),
+        semantic_usage,
+        provider_usage,
+        timings,
+    })
+}
+
 pub fn check_update(root: &Path, db: &Path) -> Result<Freshness> {
     let root = root.canonicalize()?;
     let store = Store::open_read_only(db)?;
@@ -522,13 +953,45 @@ pub fn check_update(root: &Path, db: &Path) -> Result<Freshness> {
         "index root differs from the stored root"
     );
     let options = stored_options(db)?;
-    let (files, _) = discover(&root, &db.canonicalize()?, &options)?;
-    let context = ProjectContext::discover_with_swift_modules(
+    let db = db.canonicalize()?;
+    let scan = prepare_scan(&root, &db, &options, false)?;
+    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
+    let index_options = serde_json::to_value(&options)?;
+    if let Some(proof) = &scan.proof
+        && let Some(database) = database_identity(&db)
+        && manifest_matches(
+            &scan_manifest_path(&db),
+            &ScanManifest {
+                version: SCAN_MANIFEST_VERSION,
+                root: root
+                    .to_str()
+                    .context("index root must be UTF-8")?
+                    .to_owned(),
+                database,
+                generation: stats.generation,
+                stored_options: stored_options_value(&store)?,
+                index_options,
+                extractor_revision: EXTRACTOR_REVISION,
+                language_revision: languages::revision().into(),
+                ingest_fingerprint: ingest_fingerprint.clone(),
+                scan: proof.clone(),
+            },
+        )
+    {
+        return Ok(Freshness {
+            generation: stats.generation,
+            changed: vec![],
+            added: vec![],
+            deleted: vec![],
+            fresh: true,
+        });
+    }
+    let PreparedScan { files, managed, .. } = scan;
+    let context = discover_project_context(
         &root,
         &files.iter().map(|f| f.1.clone()).collect::<Vec<_>>(),
         &options.swift_modules,
     )?;
-    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
     let mut old: HashMap<_, _> = store
         .file_stamps()?
         .into_iter()
@@ -566,7 +1029,7 @@ pub fn check_update(root: &Path, db: &Path) -> Result<Freshness> {
             _ => (),
         }
     }
-    for facts in crate::sources::read(&root)? {
+    for facts in managed {
         match old.remove(&facts.path) {
             None => result.added.push(facts.path),
             Some(previous) if previous != facts.hash => result.changed.push(facts.path),
@@ -887,12 +1350,10 @@ fn stamp(
     }
 }
 
-fn discover(
-    root: &Path,
-    db: &Path,
-    options: &IndexOptions,
-) -> Result<(Vec<(PathBuf, String)>, Coverage)> {
+fn discover(root: &Path, db: &Path, options: &IndexOptions) -> Result<Discovery> {
     let db = db.to_path_buf();
+    let context_files = discover_context_files(root, &db, options);
+    let manifest = scan_manifest_path(&db);
     let sidecars: Vec<_> = ["-wal", "-shm", "-journal"]
         .iter()
         .map(|suffix| {
@@ -920,7 +1381,10 @@ fn discover(
             if entry.file_type().is_some_and(|t| t.is_symlink()) {
                 return false;
             }
-            if entry.path() == db || sidecars.iter().any(|p| p == entry.path()) {
+            if entry.path() == db
+                || entry.path() == manifest
+                || sidecars.iter().any(|p| p == entry.path())
+            {
                 return false;
             }
             !entry.file_type().is_some_and(|t| {
@@ -938,13 +1402,14 @@ fn discover(
         });
     let mut coverage = Coverage::default();
     let mut files = vec![];
+    let mut ignore_files = Some(vec![]);
     for entry in walker.build() {
         let entry = entry.context("cannot walk index root")?;
         if let Some(error) = entry.error() {
             bail!("cannot apply ignore rules: {error}");
         }
         if entry.file_type().is_some_and(|t| t.is_dir()) {
-            check_ignore_files(entry.path(), options.no_gitignore)?;
+            check_ignore_files(entry.path(), options.no_gitignore, &mut ignore_files)?;
         }
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -977,10 +1442,99 @@ fn discover(
         files.push((entry.path().to_path_buf(), relative));
     }
     files.sort_by(|a, b| a.1.cmp(&b.1));
-    Ok((files, coverage))
+    Ok(Discovery {
+        files,
+        coverage,
+        ignore_files,
+        context_files,
+    })
 }
 
-fn check_ignore_files(directory: &Path, no_gitignore: bool) -> Result<()> {
+// Project context deliberately reads nearby manifests and explicitly named
+// source modules even when ignore rules exclude them from the graph. A cache
+// proof must therefore observe those possible inputs too. This second walk
+// ignores repository ignore files but retains Graf's fixed generated-directory
+// boundaries; any traversal uncertainty simply disables the shortcut.
+fn discover_context_files(
+    root: &Path,
+    db: &Path,
+    options: &IndexOptions,
+) -> Option<Vec<(PathBuf, String)>> {
+    let db = db.to_path_buf();
+    let manifest = scan_manifest_path(&db);
+    let sidecars: Vec<_> = ["-wal", "-shm", "-journal"]
+        .iter()
+        .map(|suffix| {
+            let mut path = db.as_os_str().to_owned();
+            path.push(suffix);
+            PathBuf::from(path)
+        })
+        .collect();
+    let include_generated = options.include_generated;
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .hidden(false)
+        .follow_links(false)
+        .require_git(false)
+        .ignore(false)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .parents(false)
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+                return false;
+            }
+            if entry.path() == db
+                || entry.path() == manifest
+                || sidecars.iter().any(|path| path == entry.path())
+            {
+                return false;
+            }
+            !entry.file_type().is_some_and(|kind| {
+                kind.is_dir()
+                    && match entry.file_name().to_str() {
+                        Some(".git" | ".graf") => true,
+                        Some(
+                            ".venv" | "venv" | "env" | "__pycache__" | "node_modules"
+                            | "site-packages" | "target" | "build" | "dist" | ".tox" | ".nox"
+                            | ".mypy_cache" | ".pytest_cache" | ".ruff_cache",
+                        ) => !include_generated,
+                        _ => false,
+                    }
+            })
+        });
+    let mut files = vec![];
+    for entry in walker.build() {
+        let entry = entry.ok()?;
+        if entry.error().is_some() {
+            return None;
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            return None;
+        }
+        let relative = entry.path().strip_prefix(root).ok()?.to_str()?.to_owned();
+        #[cfg(windows)]
+        let relative = relative.replace('\\', "/");
+        if is_code(&relative) || content_probe(&relative) {
+            files.push((entry.path().to_path_buf(), relative));
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Some(files)
+}
+
+fn check_ignore_files(
+    directory: &Path,
+    no_gitignore: bool,
+    manifest_files: &mut Option<Vec<(Vec<u8>, String)>>,
+) -> Result<()> {
     // WalkBuilder suppresses ignore-file I/O errors, including invalid UTF-8.
     // Validate each visited directory so partial rules cannot publish a graph
     // that silently includes excluded files. Pruned subtrees need no validation.
@@ -1013,6 +1567,22 @@ fn check_ignore_files(directory: &Path, no_gitignore: bool) -> Result<()> {
         }
         if let Some(error) = ignore::gitignore::GitignoreBuilder::new(directory).add(&path) {
             bail!("cannot apply ignore rules: {error}");
+        }
+        if manifest_files.is_some() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                *manifest_files = None;
+                continue;
+            }
+            let (digest, content) = read_source(&path, MAX_IGNORE_BYTES)?;
+            if content.is_none() {
+                *manifest_files = None;
+                continue;
+            }
+            manifest_files
+                .as_mut()
+                .unwrap()
+                .push((path.as_os_str().as_encoded_bytes().to_vec(), digest));
         }
     }
     Ok(())
@@ -1107,10 +1677,18 @@ mod tests {
 
     thread_local! {
         static AFTER_PYTHON_INVENTORY: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static BEFORE_PUBLISH_VALIDATION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     pub(super) fn after_python_inventory() {
         let hook = AFTER_PYTHON_INVENTORY.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(super) fn before_publish_validation() {
+        let hook = BEFORE_PUBLISH_VALIDATION.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook();
         }
@@ -1185,5 +1763,45 @@ mod tests {
             assert_eq!(target(&snapshot()), "second");
             assert_eq!(run(root.path(), &db).unwrap().parsed_files, 0);
         }
+    }
+
+    #[test]
+    fn cached_document_change_with_restored_metadata_aborts_before_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join(".graf/index.db");
+        let source = root.path().join("notes.md");
+        fs::write(&source, "alpha\n").unwrap();
+        let initial = run(root.path(), &db).unwrap();
+        let before =
+            serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap();
+
+        fs::write(&source, "bravo\n").unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(metadata.accessed().unwrap())
+            .set_modified(metadata.modified().unwrap());
+        let changed = source.clone();
+        BEFORE_PUBLISH_VALIDATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::write(&changed, "cider\n").unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .open(&changed)
+                    .unwrap()
+                    .set_times(times)
+                    .unwrap();
+            }));
+        });
+
+        let error = run(root.path(), &db).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source tree changed during indexing"),
+            "{error:#}"
+        );
+        let after = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+        assert_eq!(after.generation, initial.generation);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
 }
