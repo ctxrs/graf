@@ -295,6 +295,56 @@ fn edge(id: &str, source: &str, target: &str, directed: bool) -> Edge {
 }
 
 #[test]
+fn empty_native_node_and_edge_ids_are_rejected_in_fresh_and_initialized_stores()
+-> anyhow::Result<()> {
+    for initialized in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let db = directory.path().join("index.db");
+        let mut store = Store::create(&db)?;
+        if initialized {
+            store.apply_native(
+                "repo",
+                vec![file(
+                    "seed.py",
+                    vec![node("seed", "seed.py", "python:seed")],
+                    vec![],
+                )],
+                vec![],
+                Coverage::default(),
+            )?;
+        }
+
+        let mut empty_node = node("", "bad-node.py", "python:bad");
+        empty_node.label = "bad".into();
+        let invalid_node = file("bad-node.py", vec![empty_node], vec![]);
+        let mut invalid_edge = file(
+            "bad-edge.py",
+            vec![
+                node("left", "bad-edge.py", "python:left"),
+                node("right", "bad-edge.py", "python:right"),
+            ],
+            vec![],
+        );
+        invalid_edge.edges.push(edge("", "left", "right", true));
+
+        for (facts, expected) in [
+            (invalid_node, "node ID cannot be empty"),
+            (invalid_edge, "edge ID cannot be empty"),
+        ] {
+            let before = serde_json::to_value(store.snapshot()?)?;
+            let generation = store.stats()?.generation;
+            let error = store
+                .apply_native("repo", vec![facts], vec![], Coverage::default())
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(store.stats()?.generation, generation);
+            assert_eq!(serde_json::to_value(store.snapshot()?)?, before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn bounded_snapshots_include_unresolved_evidence_and_check_payload_before_loading()
 -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;

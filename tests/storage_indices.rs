@@ -169,7 +169,7 @@ fn assert_layout(conn: &Connection) -> anyhow::Result<()> {
     }
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))?,
-        3
+        4
     );
     // General adjacency and ref_key's original uniqueness constraint stay intact.
     for index in [
@@ -619,11 +619,13 @@ fn failed_native_and_import_writes_roll_back_layout_and_graph() -> anyhow::Resul
             END;")?;
         let old_schema = schema(&conn)?;
         let old_cookie: i64 = conn.pragma_query_value(None, "schema_version", |r| r.get(0))?;
+        let mut changed = facts();
+        changed.nodes[0].label.push_str(" changed");
         let error = if imported {
             store.refresh_import(graph()).unwrap_err()
         } else {
             store
-                .apply_native("repo", vec![facts()], vec![], Coverage::default())
+                .apply_native("repo", vec![changed.clone()], vec![], Coverage::default())
                 .unwrap_err()
         };
         assert!(
@@ -640,12 +642,26 @@ fn failed_native_and_import_writes_roll_back_layout_and_graph() -> anyhow::Resul
         if imported {
             store.refresh_import(graph())?;
         } else {
-            store.apply_native("repo", vec![facts()], vec![], Coverage::default())?;
+            store.apply_native("repo", vec![changed], vec![], Coverage::default())?;
         }
         assert_layout(&conn)?;
-        let mut expected = before;
-        expected["generation"] = json!(expected["generation"].as_u64().unwrap() + 1);
-        assert_eq!(snapshot(&store)?, expected);
+        let after = snapshot(&store)?;
+        assert_eq!(
+            after["generation"],
+            json!(before["generation"].as_u64().unwrap() + 1)
+        );
+        if imported {
+            let mut expected = before;
+            expected["generation"] = after["generation"].clone();
+            assert_eq!(after, expected);
+        } else {
+            assert!(
+                after["nodes"].as_array().unwrap()[0]["label"]
+                    .as_str()
+                    .unwrap()
+                    .contains("changed")
+            );
+        }
     }
     Ok(())
 }

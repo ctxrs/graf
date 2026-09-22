@@ -148,11 +148,11 @@ fn records(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
     } else {
         [
             "SELECT json_array(fkey,path,hash,module,diagnostics) FROM files ORDER BY path",
-            "SELECT json_array(n.nkey,n.id,n.label,n.qualified_name,n.binding_key,n.file,f.path,n.payload,n.search) FROM nodes n LEFT JOIN files f ON f.fkey=n.owner_key ORDER BY n.id",
-            "SELECT json_array(r.rkey,r.id,n.id,f.path,r.relation,r.payload,t.id,r.resolution_reason) FROM refs r JOIN nodes n ON n.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
+            "SELECT json_array(n.nkey,n.id,n.label,n.qualified_name,n.binding_key,n.file,f.path,printf('%s',n.payload),n.search) FROM nodes n LEFT JOIN files f ON f.fkey=n.owner_key ORDER BY n.id",
+            "SELECT json_array(r.rkey,r.id,n.id,f.path,r.relation,printf('%s',r.payload),t.id,r.resolution_reason) FROM refs r JOIN nodes n ON n.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
             "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
             "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
-            "SELECT json_array(e.id,s.id,t.id,e.relation,e.directed,f.path,r.id,e.payload) FROM edges e JOIN nodes s ON s.nkey=e.source_key JOIN nodes t ON t.nkey=e.target_key LEFT JOIN files f ON f.fkey=e.owner_key LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
+            "SELECT json_array(e.id,s.id,t.id,e.relation,e.directed,f.path,r.id,printf('%s',e.payload)) FROM edges e JOIN nodes s ON s.nkey=e.source_key JOIN nodes t ON t.nkey=e.target_key LEFT JOIN files f ON f.fkey=e.owner_key LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
         ]
     };
     let mut result: Vec<_> = sql
@@ -174,14 +174,14 @@ fn integrity(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 fn projected(conn: &Connection) -> anyhow::Result<()> {
-    assert_eq!(version(conn)?, 3);
+    assert_eq!(version(conn)?, 4);
     assert_eq!(
         conn.query_row(
             "SELECT hidden FROM pragma_table_xinfo('refs') WHERE name='id'",
             [],
             |r| r.get::<_, i64>(0)
         )?,
-        2
+        0
     );
     assert_eq!(
         strings(
@@ -200,18 +200,16 @@ fn projected(conn: &Connection) -> anyhow::Result<()> {
 fn restore_format2(conn: &Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "foreign_keys", true)?;
     let tx = conn.unchecked_transaction()?;
-    let children = strings(
-        &tx,
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name IN ('ref_keys','edges') ORDER BY name",
-    )?;
     let indexes = strings(
         &tx,
         "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name IN ('refs','ref_keys','edges') AND sql IS NOT NULL ORDER BY name",
     )?;
     tx.execute_batch(
-        "CREATE TEMP TABLE saved_refs AS SELECT * FROM refs;
+        "CREATE TEMP TABLE saved_refs AS
+            SELECT rkey,id,source_key,owner_key,relation,printf('%s',payload),resolved_target_key,resolution_reason FROM refs;
         CREATE TEMP TABLE saved_keys AS SELECT * FROM ref_keys;
-        CREATE TEMP TABLE saved_edges AS SELECT rowid AS saved_rowid,* FROM edges;
+        CREATE TEMP TABLE saved_edges AS
+            SELECT rowid AS saved_rowid,id,source_key,target_key,relation,directed,owner_key,ref_key,printf('%s',payload) FROM edges;
         DROP TABLE edges; DROP TABLE ref_keys; DROP TABLE refs;
         CREATE TABLE refs (
             rkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
@@ -219,11 +217,22 @@ fn restore_format2(conn: &Connection) -> anyhow::Result<()> {
             owner_key INTEGER NOT NULL REFERENCES files(fkey) ON DELETE CASCADE,
             relation TEXT NOT NULL, payload TEXT NOT NULL,
             resolved_target_key INTEGER, resolution_reason TEXT NOT NULL
+        );
+        CREATE TABLE ref_keys (
+            ref_key INTEGER NOT NULL REFERENCES refs(rkey) ON DELETE CASCADE,
+            priority INTEGER NOT NULL, binding_key TEXT NOT NULL,
+            PRIMARY KEY(ref_key, priority)
+        ) WITHOUT ROWID;
+        CREATE TABLE edges (
+            id TEXT PRIMARY KEY,
+            source_key INTEGER NOT NULL REFERENCES nodes(nkey) ON DELETE CASCADE,
+            target_key INTEGER NOT NULL REFERENCES nodes(nkey) ON DELETE CASCADE,
+            relation TEXT NOT NULL, directed INTEGER NOT NULL CHECK(directed IN (0, 1)),
+            owner_key INTEGER REFERENCES files(fkey) ON DELETE CASCADE,
+            ref_key INTEGER UNIQUE REFERENCES refs(rkey) ON DELETE CASCADE,
+            payload TEXT NOT NULL
         );",
     )?;
-    for sql in children {
-        tx.execute_batch(&sql)?;
-    }
     tx.execute_batch("INSERT INTO refs SELECT * FROM saved_refs;
         INSERT INTO ref_keys SELECT * FROM saved_keys;
         INSERT INTO edges(rowid,id,source_key,target_key,relation,directed,owner_key,ref_key,payload) SELECT * FROM saved_edges;
@@ -412,8 +421,8 @@ fn late_write_failure_rolls_back_upgrade_and_all_graph_state() -> anyhow::Result
         let conn = old_fixture(&db, format)?;
         conn.execute_batch(
             "CREATE TRIGGER reject_late BEFORE UPDATE OF generation ON metadata BEGIN
-            SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=3
-            AND (SELECT hidden FROM pragma_table_xinfo('refs') WHERE name='id')=2
+            SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=4
+            AND (SELECT hidden FROM pragma_table_xinfo('refs') WHERE name='id')=0
             THEN RAISE(ABORT,'after projected replacement') ELSE RAISE(ABORT,'too early') END;
         END;",
         )?;

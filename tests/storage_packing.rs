@@ -108,13 +108,13 @@ fn schema(conn: &Connection) -> anyhow::Result<Vec<String>> {
 fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
     let compact = matches!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2 | 3
+        2..=4
     );
     let statements = if compact {
         [
-            "SELECT json_array(rowid,id,payload,search) FROM nodes ORDER BY id",
-            "SELECT json_array(e.id,e.payload,r.id) FROM edges e LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
-            "SELECT json_array(r.id,r.payload,n.id,r.resolution_reason) FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key ORDER BY r.id",
+            "SELECT json_array(rowid,id,printf('%s',payload),search) FROM nodes ORDER BY id",
+            "SELECT json_array(e.id,printf('%s',e.payload),r.id) FROM edges e LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
+            "SELECT json_array(r.id,printf('%s',r.payload),n.id,r.resolution_reason) FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key ORDER BY r.id",
             "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
             "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
         ]
@@ -183,7 +183,7 @@ fn assert_packed(conn: &Connection) -> anyhow::Result<()> {
     );
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        3
+        4
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {

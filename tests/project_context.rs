@@ -886,6 +886,30 @@ fn javascript_config_changes_match_fresh_and_preserve_unrelated_outcomes() {
 }
 
 #[test]
+fn empty_typescript_config_is_a_noop_and_can_later_define_paths() {
+    let f = Fixture::new();
+    f.write("tsconfig.json", "");
+    f.write("lib.ts", "export function work() {}\n");
+    f.write(
+        "main.ts",
+        "import {work} from './lib'; export function Main(){work();}\n",
+    );
+    let graph = f.index();
+    assert!(calls(&graph, ("main.ts", "Main"), ("lib.ts", "work")));
+
+    f.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"target":["lib.ts"]}}}"#,
+    );
+    f.write(
+        "main.ts",
+        "import {work} from 'target'; export function Main(){work();}\n",
+    );
+    let graph = f.index();
+    assert!(calls(&graph, ("main.ts", "Main"), ("lib.ts", "work")));
+}
+
+#[test]
 fn go_uses_declared_package_names_excludes_external_tests_and_rebinds_modules() {
     let f = Fixture::new();
     f.write("go.mod", "module example.org/project\n\ngo 1.22\n");
@@ -2193,7 +2217,7 @@ fn rust_stored_outcome(db: &std::path::Path) -> serde_json::Value {
             "SELECT json_array(ref_id,priority,binding_key) FROM ref_keys ORDER BY ref_id,priority",
             "SELECT json_array(node_id,binding_key) FROM node_aliases ORDER BY node_id,binding_key",
         ],
-        2 | 3 => [
+        2..=4 => [
             "SELECT json_array(r.id,s.id,f.path,r.relation,r.payload,t.id,r.resolution_reason) FROM refs r JOIN nodes s ON s.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
             "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
             "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
@@ -2210,7 +2234,7 @@ fn rust_stored_outcome(db: &std::path::Path) -> serde_json::Value {
             .unwrap()
             .is_none()
     );
-    if matches!(physical_version, 2 | 3) {
+    if matches!(physical_version, 2..=4) {
         let dangling: i64 = connection
             .query_row(
                 "SELECT count(*) FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key WHERE r.resolved_target_key IS NOT NULL AND n.nkey IS NULL",

@@ -1,6 +1,6 @@
 use crate::{
     model::*,
-    store::{StorageLayout, generation, storage_layout},
+    store::{StorageLayout, generation, normalized_storage, storage_layout},
 };
 use anyhow::{Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -806,12 +806,18 @@ fn node_matches(node: &Node, options: &SearchOptions) -> bool {
         && (options.kinds.is_empty() || options.kinds.contains(&node.kind))
 }
 
-fn filter_sql(options: &SearchOptions, values: &mut Vec<rusqlite::types::Value>) -> String {
+fn filter_sql(
+    conn: &Connection,
+    options: &SearchOptions,
+    values: &mut Vec<rusqlite::types::Value>,
+) -> Result<String> {
     let mut sql = String::new();
-    for (column, filters) in [
-        ("n.file", &options.files),
-        ("json_extract(n.payload,'$.kind')", &options.kinds),
-    ] {
+    let kind = if normalized_storage(conn)? {
+        "n.kind"
+    } else {
+        "json_extract(n.payload,'$.kind')"
+    };
+    for (column, filters) in [("n.file", &options.files), (kind, &options.kinds)] {
         if !filters.is_empty() {
             sql.push_str(&format!(
                 " AND {column} IN ({})",
@@ -820,7 +826,7 @@ fn filter_sql(options: &SearchOptions, values: &mut Vec<rusqlite::types::Value>)
             values.extend(filters.iter().cloned().map(Into::into));
         }
     }
-    sql
+    Ok(sql)
 }
 
 fn enriched_search_index(conn: &Connection) -> Result<bool> {
@@ -980,7 +986,7 @@ fn exact_filtered(
     };
     for column in columns {
         let mut values: Vec<rusqlite::types::Value> = vec![text.to_owned().into()];
-        let filters = filter_sql(options, &mut values);
+        let filters = filter_sql(conn, options, &mut values)?;
         let sql = format!(
             "SELECT n.payload FROM nodes n WHERE n.{column}=?{filters} ORDER BY n.id LIMIT {}",
             MAX_SEEDS + 1
@@ -1010,7 +1016,7 @@ fn exact_filtered(
         for column in ["id", "label", "qualified_name"] {
             let mut values: Vec<rusqlite::types::Value> =
                 vec![file.to_owned().into(), symbol.to_owned().into()];
-            let filters = filter_sql(options, &mut values);
+            let filters = filter_sql(conn, options, &mut values)?;
             let sql = format!(
                 "SELECT n.payload FROM nodes n WHERE n.file=? AND n.{column}=?{filters} ORDER BY n.id LIMIT {}",
                 MAX_SEEDS + 1
@@ -1213,13 +1219,17 @@ fn file_nodes(
         .and_then(|s| s.to_str())
         .unwrap_or(file);
     let mut values: Vec<rusqlite::types::Value> = vec![file.to_owned().into()];
-    let filters = filter_sql(options, &mut values);
+    let filters = filter_sql(conn, options, &mut values)?;
     values.push(basename.to_owned().into());
     values.push((limit as i64).into());
+    let root_order = if normalized_storage(conn)? {
+        "n.kind IN ('file','module') OR (n.line=1 AND n.label=?)"
+    } else {
+        "json_extract(n.payload,'$.kind') IN ('file','module') OR (json_extract(n.payload,'$.line')=1 AND n.label=?)"
+    };
     let sql = format!(
         "SELECT n.payload FROM nodes n WHERE n.file=?{filters}
-        ORDER BY CASE WHEN json_extract(n.payload,'$.kind') IN ('file','module')
-        OR (json_extract(n.payload,'$.line')=1 AND n.label=?) THEN 0 ELSE 1 END,n.id LIMIT ?"
+        ORDER BY CASE WHEN {root_order} THEN 0 ELSE 1 END,n.id LIMIT ?"
     );
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(rusqlite::params_from_iter(values), |r| {
@@ -1263,7 +1273,7 @@ fn resolve_endpoint_in(conn: &Connection, text: &str, options: &SearchOptions) -
         && term.contains('.')
         && term.split('.').all(|component| !component.is_empty());
     let mut values = Vec::new();
-    let mut filters = filter_sql(options, &mut values);
+    let mut filters = filter_sql(conn, options, &mut values)?;
     if let Some(file) = file {
         filters.push_str(" AND n.file=?");
         values.push(source_path(conn, file)?.into());
@@ -1521,7 +1531,7 @@ fn rank_seeds(conn: &Connection, text: &str, options: &SearchOptions) -> Result<
         let expression = format!("\"{literal}\"*");
         let term = &normalized_terms[index];
         let mut values: Vec<rusqlite::types::Value> = vec![expression.into()];
-        let filters = filter_sql(options, &mut values);
+        let filters = filter_sql(conn, options, &mut values)?;
         // Enumerate postings, not the snapshot, and rank only after the complete
         // candidate set is known. Refuse an incomplete set: ranking a rowid
         // sample can silently exclude the best hit and depend on insert order.
