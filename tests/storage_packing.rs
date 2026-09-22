@@ -108,7 +108,7 @@ fn schema(conn: &Connection) -> anyhow::Result<Vec<String>> {
 fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
     let compact = matches!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2..=4
+        2..=5
     );
     let statements = if compact {
         [
@@ -183,7 +183,7 @@ fn assert_packed(conn: &Connection) -> anyhow::Result<()> {
     );
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        4
+        5
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {

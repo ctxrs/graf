@@ -2217,7 +2217,7 @@ fn rust_stored_outcome(db: &std::path::Path) -> serde_json::Value {
             "SELECT json_array(ref_id,priority,binding_key) FROM ref_keys ORDER BY ref_id,priority",
             "SELECT json_array(node_id,binding_key) FROM node_aliases ORDER BY node_id,binding_key",
         ],
-        2..=4 => [
+        2..=5 => [
             "SELECT json_array(r.id,s.id,f.path,r.relation,r.payload,t.id,r.resolution_reason) FROM refs r JOIN nodes s ON s.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
             "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
             "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
@@ -2234,7 +2234,7 @@ fn rust_stored_outcome(db: &std::path::Path) -> serde_json::Value {
             .unwrap()
             .is_none()
     );
-    if matches!(physical_version, 2..=4) {
+    if matches!(physical_version, 2..=5) {
         let dangling: i64 = connection
             .query_row(
                 "SELECT count(*) FROM refs r LEFT JOIN nodes n ON n.nkey=r.resolved_target_key WHERE r.resolved_target_key IS NOT NULL AND n.nkey IS NULL",

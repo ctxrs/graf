@@ -1965,7 +1965,7 @@ fn search_migration_is_write_only_atomic_and_advances_generation_once() {
     assert_eq!(
         sql.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -2437,7 +2437,7 @@ fn scoped_qualified_tail_preserves_layouts_consumers_and_read_only_bytes() {
         let version: i64 = sql
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, if legacy { 1 } else { 4 });
+        assert_eq!(version, if legacy { 1 } else { 5 });
         drop(sql);
         let before = std::fs::read(&path).unwrap();
         let graph = Store::open_read_only(&path).unwrap();

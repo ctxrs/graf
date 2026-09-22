@@ -10,21 +10,21 @@ use serde_json::{Value, json};
 mod legacy;
 
 const OLD_INDICES: &str = "
-DROP INDEX nodes_qualified;
+DROP INDEX IF EXISTS nodes_qualified;
 CREATE INDEX nodes_qualified ON nodes(qualified_name, id);
-DROP INDEX nodes_binding;
+DROP INDEX IF EXISTS nodes_binding;
 CREATE INDEX nodes_binding ON nodes(binding_key, id);
-DROP INDEX nodes_owner;
+DROP INDEX IF EXISTS nodes_owner;
 CREATE INDEX nodes_owner ON nodes(owner_file);
-DROP INDEX edges_owner;
+DROP INDEX IF EXISTS edges_owner;
 CREATE INDEX edges_owner ON edges(owner_file);
-DROP INDEX edges_source_direction;
+DROP INDEX IF EXISTS edges_source_direction;
 CREATE INDEX edges_source_direction ON edges(source, directed, id);
-DROP INDEX edges_target_direction;
+DROP INDEX IF EXISTS edges_target_direction;
 CREATE INDEX edges_target_direction ON edges(target, directed, id);
-DROP INDEX edges_source_direction_relation;
+DROP INDEX IF EXISTS edges_source_direction_relation;
 CREATE INDEX edges_source_direction_relation ON edges(source, directed, relation, id);
-DROP INDEX edges_target_direction_relation;
+DROP INDEX IF EXISTS edges_target_direction_relation;
 CREATE INDEX edges_target_direction_relation ON edges(target, directed, relation, id);
 ";
 
@@ -123,30 +123,6 @@ fn assert_layout(conn: &Connection) -> anyhow::Result<()> {
         ),
         ("nodes", "nodes_owner", "owner_key", "owner_key IS NOT NULL"),
         ("edges", "edges_owner", "owner_key", "owner_key IS NOT NULL"),
-        (
-            "edges",
-            "edges_source_direction",
-            "source_key,id",
-            "directed=0",
-        ),
-        (
-            "edges",
-            "edges_target_direction",
-            "target_key,id",
-            "directed=0",
-        ),
-        (
-            "edges",
-            "edges_source_direction_relation",
-            "source_key,relation,id",
-            "directed=0",
-        ),
-        (
-            "edges",
-            "edges_target_direction_relation",
-            "target_key,relation,id",
-            "directed=0",
-        ),
     ] {
         let sql: String = conn.query_row(
             "SELECT sql FROM sqlite_master WHERE name=?1",
@@ -169,20 +145,73 @@ fn assert_layout(conn: &Connection) -> anyhow::Result<()> {
     }
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))?,
-        4
+        5
     );
     // General adjacency and ref_key's original uniqueness constraint stay intact.
-    for index in [
-        "edges_source",
-        "edges_target",
-        "edges_source_relation",
-        "edges_target_relation",
+    for (table, index, columns, partial) in [
+        (
+            "edges",
+            "edges_source_relation",
+            "source_key,relation,id",
+            false,
+        ),
+        (
+            "edges",
+            "edges_target_relation",
+            "target_key,relation,id",
+            false,
+        ),
+        (
+            "refs",
+            "refs_unresolved_relation",
+            "source_key,relation,id",
+            true,
+        ),
     ] {
-        assert!(!conn.query_row(
-            "SELECT partial FROM pragma_index_list('edges') WHERE name=?1",
+        assert_eq!(
+            conn.query_row(
+                "SELECT partial FROM pragma_index_list(?1) WHERE name=?2",
+                params![table, index],
+                |r| r.get::<_, bool>(0)
+            )?,
+            partial,
+        );
+        let actual = conn
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map([index], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join(",");
+        assert_eq!(actual, columns, "{index}");
+    }
+    for (index, columns) in [
+        ("edges_source_direction", "source_key,id"),
+        ("edges_target_direction", "target_key,id"),
+        ("edges_source_direction_relation", "source_key,relation,id"),
+        ("edges_target_direction_relation", "target_key,relation,id"),
+    ] {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name=?1",
             [index],
-            |r| r.get::<_, bool>(0)
-        )?);
+            |r| r.get(0),
+        )?;
+        assert!(sql.ends_with("WHERE directed=0"), "{sql}");
+        let actual = conn
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map([index], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join(",");
+        assert_eq!(actual, columns, "{index}");
+    }
+    for obsolete in ["refs_unresolved_source", "edges_source", "edges_target"] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [obsolete],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0,
+            "{obsolete}"
+        );
     }
     let unique_ref: i64 = conn.query_row(
         "SELECT count(*) FROM pragma_index_list('edges') i JOIN pragma_index_info(i.name) c WHERE i.origin='u' AND c.name='ref_key'", [], |r| r.get(0),
@@ -207,6 +236,11 @@ fn assert_seek(plan: &str, index: &str) {
         !plan.contains("SCAN ") && !plan.contains("TEMP B-TREE"),
         "{plan}"
     );
+}
+
+fn assert_indexed(plan: &str, index: &str) {
+    assert!(plan.contains(index), "{index}: {plan}");
+    assert!(!plan.contains("SCAN "), "{plan}");
 }
 
 #[test]
@@ -287,9 +321,16 @@ fn rare_undirected_streams_seek_past_directed_hubs_under_query_budget() -> anyho
     // query's 5,000-edge admission cap in both stored orientations.
     let mut edges = Vec::new();
     for i in 0..5_001 {
-        edges.push(edge(&format!("out-{i:05}"), "out", "leaf", true, "calls"));
+        edges.push(edge(
+            &format!("out-{i:05}"),
+            "out",
+            "leaf",
+            true,
+            &format!("relation-{i:05}"),
+        ));
         edges.push(edge(&format!("in-{i:05}"), "leaf", "in", true, "calls"));
     }
+    edges.push(edge("000-first", "out", "peer", true, "uses"));
     edges.push(edge("rare-out", "out", "peer", false, "calls"));
     edges.push(edge("rare-in", "peer", "in", false, "calls"));
     store.import_graph(ImportedGraph {
@@ -355,36 +396,63 @@ fn rare_undirected_streams_seek_past_directed_hubs_under_query_budget() -> anyho
         )?;
         assert!(result.truncated);
         assert_eq!(result.edges.len(), 5_000);
+        if hub == "out" {
+            assert_eq!(result.edges[0].id, "000-first");
+            assert!(!result.edges.iter().any(|edge| edge.id == "out-04999"));
+        }
     }
     let conn = Connection::open(&db)?;
     for column in ["source", "target"] {
-        for partial in [false, true] {
-            let filter = if partial { " AND directed=0" } else { "" };
-            let stem = format!("edges_{column}{}", if partial { "_direction" } else { "" });
-            assert_seek(
-                &plan(
-                    &conn,
-                    &format!(
-                        "SELECT payload FROM edges WHERE {column}_key=?1{filter} ORDER BY id LIMIT 10"
-                    ),
-                    &["1"],
-                )?,
-                &stem,
+        for undirected in [false, true] {
+            let filter = if undirected { " AND directed=0" } else { "" };
+            let stem = format!(
+                "edges_{column}{}",
+                if undirected { "_direction" } else { "" }
             );
+            let unordered_index = if undirected {
+                stem.clone()
+            } else {
+                format!("edges_{column}_relation")
+            };
+            let unordered_plan = plan(
+                &conn,
+                &format!(
+                    "SELECT payload FROM edges{} WHERE {column}_key=?1{filter} ORDER BY id LIMIT 10",
+                    if undirected {
+                        format!(" INDEXED BY {stem}")
+                    } else {
+                        String::new()
+                    }
+                ),
+                &["1"],
+            )?;
+            if undirected {
+                assert_seek(&unordered_plan, &unordered_index);
+            } else {
+                assert_indexed(&unordered_plan, &unordered_index);
+            }
             for suffix in [
                 "AND relation=?2 ORDER BY id LIMIT 10",
                 "AND relation>?2 ORDER BY relation LIMIT 1",
             ] {
-                assert_seek(
-                    &plan(
-                        &conn,
-                        &format!(
-                            "SELECT payload FROM edges WHERE {column}_key=?1{filter} {suffix}"
-                        ),
-                        &["1", "calls"],
-                    )?,
-                    &format!("{stem}_relation"),
-                );
+                let relation_plan = plan(
+                    &conn,
+                    &format!(
+                        "SELECT payload FROM edges{} WHERE {column}_key=?1{filter} {suffix}",
+                        if undirected {
+                            format!(" INDEXED BY {stem}_relation")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    &["1", "calls"],
+                )?;
+                let index = if undirected {
+                    format!("{stem}_relation")
+                } else {
+                    format!("edges_{column}_relation")
+                };
+                assert_seek(&relation_plan, &index);
             }
         }
     }
@@ -392,23 +460,40 @@ fn rare_undirected_streams_seek_past_directed_hubs_under_query_budget() -> anyho
         &plan(&conn, "SELECT nkey FROM nodes WHERE id=?1", &["out"])?,
         "sqlite_autoindex_nodes_1",
     );
-    for (predicate, values, index) in [
-        ("", vec!["1"], "refs_unresolved_source"),
-        (
-            " AND relation=?2",
-            vec!["1", "calls"],
-            "refs_unresolved_relation",
-        ),
+    assert_indexed(
+        &plan(&conn, "SELECT rkey FROM refs WHERE source_key=?1", &["1"])?,
+        "refs_source",
+    );
+    for sql in [
+        "SELECT payload,resolution_reason FROM refs INDEXED BY refs_unresolved_relation WHERE source_key=?1 AND resolved_target_key IS NULL AND relation=?2 ORDER BY id LIMIT 10",
+        "SELECT relation FROM refs INDEXED BY refs_unresolved_relation WHERE source_key=?1 AND resolved_target_key IS NULL AND relation>?2 ORDER BY relation LIMIT 1",
     ] {
         assert_seek(
-            &plan(
-                &conn,
-                &format!(
-                    "SELECT payload,resolution_reason FROM refs WHERE source_key=?1 AND resolved_target_key IS NULL{predicate} ORDER BY id LIMIT 10"
-                ),
-                &values,
-            )?,
-            index,
+            &plan(&conn, sql, &["1", "calls"])?,
+            "refs_unresolved_relation",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn open_rejects_an_incomplete_storage_counter_schema() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("damaged.db");
+    drop(Store::create(&db)?);
+    Connection::open(&db)?.execute_batch("DROP TRIGGER storage_count_edges_delete")?;
+
+    for error in [
+        Store::open(&db).err().expect("damaged schema must fail"),
+        Store::open_read_only(&db)
+            .err()
+            .expect("damaged schema must fail"),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete Graf storage counters"),
+            "{error:#}"
         );
     }
     Ok(())
@@ -614,7 +699,9 @@ fn failed_native_and_import_writes_roll_back_layout_and_graph() -> anyhow::Resul
         assert_eq!(schema(&conn)?, old_layout);
         // Prove the failure happens after replacement, not during validation.
         conn.execute_batch("CREATE TRIGGER reject_insert BEFORE INSERT ON nodes BEGIN
-            SELECT CASE WHEN (SELECT partial FROM pragma_index_list('edges') WHERE name='edges_source_direction')=1
+            SELECT CASE WHEN EXISTS(SELECT 1 FROM pragma_index_list('edges') WHERE name='edges_source_direction')
+                AND NOT EXISTS(SELECT 1 FROM pragma_index_list('edges') WHERE name='edges_source')
+                AND EXISTS(SELECT 1 FROM pragma_index_list('edges') WHERE name='edges_source_relation')
                 THEN RAISE(ABORT,'after index migration') ELSE RAISE(ABORT,'before index migration') END;
             END;")?;
         let old_schema = schema(&conn)?;

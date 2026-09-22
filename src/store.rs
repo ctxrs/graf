@@ -24,16 +24,17 @@ pub(crate) fn storage_layout(conn: &Connection) -> Result<StorageLayout> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         1 => Ok(StorageLayout::Legacy),
-        // Formats 3 and 4 expose the same public payload columns. Format 4
-        // reconstructs them from normalized fields instead of storing each
-        // graph record twice.
-        2..=4 => Ok(StorageLayout::Compact),
-        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1, 2, 3 or 4"),
+        // Formats 3 through 5 expose the same public payload columns. Formats
+        // 4 and 5 reconstruct them from normalized fields instead of storing
+        // each graph record twice; format 5 adds derived counters and leaner
+        // indexes without changing the graph model.
+        2..=5 => Ok(StorageLayout::Compact),
+        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1, 2, 3, 4 or 5"),
     }
 }
 
 pub(crate) fn normalized_storage(conn: &Connection) -> Result<bool> {
-    Ok(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 4)
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? >= 4)
 }
 
 pub struct Store {
@@ -62,6 +63,64 @@ CREATE TABLE metadata (
 );
 INSERT INTO metadata VALUES (1, 0, 'empty', NULL,
  '{"supported_files":0,"unsupported_files":0,"unchanged_files":0}', 'null');
+"#;
+
+const STORAGE_COUNTS: &str = r#"
+CREATE TABLE storage_counts (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    files INTEGER NOT NULL CHECK(files >= 0),
+    nodes INTEGER NOT NULL CHECK(nodes >= 0),
+    edges INTEGER NOT NULL CHECK(edges >= 0),
+    unresolved_references INTEGER NOT NULL CHECK(unresolved_references >= 0)
+);
+INSERT INTO storage_counts VALUES (1, 0, 0, 0, 0);
+"#;
+
+const STORAGE_COUNT_TRIGGERS: &str = r#"
+CREATE TRIGGER storage_count_files_insert AFTER INSERT ON files BEGIN
+    UPDATE storage_counts SET files=files+1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_files_delete AFTER DELETE ON files BEGIN
+    UPDATE storage_counts SET files=files-1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_nodes_insert AFTER INSERT ON nodes BEGIN
+    UPDATE storage_counts SET nodes=nodes+1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_nodes_delete AFTER DELETE ON nodes BEGIN
+    UPDATE storage_counts SET nodes=nodes-1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_edges_insert AFTER INSERT ON edges BEGIN
+    UPDATE storage_counts SET edges=edges+1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_edges_delete AFTER DELETE ON edges BEGIN
+    UPDATE storage_counts SET edges=edges-1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_refs_insert AFTER INSERT ON refs
+WHEN new.resolved_target_key IS NULL BEGIN
+    UPDATE storage_counts SET unresolved_references=unresolved_references+1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_refs_delete AFTER DELETE ON refs
+WHEN old.resolved_target_key IS NULL BEGIN
+    UPDATE storage_counts SET unresolved_references=unresolved_references-1 WHERE singleton=1;
+END;
+CREATE TRIGGER storage_count_refs_update AFTER UPDATE OF resolved_target_key ON refs
+WHEN (old.resolved_target_key IS NULL) != (new.resolved_target_key IS NULL) BEGIN
+    UPDATE storage_counts SET unresolved_references=unresolved_references
+        + CASE WHEN new.resolved_target_key IS NULL THEN 1 ELSE -1 END
+        WHERE singleton=1;
+END;
+"#;
+
+const DROP_STORAGE_COUNT_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS storage_count_files_insert;
+DROP TRIGGER IF EXISTS storage_count_files_delete;
+DROP TRIGGER IF EXISTS storage_count_nodes_insert;
+DROP TRIGGER IF EXISTS storage_count_nodes_delete;
+DROP TRIGGER IF EXISTS storage_count_edges_insert;
+DROP TRIGGER IF EXISTS storage_count_edges_delete;
+DROP TRIGGER IF EXISTS storage_count_refs_insert;
+DROP TRIGGER IF EXISTS storage_count_refs_delete;
+DROP TRIGGER IF EXISTS storage_count_refs_update;
 "#;
 
 // The same tables serve fresh stores and transactional upgrades. Temporary
@@ -112,9 +171,6 @@ const COMPACT_PUBLISH: &str = r#"
 ALTER TABLE compact_files RENAME TO files;
 ALTER TABLE compact_nodes RENAME TO nodes;
 ALTER TABLE compact_node_aliases RENAME TO node_aliases;
-CREATE INDEX nodes_label ON nodes(label, id);
-CREATE INDEX nodes_file ON nodes(file, id);
-CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
 CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
 INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
 CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
@@ -129,14 +185,6 @@ const COMPACT_REFERENCE_PUBLISH: &str = r#"
 ALTER TABLE compact_refs RENAME TO refs;
 ALTER TABLE compact_ref_keys RENAME TO ref_keys;
 ALTER TABLE compact_edges RENAME TO edges;
-CREATE INDEX refs_owner ON refs(owner_key);
-CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
-CREATE INDEX edges_source ON edges(source_key, id);
-CREATE INDEX edges_target ON edges(target_key, id);
-CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
-CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
 "#;
 
 // Format 4 keeps the query-facing payload contract but makes it virtual. This
@@ -211,9 +259,6 @@ const NORMALIZED_PUBLISH: &str = r#"
 ALTER TABLE normalized_files RENAME TO files;
 ALTER TABLE normalized_nodes RENAME TO nodes;
 ALTER TABLE normalized_node_aliases RENAME TO node_aliases;
-CREATE INDEX nodes_label ON nodes(label, id);
-CREATE INDEX nodes_file ON nodes(file, id);
-CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
 CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
 INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
 CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
@@ -228,24 +273,32 @@ const NORMALIZED_REFERENCE_PUBLISH: &str = r#"
 ALTER TABLE normalized_refs RENAME TO refs;
 ALTER TABLE normalized_ref_keys RENAME TO ref_keys;
 ALTER TABLE normalized_edges RENAME TO edges;
-CREATE INDEX refs_owner ON refs(owner_key);
-CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
-CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
-CREATE INDEX edges_source ON edges(source_key, id);
-CREATE INDEX edges_target ON edges(target_key, id);
-CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
-CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
 "#;
 
 // Shared by fresh databases and explicit-write migration; these indexes do
 // not change graph identity, payloads, or schema-1 snapshot compatibility.
 const STORAGE_INDICES: &[(&str, &str)] = &[
-    // Unfiltered source lookup serves FK deletion and rebinding. Ordered
-    // unresolved streams keep their separate (source_key, ..., id) indexes.
+    (
+        "nodes_label",
+        "CREATE INDEX nodes_label ON nodes(label, id)",
+    ),
+    ("nodes_file", "CREATE INDEX nodes_file ON nodes(file, id)"),
+    (
+        "node_aliases_binding",
+        "CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key)",
+    ),
     (
         "refs_source",
         "CREATE INDEX refs_source ON refs(source_key)",
+    ),
+    ("refs_owner", "CREATE INDEX refs_owner ON refs(owner_key)"),
+    (
+        "refs_unresolved_relation",
+        "CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL",
+    ),
+    (
+        "ref_keys_binding",
+        "CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key)",
     ),
     (
         "nodes_qualified",
@@ -259,6 +312,17 @@ const STORAGE_INDICES: &[(&str, &str)] = &[
         "nodes_owner",
         "CREATE INDEX nodes_owner ON nodes(owner_key) WHERE owner_key IS NOT NULL",
     ),
+    (
+        "edges_source_relation",
+        "CREATE INDEX edges_source_relation ON edges(source_key, relation, id)",
+    ),
+    (
+        "edges_target_relation",
+        "CREATE INDEX edges_target_relation ON edges(target_key, relation, id)",
+    ),
+    // Undirected edges must be visited from either endpoint in stable ID order.
+    // Partial indexes keep that path fast without duplicating every directed
+    // edge in the overwhelmingly directed native graph.
     (
         "edges_source_direction",
         "CREATE INDEX edges_source_direction ON edges(source_key, id) WHERE directed=0",
@@ -280,6 +344,9 @@ const STORAGE_INDICES: &[(&str, &str)] = &[
         "CREATE INDEX edges_owner ON edges(owner_key) WHERE owner_key IS NOT NULL",
     ),
 ];
+
+const OBSOLETE_STORAGE_INDICES: &[&str] =
+    &["refs_unresolved_source", "edges_source", "edges_target"];
 
 /// A concurrent writer committed after this handle captured its baseline.
 #[derive(Debug)]
@@ -320,8 +387,10 @@ impl Store {
             tx.execute_batch(NORMALIZED_PUBLISH)?;
             tx.execute_batch(NORMALIZED_REFERENCE_PUBLISH)?;
             ensure_storage_indices(&tx)?;
+            tx.execute_batch(STORAGE_COUNTS)?;
+            tx.execute_batch(STORAGE_COUNT_TRIGGERS)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-            tx.pragma_update(None, "user_version", 4)?;
+            tx.pragma_update(None, "user_version", 5)?;
             tx.commit()?;
         }
         validate(&conn)?;
@@ -1232,6 +1301,23 @@ fn validate(conn: &Connection) -> Result<()> {
         StorageLayout::Compact => "SELECT n.nkey,n.payload,n.owner_key,e.payload,e.source_key,e.target_key,e.owner_key,e.ref_key,r.rkey,r.id,r.payload,r.source_key,r.owner_key,r.resolved_target_key,k.ref_key,k.priority,f.fkey,f.hash FROM nodes n,edges e,refs r,ref_keys k,files f LIMIT 0",
     })?;
     conn.prepare("SELECT rowid FROM node_search LIMIT 0")?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version >= 5 {
+        conn.prepare(
+            "SELECT files,nodes,edges,unresolved_references FROM storage_counts WHERE singleton=1 LIMIT 1",
+        )?;
+        let count_triggers: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN (
+                'storage_count_files_insert','storage_count_files_delete',
+                'storage_count_nodes_insert','storage_count_nodes_delete',
+                'storage_count_edges_insert','storage_count_edges_delete',
+                'storage_count_refs_insert','storage_count_refs_delete',
+                'storage_count_refs_update')",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(count_triggers == 9, "incomplete Graf storage counters");
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1296,6 +1382,9 @@ fn binding_aliases(node: &Node) -> Result<Vec<&str>> {
 // checks (or during creation). Index replacement rolls back with the graph on
 // failure and does not advance the logical graph generation on its own.
 fn ensure_storage_indices(tx: &Transaction<'_>) -> Result<()> {
+    for name in OBSOLETE_STORAGE_INDICES {
+        tx.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))?;
+    }
     for &(name, sql) in STORAGE_INDICES {
         let current: Option<String> = tx
             .query_row(
@@ -1309,6 +1398,34 @@ fn ensure_storage_indices(tx: &Transaction<'_>) -> Result<()> {
             tx.execute_batch(&format!("DROP INDEX IF EXISTS {name}; {sql};"))?;
         }
     }
+    Ok(())
+}
+
+fn ensure_storage_counts(tx: &Transaction<'_>) -> Result<()> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_counts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        tx.execute_batch(STORAGE_COUNTS)?;
+    }
+    rebuild_storage_counts(tx)?;
+    tx.execute_batch(DROP_STORAGE_COUNT_TRIGGERS)?;
+    tx.execute_batch(STORAGE_COUNT_TRIGGERS)?;
+    Ok(())
+}
+
+fn rebuild_storage_counts(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "UPDATE storage_counts SET
+            files=(SELECT count(*) FROM files),
+            nodes=(SELECT count(*) FROM nodes),
+            edges=(SELECT count(*) FROM edges),
+            unresolved_references=(SELECT count(*) FROM refs WHERE resolved_target_key IS NULL)
+         WHERE singleton=1",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1455,6 +1572,10 @@ fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> 
     }
     ensure_aliases(tx, keys)?;
     ensure_storage_indices(tx)?;
+    if version < 5 {
+        ensure_storage_counts(tx)?;
+        tx.pragma_update(None, "user_version", 5)?;
+    }
     Ok(search_changed)
 }
 
@@ -1898,6 +2019,7 @@ fn resolved_reference_edge(reference: &Reference, source: &Node, target: &str) -
 // publish those structures once. Integer identities are carried in memory so
 // the initial graph also avoids millions of repeated text-key subqueries.
 fn publish_initial_native(tx: &Transaction<'_>, facts: &[FileFacts]) -> Result<()> {
+    tx.execute_batch(DROP_STORAGE_COUNT_TRIGGERS)?;
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS nodes_insert;
          DROP TRIGGER IF EXISTS nodes_delete;
@@ -2089,18 +2211,7 @@ fn publish_initial_native(tx: &Transaction<'_>, facts: &[FileFacts]) -> Result<(
     }
 
     tx.execute_batch(
-        "CREATE INDEX nodes_label ON nodes(label, id);
-         CREATE INDEX nodes_file ON nodes(file, id);
-         CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
-         CREATE INDEX refs_owner ON refs(owner_key);
-         CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
-         CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
-         CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
-         CREATE INDEX edges_source ON edges(source_key, id);
-         CREATE INDEX edges_target ON edges(target_key, id);
-         CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
-         CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
-         CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
+        "CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
          INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
          CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
              INSERT INTO node_search(rowid,text) VALUES(new.nkey,new.search);
@@ -2110,6 +2221,8 @@ fn publish_initial_native(tx: &Transaction<'_>, facts: &[FileFacts]) -> Result<(
          END;",
     )?;
     ensure_storage_indices(tx)?;
+    rebuild_storage_counts(tx)?;
+    tx.execute_batch(STORAGE_COUNT_TRIGGERS)?;
     Ok(())
 }
 
@@ -2229,6 +2342,7 @@ fn read_stats(conn: &Connection) -> Result<Stats> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
     let layout = storage_layout(conn)?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let mut diagnostics = Vec::new();
     let mut stmt = conn.prepare("SELECT diagnostics FROM files ORDER BY path")?;
     for json in stmt.query_map([], |r| r.get::<_, String>(0))? {
@@ -2238,21 +2352,54 @@ fn read_stats(conn: &Connection) -> Result<Stats> {
         let value: i64 = conn.query_row(sql, [], |r| r.get(0))?;
         Ok(usize::try_from(value)?)
     };
+    let stored_counts = if version >= 5 {
+        let counts: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT files,nodes,edges,unresolved_references FROM storage_counts WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Some((
+            usize::try_from(counts.0)?,
+            usize::try_from(counts.1)?,
+            usize::try_from(counts.2)?,
+            usize::try_from(counts.3)?,
+        ))
+    } else {
+        None
+    };
     Ok(Stats {
         schema_version: SCHEMA_VERSION,
         generation: u64::try_from(generation)?,
         root,
-        nodes: count("SELECT count(*) FROM nodes")?,
-        edges: count("SELECT count(*) FROM edges")?,
+        nodes: stored_counts.as_ref().map_or_else(
+            || count("SELECT count(*) FROM nodes"),
+            |counts| Ok(counts.1),
+        )?,
+        edges: stored_counts.as_ref().map_or_else(
+            || count("SELECT count(*) FROM edges"),
+            |counts| Ok(counts.2),
+        )?,
         files: if kind == "imported" {
             count("SELECT count(DISTINCT file) FROM nodes WHERE file<>''")?
         } else {
-            count("SELECT count(*) FROM files")?
+            stored_counts.as_ref().map_or_else(
+                || count("SELECT count(*) FROM files"),
+                |counts| Ok(counts.0),
+            )?
         },
-        unresolved_references: count(match layout {
-            StorageLayout::Legacy => "SELECT count(*) FROM refs WHERE resolved_target IS NULL",
-            StorageLayout::Compact => "SELECT count(*) FROM refs WHERE resolved_target_key IS NULL",
-        })?,
+        unresolved_references: stored_counts.as_ref().map_or_else(
+            || {
+                count(match layout {
+                    StorageLayout::Legacy => {
+                        "SELECT count(*) FROM refs WHERE resolved_target IS NULL"
+                    }
+                    StorageLayout::Compact => {
+                        "SELECT count(*) FROM refs WHERE resolved_target_key IS NULL"
+                    }
+                })
+            },
+            |counts| Ok(counts.3),
+        )?,
         kind,
         coverage: serde_json::from_str(&coverage)?,
         diagnostics,
