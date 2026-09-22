@@ -504,7 +504,7 @@ fn schema_one_opens_without_migration_and_indexing_backfills_aliases() {
     assert_eq!(
         sql.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 

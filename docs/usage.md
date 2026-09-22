@@ -36,7 +36,7 @@ format is unchanged.
 An upgrade or a large deletion can leave reusable space inside the database
 file. Run `graf compact` to reclaim it explicitly. This reads no source files
 and preserves graph facts and generation; it works on native and imported
-indexes using storage format 2 or 3, without upgrading either. Refresh a
+indexes using storage formats 2 through 5, without upgrading them. Refresh a
 format-1 index before compacting it. Compaction can require temporary free space
 up to twice the database's current size and can fail while another writer holds
 the database. Another

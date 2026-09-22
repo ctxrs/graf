@@ -18,10 +18,11 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 const EXTRACTOR_REVISION: u32 = 12;
-const SCAN_MANIFEST_VERSION: u32 = 2;
+const SCAN_MANIFEST_VERSION: u32 = 3;
 const MAX_SCAN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCAN_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
+const SOURCE_IDENTITY_SETTLE_NANOS: u128 = 2_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +62,15 @@ struct ScanProof {
 struct SourceProof {
     path: String,
     digest: String,
+    identity: Option<ManifestSourceIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestSourceIdentity {
+    length: u64,
+    modified: String,
+    file_id: String,
 }
 
 struct Discovery {
@@ -76,6 +86,7 @@ struct PreparedScan {
     managed: Vec<FileFacts>,
     proof: Option<ScanProof>,
     cached_sources: Option<HashMap<String, CachedSource>>,
+    freshly_read: BTreeSet<String>,
 }
 
 struct CachedSource {
@@ -293,33 +304,50 @@ fn run_prepared(
     let db = db.canonicalize()?;
     let index_options = serde_json::to_value(options)?;
     let stored_options = stored_options_value(&store)?;
+    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
     let mut old: HashMap<_, _> = store
         .file_stamps()?
         .into_iter()
         .map(|f| (f.path, f.hash))
         .collect();
-    let scan = prepare_scan(&root, &db, options, true)?;
-    let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
+    let manifest_path = scan_manifest_path(&db);
+    let existing_manifest = read_manifest(&manifest_path);
+    let database = database_identity(&db);
+    let reusable = existing_manifest.as_ref().and_then(|manifest| {
+        reusable_scan(
+            manifest,
+            root_text,
+            database.as_ref(),
+            stats.generation,
+            &stored_options,
+            &index_options,
+            &ingest_fingerprint,
+        )
+    });
+    let scan = prepare_scan(&root, &db, options, true, reusable, None)?;
     if !options.force
         && let Some(proof) = &scan.proof
         && let Some(database) = database_identity(&db)
-        && manifest_matches(
-            &scan_manifest_path(&db),
-            &ScanManifest {
-                version: SCAN_MANIFEST_VERSION,
-                root: root_text.to_owned(),
-                database,
-                generation: stats.generation,
-                stored_options: stored_options.clone(),
-                index_options: index_options.clone(),
-                extractor_revision: EXTRACTOR_REVISION,
-                language_revision: languages::revision().into(),
-                ingest_fingerprint: ingest_fingerprint.clone(),
-                scan: proof.clone(),
-            },
-        )
     {
-        return unchanged_report(&stats, options, started);
+        let current = ScanManifest {
+            version: SCAN_MANIFEST_VERSION,
+            root: root_text.to_owned(),
+            database,
+            generation: stats.generation,
+            stored_options: stored_options.clone(),
+            index_options: index_options.clone(),
+            extractor_revision: EXTRACTOR_REVISION,
+            language_revision: languages::revision().into(),
+            ingest_fingerprint: ingest_fingerprint.clone(),
+            scan: proof.clone(),
+        };
+        if manifest_matches(&manifest_path, &current) {
+            return unchanged_report(&stats, options, started);
+        }
+        if reusable.is_some_and(|previous| scan_content_matches(previous, proof)) {
+            write_manifest(&manifest_path, &current)?;
+            return unchanged_report(&stats, options, started);
+        }
     }
     let initial_proof = scan.proof.clone();
     let PreparedScan {
@@ -327,6 +355,7 @@ fn run_prepared(
         mut coverage,
         managed,
         mut cached_sources,
+        mut freshly_read,
         ..
     } = scan;
     let mut context = discover_project_context(
@@ -353,7 +382,7 @@ fn run_prepared(
             .and_then(|sources| sources.remove(&relative))
             .filter(|source| source_version(&path).as_ref() == Some(&source.version));
         let cached_version = cached.as_ref().map(|source| source.version.clone());
-        let (content_hash, content) = cached
+        let (content_hash, mut content) = cached
             .map(|source| Ok((source.digest, source.content)))
             .unwrap_or_else(|| read_source(&path, maximum))?;
         context.validate_source(&relative, &content_hash)?;
@@ -372,6 +401,15 @@ fn run_prepared(
         if unchanged && !options.force {
             coverage.unchanged_files += 1;
             continue;
+        }
+        if content.is_none() {
+            freshly_read.insert(relative.clone());
+            let (fresh_hash, fresh_content) = read_source(&path, maximum)?;
+            ensure!(
+                fresh_hash == content_hash,
+                "source changed during indexing; previous graph retained"
+            );
+            content = fresh_content;
         }
         let mut facts = if code {
             match content {
@@ -493,7 +531,14 @@ fn run_prepared(
     #[cfg(test)]
     tests::before_publish_validation();
     if let Some(initial_proof) = &initial_proof {
-        let current = prepare_scan(&root, &db, options, false)?;
+        let current = prepare_scan(
+            &root,
+            &db,
+            options,
+            false,
+            Some(initial_proof),
+            Some(&freshly_read),
+        )?;
         ensure!(
             current.proof.as_ref() == Some(initial_proof),
             "source tree changed during indexing; previous graph retained"
@@ -695,6 +740,8 @@ fn prepare_scan(
     db: &Path,
     options: &IndexOptions,
     cache_sources: bool,
+    previous: Option<&ScanProof>,
+    force_read: Option<&BTreeSet<String>>,
 ) -> Result<PreparedScan> {
     let Discovery {
         files,
@@ -704,6 +751,12 @@ fn prepare_scan(
     } = discover(root, db, options)?;
     let mut cacheable = ignore_files.is_some() && context_files.is_some();
     let mut sources = BTreeMap::new();
+    let previous: BTreeMap<_, _> = previous
+        .into_iter()
+        .flat_map(|proof| &proof.sources)
+        .map(|proof| (proof.path.as_str(), proof))
+        .collect();
+    let mut freshly_read = BTreeSet::new();
     let source_paths: BTreeSet<_> = files.iter().map(|(_, relative)| relative.clone()).collect();
     let mut inputs = BTreeMap::new();
     for (path, relative) in files
@@ -723,8 +776,24 @@ fn prepare_scan(
             continue;
         }
         let version = source_version_from_metadata(&metadata);
-        let (digest, content) = read_source(&path, source_maximum(&relative, options))?;
-        cacheable &= content.is_some();
+        let identity = manifest_source_identity(&metadata);
+        let reusable = force_read
+            .is_none_or(|paths| !paths.contains(&relative))
+            .then(|| {
+                identity.as_ref().and_then(|identity| {
+                    previous
+                        .get(relative.as_str())
+                        .copied()
+                        .filter(|proof| proof.identity.as_ref() == Some(identity))
+                })
+            })
+            .flatten();
+        let (digest, content) = if let Some(proof) = reusable {
+            (proof.digest.clone(), None)
+        } else {
+            freshly_read.insert(relative.clone());
+            read_source(&path, source_maximum(&relative, options))?
+        };
         if source_paths.contains(&relative) && cached_sources.is_some() {
             cached_bytes = cached_bytes.saturating_add(content.as_ref().map_or(0, Vec::len));
             if cached_bytes <= MAX_SCAN_CACHE_BYTES
@@ -748,6 +817,7 @@ fn prepare_scan(
             SourceProof {
                 path: relative,
                 digest,
+                identity,
             },
         );
     }
@@ -757,6 +827,7 @@ fn prepare_scan(
         .map(|facts| SourceProof {
             path: facts.path.clone(),
             digest: facts.hash.clone(),
+            identity: None,
         })
         .collect();
     let proof = cacheable.then(|| ScanProof {
@@ -775,7 +846,68 @@ fn prepare_scan(
         managed,
         proof,
         cached_sources,
+        freshly_read,
     })
+}
+
+#[cfg(unix)]
+fn manifest_source_identity(metadata: &std::fs::Metadata) -> Option<ManifestSourceIdentity> {
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        let changed_seconds = u128::try_from(metadata.ctime()).ok()?;
+        let changed_subsecond = u128::try_from(metadata.ctime_nsec()).ok()?;
+        if changed_subsecond >= 1_000_000_000 {
+            return None;
+        }
+        let changed_nanos = changed_seconds
+            .checked_mul(1_000_000_000)?
+            .checked_add(changed_subsecond)?;
+        let observed_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        // Timestamp metadata is a safe digest cache key only after its
+        // filesystem-resolution window has closed. If a scan overlaps that
+        // window, persist no identity: a later run must hash once more before
+        // it can establish a reusable proof.
+        if !source_identity_settled(modified_nanos, changed_nanos, observed_nanos) {
+            return None;
+        }
+        format!(
+            "{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        )
+    };
+    Some(ManifestSourceIdentity {
+        length: metadata.len(),
+        modified: modified_nanos.to_string(),
+        file_id,
+    })
+}
+
+#[cfg(unix)]
+fn source_identity_settled(
+    modified_nanos: u128,
+    changed_nanos: u128,
+    observed_nanos: u128,
+) -> bool {
+    observed_nanos.saturating_sub(changed_nanos.max(modified_nanos)) >= SOURCE_IDENTITY_SETTLE_NANOS
+}
+
+#[cfg(not(unix))]
+fn manifest_source_identity(_metadata: &std::fs::Metadata) -> Option<ManifestSourceIdentity> {
+    // The portable metadata surface has no change counter independent of mtime.
+    // Keep content hashing on those platforms rather than trust a restorable timestamp.
+    None
 }
 
 fn source_version(path: &Path) -> Option<SourceVersion> {
@@ -864,19 +996,60 @@ fn database_identity(db: &Path) -> Option<DatabaseIdentity> {
 }
 
 fn manifest_matches(path: &Path, expected: &ScanManifest) -> bool {
+    read_manifest(path).is_some_and(|actual| actual == *expected)
+}
+
+fn scan_content_matches(left: &ScanProof, right: &ScanProof) -> bool {
+    fn sources_match(left: &[SourceProof], right: &[SourceProof]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| left.path == right.path && left.digest == right.digest)
+    }
+
+    left.supported_files == right.supported_files
+        && left.unsupported_files == right.unsupported_files
+        && left.ignore_fingerprint == right.ignore_fingerprint
+        && sources_match(&left.sources, &right.sources)
+        && sources_match(&left.managed_sources, &right.managed_sources)
+}
+
+fn read_manifest(path: &Path) -> Option<ScanManifest> {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
+        return None;
     };
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MAX_SCAN_MANIFEST_BYTES
     {
-        return false;
+        return None;
     }
     let Ok((_, Some(bytes))) = read_source(path, MAX_SCAN_MANIFEST_BYTES) else {
-        return false;
+        return None;
     };
-    serde_json::from_slice::<ScanManifest>(&bytes).is_ok_and(|actual| actual == *expected)
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn reusable_scan<'a>(
+    manifest: &'a ScanManifest,
+    root: &str,
+    database: Option<&DatabaseIdentity>,
+    generation: u64,
+    stored_options: &serde_json::Value,
+    index_options: &serde_json::Value,
+    ingest_fingerprint: &str,
+) -> Option<&'a ScanProof> {
+    (manifest.version == SCAN_MANIFEST_VERSION
+        && manifest.root == root
+        && Some(&manifest.database) == database
+        && manifest.generation == generation
+        && &manifest.stored_options == stored_options
+        && &manifest.index_options == index_options
+        && manifest.extractor_revision == EXTRACTOR_REVISION
+        && manifest.language_revision == languages::revision()
+        && manifest.ingest_fingerprint == ingest_fingerprint)
+        .then_some(&manifest.scan)
 }
 
 fn write_manifest(path: &Path, manifest: &ScanManifest) -> Result<()> {
@@ -954,37 +1127,54 @@ pub fn check_update(root: &Path, db: &Path) -> Result<Freshness> {
     );
     let options = stored_options(db)?;
     let db = db.canonicalize()?;
-    let scan = prepare_scan(&root, &db, &options, false)?;
     let ingest_fingerprint = ingest::config_fingerprint(&options.ingest)?;
     let index_options = serde_json::to_value(&options)?;
-    if let Some(proof) = &scan.proof
-        && let Some(database) = database_identity(&db)
-        && manifest_matches(
-            &scan_manifest_path(&db),
-            &ScanManifest {
-                version: SCAN_MANIFEST_VERSION,
-                root: root
-                    .to_str()
-                    .context("index root must be UTF-8")?
-                    .to_owned(),
-                database,
-                generation: stats.generation,
-                stored_options: stored_options_value(&store)?,
-                index_options,
-                extractor_revision: EXTRACTOR_REVISION,
-                language_revision: languages::revision().into(),
-                ingest_fingerprint: ingest_fingerprint.clone(),
-                scan: proof.clone(),
-            },
+    let stored_options = stored_options_value(&store)?;
+    let database = database_identity(&db);
+    let manifest = read_manifest(&scan_manifest_path(&db));
+    let root_text = root
+        .to_str()
+        .context("index root must be UTF-8")?
+        .to_owned();
+    let reusable = manifest.as_ref().and_then(|manifest| {
+        reusable_scan(
+            manifest,
+            &root_text,
+            database.as_ref(),
+            stats.generation,
+            &stored_options,
+            &index_options,
+            &ingest_fingerprint,
         )
-    {
-        return Ok(Freshness {
-            generation: stats.generation,
-            changed: vec![],
-            added: vec![],
-            deleted: vec![],
-            fresh: true,
+    });
+    let scan = prepare_scan(&root, &db, &options, false, reusable, None)?;
+    if let Some(proof) = &scan.proof {
+        let exact = database_identity(&db).is_some_and(|database| {
+            manifest_matches(
+                &scan_manifest_path(&db),
+                &ScanManifest {
+                    version: SCAN_MANIFEST_VERSION,
+                    root: root_text,
+                    database,
+                    generation: stats.generation,
+                    stored_options,
+                    index_options,
+                    extractor_revision: EXTRACTOR_REVISION,
+                    language_revision: languages::revision().into(),
+                    ingest_fingerprint: ingest_fingerprint.clone(),
+                    scan: proof.clone(),
+                },
+            )
         });
+        if exact || reusable.is_some_and(|previous| scan_content_matches(previous, proof)) {
+            return Ok(Freshness {
+                generation: stats.generation,
+                changed: vec![],
+                added: vec![],
+                deleted: vec![],
+                fresh: true,
+            });
+        }
     }
     let PreparedScan { files, managed, .. } = scan;
     let context = discover_project_context(
@@ -1692,6 +1882,52 @@ mod tests {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_identity_reuse_waits_past_the_timestamp_collision_window() {
+        let old = 1_000_000_000_000_u128;
+        assert!(!source_identity_settled(
+            old,
+            old,
+            old + SOURCE_IDENTITY_SETTLE_NANOS - 1
+        ));
+        assert!(source_identity_settled(
+            old,
+            old,
+            old + SOURCE_IDENTITY_SETTLE_NANOS
+        ));
+        assert!(!source_identity_settled(old, old + 1, old));
+        assert!(!source_identity_settled(old + 1, old, old));
+    }
+
+    #[test]
+    fn scan_content_match_ignores_only_promoted_source_identities() {
+        let source = |digest: &str, identity| SourceProof {
+            path: "app.py".into(),
+            digest: digest.into(),
+            identity,
+        };
+        let proof = |source| ScanProof {
+            supported_files: 1,
+            unsupported_files: 0,
+            ignore_fingerprint: "ignore".into(),
+            sources: vec![source],
+            managed_sources: vec![],
+        };
+        let initial = proof(source("same", None));
+        let promoted = proof(source(
+            "same",
+            Some(ManifestSourceIdentity {
+                length: 1,
+                modified: "2".into(),
+                file_id: "3".into(),
+            }),
+        ));
+        let changed = proof(source("changed", None));
+        assert!(scan_content_matches(&initial, &promoted));
+        assert!(!scan_content_matches(&initial, &changed));
     }
 
     #[test]

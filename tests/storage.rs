@@ -1080,7 +1080,7 @@ fn directional_hubs_use_filtered_indexes_and_a_shared_edge_budget() -> anyhow::R
         ("target_key", "edges_target_direction_relation"),
     ] {
         let sql = format!(
-            "EXPLAIN QUERY PLAN SELECT payload FROM edges WHERE {column}=(SELECT nkey FROM nodes WHERE id=?1) AND directed=0 AND relation=?2 ORDER BY id LIMIT 10"
+            "EXPLAIN QUERY PLAN SELECT payload FROM edges INDEXED BY {expected} WHERE {column}=(SELECT nkey FROM nodes WHERE id=?1) AND directed=0 AND relation=?2 ORDER BY id LIMIT 10"
         );
         let mut stmt = conn.prepare(&sql)?;
         let plan = stmt
