@@ -5,7 +5,8 @@ use crate::{
 use anyhow::{Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -256,6 +257,7 @@ fn adjacency_filtered(
     let layout = storage_layout(conn)?;
     let identity = node_identity(conn, layout, id)?;
     let mut edges = Vec::new();
+    let selected_relations = relation_selection(options.relation.as_deref(), relations);
     let streams = if options.direction == Direction::Incoming {
         [false, true]
     } else {
@@ -266,49 +268,216 @@ fn adjacency_filtered(
         if remaining == 0 {
             break;
         }
-        let column = match (layout, outgoing) {
-            (StorageLayout::Legacy, true) => "source",
-            (StorageLayout::Legacy, false) => "target",
-            (StorageLayout::Compact, true) => "source_key",
-            (StorageLayout::Compact, false) => "target_key",
-        };
         let undirected_only = matches!(
             (options.direction, outgoing),
             (Direction::Incoming, true) | (Direction::Outgoing, false)
         );
-        let mut sql = format!("SELECT payload FROM edges WHERE {column}=?");
-        let mut values = vec![identity.clone()];
-        if undirected_only {
-            sql.push_str(" AND directed=0");
-        }
         // Do not filter self-loops in SQL: even rejected rows could make a
         // LIMIT scan an entire hub. Duplicates consume the budget and are
         // removed only after bounded retrieval.
-        if let Some(relation) = &options.relation {
-            sql.push_str(" AND relation=?");
-            values.push(relation.clone().into());
+        edges.extend(edge_relation_rows(
+            conn,
+            layout,
+            &identity,
+            outgoing,
+            undirected_only,
+            selected_relations.as_deref(),
+            remaining,
+        )?);
+    }
+    Ok(edges)
+}
+
+fn relation_selection(explicit: Option<&str>, relations: &[String]) -> Option<Vec<String>> {
+    match explicit {
+        Some(relation) => Some(
+            if relations.is_empty() || relations.iter().any(|candidate| candidate == relation) {
+                vec![relation.to_owned()]
+            } else {
+                Vec::new()
+            },
+        ),
+        None if relations.is_empty() => None,
+        None => Some(
+            relations
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        ),
+    }
+}
+
+// Storage v5 omits the duplicate endpoint-only B-trees. Its relation indexes
+// retain `(endpoint, relation, id)`, so walk one bounded relation stream at a
+// time and merge by the public edge/reference ID. This preserves the previous
+// lexical LIMIT semantics without sorting an entire high-degree endpoint.
+fn stream_relations(
+    conn: &Connection,
+    stream: &str,
+    identity: &rusqlite::types::Value,
+) -> Result<Vec<String>> {
+    let mut relations = Vec::new();
+    let mut previous: Option<String> = None;
+    loop {
+        let relation = if let Some(previous) = &previous {
+            conn.query_row(
+                &format!("SELECT relation FROM {stream} AND relation>?2 ORDER BY relation LIMIT 1"),
+                params![identity.clone(), previous],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                &format!("SELECT relation FROM {stream} ORDER BY relation LIMIT 1"),
+                [identity.clone()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        };
+        let Some(relation) = relation else {
+            break;
+        };
+        previous = Some(relation.clone());
+        relations.push(relation);
+    }
+    Ok(relations)
+}
+
+fn edge_relation_rows(
+    conn: &Connection,
+    layout: StorageLayout,
+    identity: &rusqlite::types::Value,
+    outgoing: bool,
+    undirected_only: bool,
+    selected_relations: Option<&[String]>,
+    limit: usize,
+) -> Result<Vec<Edge>> {
+    if limit == 0 || selected_relations.is_some_and(<[String]>::is_empty) {
+        return Ok(Vec::new());
+    }
+    let endpoint = if outgoing { "source" } else { "target" };
+    let column = match (layout, outgoing) {
+        (StorageLayout::Legacy, true) => "source",
+        (StorageLayout::Legacy, false) => "target",
+        (StorageLayout::Compact, true) => "source_key",
+        (StorageLayout::Compact, false) => "target_key",
+    };
+    let index = format!(
+        "edges_{endpoint}{}_relation",
+        if undirected_only { "_direction" } else { "" }
+    );
+    let stream = format!(
+        "edges INDEXED BY {index} WHERE {column}=?1{}",
+        if undirected_only {
+            " AND directed=0"
+        } else {
+            ""
         }
-        relation_sql(&mut sql, &mut values, relations);
-        sql.push_str(" ORDER BY id LIMIT ?");
-        values.push((remaining as i64).into());
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-        while let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            edges.push(serde_json::from_str(&json)?);
+    );
+    let relations = match selected_relations {
+        Some(relations) => relations.to_vec(),
+        None => stream_relations(conn, &stream, identity)?,
+    };
+    let mut first = conn.prepare(&format!(
+        "SELECT id,payload FROM {stream} AND relation=?2 ORDER BY id LIMIT 1"
+    ))?;
+    let mut next = conn.prepare(&format!(
+        "SELECT id,payload FROM {stream} AND relation=?2 AND id>?3 ORDER BY id LIMIT 1"
+    ))?;
+    let mut pending = BinaryHeap::new();
+    for relation in relations {
+        if let Some((id, payload)) = first
+            .query_row(params![identity.clone(), relation], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?
+        {
+            pending.push(Reverse((id, relation, payload)));
+        }
+    }
+    let mut edges = Vec::new();
+    while edges.len() < limit {
+        let Some(Reverse((id, relation, payload))) = pending.pop() else {
+            break;
+        };
+        edges.push(serde_json::from_str(&payload)?);
+        if let Some((next_id, next_payload)) = next
+            .query_row(params![identity.clone(), relation, id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?
+        {
+            pending.push(Reverse((next_id, relation, next_payload)));
         }
     }
     Ok(edges)
 }
 
-fn relation_sql(sql: &mut String, values: &mut Vec<rusqlite::types::Value>, relations: &[String]) {
-    if !relations.is_empty() {
-        sql.push_str(&format!(
-            " AND relation IN ({})",
-            vec!["?"; relations.len()].join(",")
-        ));
-        values.extend(relations.iter().cloned().map(Into::into));
+fn unresolved_relation_rows(
+    conn: &Connection,
+    layout: StorageLayout,
+    identity: &rusqlite::types::Value,
+    relation: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(Reference, String)>> {
+    if limit == 0 {
+        return Ok(Vec::new());
     }
+    let stream = match layout {
+        StorageLayout::Legacy => {
+            "refs INDEXED BY refs_unresolved_relation WHERE source=?1 AND resolved_target IS NULL"
+        }
+        StorageLayout::Compact => {
+            "refs INDEXED BY refs_unresolved_relation WHERE source_key=?1 AND resolved_target_key IS NULL"
+        }
+    };
+    let relations = match relation {
+        Some(relation) => vec![relation.to_owned()],
+        None => stream_relations(conn, stream, identity)?,
+    };
+    let mut first = conn.prepare(&format!(
+        "SELECT id,payload,resolution_reason FROM {stream} AND relation=?2 ORDER BY id LIMIT 1"
+    ))?;
+    let mut next = conn.prepare(&format!(
+        "SELECT id,payload,resolution_reason FROM {stream} AND relation=?2 AND id>?3 ORDER BY id LIMIT 1"
+    ))?;
+    let mut pending = BinaryHeap::new();
+    for relation in relations {
+        if let Some((id, payload, reason)) = first
+            .query_row(params![identity.clone(), relation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?
+        {
+            pending.push(Reverse((id, relation, payload, reason)));
+        }
+    }
+    let mut references = Vec::new();
+    while references.len() < limit {
+        let Some(Reverse((id, relation, payload, reason))) = pending.pop() else {
+            break;
+        };
+        references.push((serde_json::from_str(&payload)?, reason));
+        if let Some((next_id, next_payload, next_reason)) = next
+            .query_row(params![identity.clone(), relation, id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?
+        {
+            pending.push(Reverse((next_id, relation, next_payload, next_reason)));
+        }
+    }
+    Ok(references)
 }
 
 fn opposite<'a>(edge: &'a Edge, id: &str) -> &'a str {
@@ -331,38 +500,26 @@ fn unresolved(
     let remaining = options.limit - result.unresolved.len();
     let layout = storage_layout(conn)?;
     let identity = node_identity(conn, layout, id)?;
-    let mut sql = match layout {
-        StorageLayout::Legacy => "SELECT payload,resolution_reason FROM refs WHERE source=?1 AND resolved_target IS NULL",
-        StorageLayout::Compact => "SELECT payload,resolution_reason FROM refs WHERE source_key=?1 AND resolved_target_key IS NULL",
-    }.to_owned();
-    if options.relation.is_some() {
-        sql.push_str(" AND relation=?2 ORDER BY id LIMIT ?3");
-    } else {
-        sql.push_str(" ORDER BY id LIMIT ?2");
-    }
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = if let Some(relation) = &options.relation {
-        stmt.query(params![identity, relation, (remaining + 1) as i64])?
-    } else {
-        stmt.query(params![identity, (remaining + 1) as i64])?
-    };
-    let mut seen = 0;
-    while let Some(row) = rows.next()? {
+    let rows = unresolved_relation_rows(
+        conn,
+        layout,
+        &identity,
+        options.relation.as_deref(),
+        remaining + 1,
+    )?;
+    for (seen, (reference, reason)) in rows.into_iter().enumerate() {
         if seen == remaining {
             result.truncated = true;
             break;
         }
-        let json: String = row.get(0)?;
-        let reference: Reference = serde_json::from_str(&json)?;
         result.unresolved.push(UnresolvedReference {
             source: reference.source,
             label: reference.label,
             relation: reference.relation,
             file: reference.file,
             line: reference.line,
-            reason: row.get(1)?,
+            reason,
         });
-        seen += 1;
     }
     Ok(())
 }
@@ -1077,7 +1234,9 @@ fn resolve_relation(
             (Direction::Incoming, true) | (Direction::Outgoing, false)
         );
         streams.push(format!(
-            "edges WHERE {column}=?1{}",
+            "edges INDEXED BY edges_{}{}_relation WHERE {column}=?1{}",
+            if outgoing { "source" } else { "target" },
+            if undirected_only { "_direction" } else { "" },
             if undirected_only {
                 " AND directed=0"
             } else {
@@ -1088,9 +1247,9 @@ fn resolve_relation(
     if options.direction != Direction::Incoming {
         streams.push(
             match layout {
-                StorageLayout::Legacy => "refs WHERE source=?1 AND resolved_target IS NULL",
+                StorageLayout::Legacy => "refs INDEXED BY refs_unresolved_relation WHERE source=?1 AND resolved_target IS NULL",
                 StorageLayout::Compact => {
-                    "refs WHERE source_key=?1 AND resolved_target_key IS NULL"
+                    "refs INDEXED BY refs_unresolved_relation WHERE source_key=?1 AND resolved_target_key IS NULL"
                 }
             }
             .into(),
@@ -1372,19 +1531,26 @@ fn impact_seeds(
     let layout = storage_layout(conn)?;
     // Only descendants of the original seeds are added here. Dependencies
     // discovered by the later reverse walk never expand their own members.
+    let membership_relations = [
+        "contains".to_owned(),
+        "defines".to_owned(),
+        "method".to_owned(),
+    ];
     'members: while cursor < seeds.len() && examined < MAX_EXAMINED {
         let identity = node_identity(conn, layout, &seeds[cursor].id)?;
-        let mut stmt = conn.prepare(match layout {
-            StorageLayout::Legacy => "SELECT target FROM edges WHERE source=?1
-                AND relation IN ('contains','method','defines') ORDER BY id LIMIT ?2",
-            StorageLayout::Compact => "SELECT n.id FROM edges e JOIN nodes n ON n.nkey=e.target_key
-                WHERE e.source_key=?1 AND e.relation IN ('contains','method','defines') ORDER BY e.id LIMIT ?2",
-        })?;
-        let mut rows = stmt.query(params![identity, (MAX_EXAMINED - examined) as i64])?;
+        let rows = edge_relation_rows(
+            conn,
+            layout,
+            &identity,
+            true,
+            false,
+            Some(&membership_relations),
+            MAX_EXAMINED - examined,
+        )?;
         cursor += 1;
-        while let Some(row) = rows.next()? {
+        for edge in rows {
             examined += 1;
-            let id: String = row.get(0)?;
+            let id = edge.target;
             if seen.contains(&id) {
                 continue;
             }
@@ -1895,31 +2061,26 @@ fn close_edges(
     let ids: BTreeSet<_> = output.graph.nodes.iter().map(|n| n.id.clone()).collect();
     let mut edge_ids: BTreeSet<_> = output.graph.edges.iter().map(|e| e.id.clone()).collect();
     let layout = storage_layout(conn)?;
+    let selected_relations = relation_selection(options.graph.relation.as_deref(), relations);
     for id in &ids {
         if *examined == MAX_EXAMINED {
             truncate(output, "work_limit");
             break;
         }
-        // Outgoing storage stream visits every induced edge only once, including
-        // undirected edges, mutual arcs, parallel relations and self loops.
-        let mut sql = match layout {
-            StorageLayout::Legacy => "SELECT payload FROM edges WHERE source=?",
-            StorageLayout::Compact => "SELECT payload FROM edges WHERE source_key=?",
-        }
-        .to_owned();
-        let mut values = vec![node_identity(conn, layout, id)?];
-        if let Some(relation) = &options.graph.relation {
-            sql.push_str(" AND relation=?");
-            values.push(relation.clone().into());
-        }
-        relation_sql(&mut sql, &mut values, relations);
-        sql.push_str(" ORDER BY id LIMIT ?");
-        values.push(((MAX_EXAMINED - *examined) as i64).into());
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-        while let Some(row) = rows.next()? {
+        // Outgoing storage streams visit every induced edge only once,
+        // including undirected edges, mutual arcs, parallel relations and loops.
+        let identity = node_identity(conn, layout, id)?;
+        let rows = edge_relation_rows(
+            conn,
+            layout,
+            &identity,
+            true,
+            false,
+            selected_relations.as_deref(),
+            MAX_EXAMINED - *examined,
+        )?;
+        for edge in rows {
             *examined += 1;
-            let edge: Edge = serde_json::from_str(&row.get::<_, String>(0)?)?;
             if ids.contains(&edge.target)
                 && !edge_ids.contains(&edge.id)
                 && context_matches(&edge, &output.contexts)
@@ -1953,23 +2114,17 @@ fn collect_unresolved(
             truncate(output, "work_limit");
             break;
         }
-        let mut sql = match layout {
-            StorageLayout::Legacy => "SELECT payload,resolution_reason FROM refs WHERE source=? AND resolved_target IS NULL",
-            StorageLayout::Compact => "SELECT payload,resolution_reason FROM refs WHERE source_key=? AND resolved_target_key IS NULL",
-        }.to_owned();
-        let mut values = vec![node_identity(conn, layout, &id)?];
-        if let Some(relation) = &options.graph.relation {
-            sql.push_str(" AND relation=?");
-            values.push(relation.clone().into());
-        }
-        sql.push_str(" ORDER BY id LIMIT ?");
         let limit = MAX_EXAMINED - *examined;
-        values.push((limit as i64).into());
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-        while let Some(row) = rows.next()? {
+        let identity = node_identity(conn, layout, &id)?;
+        let rows = unresolved_relation_rows(
+            conn,
+            layout,
+            &identity,
+            options.graph.relation.as_deref(),
+            limit,
+        )?;
+        for (reference, reason) in rows {
             *examined += 1;
-            let reference: Reference = serde_json::from_str(&row.get::<_, String>(0)?)?;
             if !output.contexts.is_empty()
                 && !output
                     .contexts
@@ -1987,7 +2142,7 @@ fn collect_unresolved(
                 relation: reference.relation,
                 file: reference.file,
                 line: reference.line,
-                reason: row.get(1)?,
+                reason,
             };
             if budget.take(OutputBudget::cost(&reference)?, output) {
                 output.graph.unresolved.push(reference);

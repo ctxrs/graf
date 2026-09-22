@@ -516,6 +516,9 @@ fn updates_hash_content_remove_facts_and_restore_incoming_references() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
+    let stale = index::check_update(root.path(), &db).unwrap();
+    assert!(!stale.fresh);
+    assert_eq!(stale.changed, ["target.py"]);
     let changed = index::run(root.path(), &db).unwrap();
     assert_eq!((changed.parsed_files, changed.unchanged_files), (1, 1));
     let graph = callees(&Store::open(&db).unwrap(), "caller");
@@ -1049,11 +1052,20 @@ fn scan_manifest_skips_context_and_matches_index_and_check_update_outputs() {
     fs::write(&source, "def original():\n    pass\n").unwrap();
 
     let first = index::run(root.path(), &db).unwrap();
+    let initial_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(scan_manifest(&db)).unwrap()).unwrap();
+    assert!(initial_manifest["scan"]["sources"][0]["identity"].is_null());
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
     let graph =
         serde_json::to_value(Store::open_read_only(&db).unwrap().snapshot().unwrap()).unwrap();
     let before = context_discoveries();
+    assert!(index::check_update(root.path(), &db).unwrap().fresh);
+    assert_eq!(context_discoveries(), before);
     let unchanged = index::run(root.path(), &db).unwrap();
     assert_eq!(context_discoveries(), before);
+    let promoted_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(scan_manifest(&db)).unwrap()).unwrap();
+    assert!(promoted_manifest["scan"]["sources"][0]["identity"].is_object());
     assert_eq!(
         (
             unchanged.generation,
@@ -1096,6 +1108,27 @@ fn scan_manifest_skips_context_and_matches_index_and_check_update_outputs() {
     let after_update = context_discoveries();
     assert!(index::check_update(root.path(), &db).unwrap().fresh);
     assert_eq!(context_discoveries(), after_update);
+}
+
+#[test]
+fn oversized_supported_files_do_not_disable_the_scan_manifest() {
+    let root = tempdir().unwrap();
+    let db = root.path().join(".graf/index.db");
+    fs::write(root.path().join("app.py"), "def app():\n    pass\n").unwrap();
+    let oversized = root.path().join("generated.ts");
+    let file = fs::File::create(&oversized).unwrap();
+    file.set_len(4 * 1024 * 1024 + 1).unwrap();
+
+    let first = index::run(root.path(), &db).unwrap();
+    assert_eq!(first.parsed_files, 2);
+    assert!(scan_manifest(&db).is_file());
+    let discoveries = context_discoveries();
+    let second = index::run(root.path(), &db).unwrap();
+    assert_eq!(
+        (second.parsed_files, second.generation),
+        (0, first.generation)
+    );
+    assert_eq!(context_discoveries(), discoveries);
 }
 
 #[test]

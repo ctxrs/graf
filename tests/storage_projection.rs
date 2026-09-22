@@ -174,7 +174,7 @@ fn integrity(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 fn projected(conn: &Connection) -> anyhow::Result<()> {
-    assert_eq!(version(conn)?, 4);
+    assert_eq!(version(conn)?, 5);
     assert_eq!(
         conn.query_row(
             "SELECT hidden FROM pragma_table_xinfo('refs') WHERE name='id'",
@@ -421,7 +421,7 @@ fn late_write_failure_rolls_back_upgrade_and_all_graph_state() -> anyhow::Result
         let conn = old_fixture(&db, format)?;
         conn.execute_batch(
             "CREATE TRIGGER reject_late BEFORE UPDATE OF generation ON metadata BEGIN
-            SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=4
+            SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=5
             AND (SELECT hidden FROM pragma_table_xinfo('refs') WHERE name='id')=0
             THEN RAISE(ABORT,'after projected replacement') ELSE RAISE(ABORT,'too early') END;
         END;",
@@ -732,15 +732,9 @@ fn partial_order_indexes_and_bounded_queries_survive_projection() -> anyhow::Res
         serde_json::to_value(Store::open_read_only(&db)?.neighbors_extended("caller", &budget)?)?,
         serde_json::to_value(before_budget)?
     );
-    for (sql, index) in [
-        (
-            "SELECT payload FROM refs WHERE source_key=1 AND resolved_target_key IS NULL ORDER BY id LIMIT 10",
-            "refs_unresolved_source",
-        ),
-        (
-            "SELECT payload FROM refs WHERE source_key=1 AND resolved_target_key IS NULL AND relation='rare_relation' ORDER BY id LIMIT 10",
-            "refs_unresolved_relation",
-        ),
+    for sql in [
+        "SELECT payload FROM refs INDEXED BY refs_unresolved_relation WHERE source_key=1 AND resolved_target_key IS NULL AND relation='rare_relation' ORDER BY id LIMIT 10",
+        "SELECT relation FROM refs INDEXED BY refs_unresolved_relation WHERE source_key=1 AND resolved_target_key IS NULL AND relation>'rare_relation' ORDER BY relation LIMIT 1",
     ] {
         let plan = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
@@ -748,10 +742,13 @@ fn partial_order_indexes_and_bounded_queries_survive_projection() -> anyhow::Res
             .collect::<rusqlite::Result<Vec<_>>>()?
             .join("\n");
         assert!(
-            plan.contains("SEARCH refs") && plan.contains(index),
+            plan.contains("SEARCH refs") && plan.contains("INDEX"),
             "{plan}"
         );
-        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        assert!(
+            !plan.contains("SCAN refs") && !plan.contains("TEMP B-TREE"),
+            "{plan}"
+        );
     }
     projected(&conn)
 }
