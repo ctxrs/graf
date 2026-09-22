@@ -1,8 +1,14 @@
 <img src="docs/assets/graf-readme-banner.svg" alt="graf is graphify, rebuilt in rust for 1000x faster search" width="100%">
 
-Grep can find a name. **graf** tells you who calls it, what depends on it, what might break if it changes, and how it connects to the rest of the repository.
+Graphify started with a great idea and became popular fast. The problem is that its Python/NetworkX architecture does not scale well. It installs about 30 direct dependencies, and the CLI reloads the entire graph into memory for every query. On a large repo, that can make each search slow enough to drag down an agent’s entire task.
 
-Graf builds a persistent local graph from your source, docs, configuration, and database schemas. You and your agents can query it from the terminal without rebuilding the graph for every question. Static indexing is local and needs no API key, model, background service, or Python environment.
+Graf is a rewrite in Rust. It keeps the graph indexed in SQLite, so searches query the database directly and updates only touch changed files. Static indexing and search run as one native binary with no Python environment, API key, model, or background service.
+
+If you aren’t familiar with Graphify, it’s like a local version of Sourcegraph: it builds a graph of your codebase and docs so an agent can ask who calls something, what depends on it, and what might break if it changes.
+
+You might not need Graf or Graphify for a smaller project. Agents are surprisingly good at getting around a codebase using normal read and search tools. On a larger project, Graf gives them a much faster way to follow relationships across files instead of spending tokens repeatedly searching the repository.
+
+**If you train coding models, try giving Graf to the agents in your rollouts.**
 
 ## Install
 
@@ -53,8 +59,6 @@ Use `--json` for structured output and an exact node ID when a name is ambiguous
 Graf is Graphify, but rebuilt properly in Rust: **1000x faster search, 89x faster updates, and one native binary.**
 
 <img src="docs/assets/graf-vscode-performance.svg" alt="On the full VS Code repository, Graf searched in 13 milliseconds instead of 13.26 seconds and updated an unchanged graph in 880 milliseconds instead of 77.97 seconds." width="100%">
-
-Graf was built from scratch around a persistent indexed graph. It updates the files that changed and answers navigation queries directly from SQLite. One native binary replaces the Python environment and dependency stack.
 
 It is also stricter about correctness. Updates become visible as one complete generation, so a failed extraction cannot publish half a graph. When two symbols could be the answer, Graf returns the ambiguity and the source evidence instead of guessing.
 
