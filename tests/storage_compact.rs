@@ -114,15 +114,15 @@ fn snapshot(path: &Path) -> anyhow::Result<Value> {
     )?)
 }
 fn persisted(conn: &Connection) -> anyhow::Result<Vec<Vec<String>>> {
-    let compact = matches!(version(conn)?, 2 | 3);
+    let compact = matches!(version(conn)?, 2..=4);
     let sql = if compact {
         [
             "SELECT json_array(fkey,path,hash,module,diagnostics) FROM files ORDER BY path",
-            "SELECT json_array(n.nkey,n.id,n.label,n.qualified_name,n.binding_key,n.file,f.path,n.payload,n.search) FROM nodes n LEFT JOIN files f ON f.fkey=n.owner_key ORDER BY n.id",
-            "SELECT json_array(r.rkey,r.id,n.id,f.path,r.relation,r.payload,t.id,r.resolution_reason) FROM refs r JOIN nodes n ON n.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
+            "SELECT json_array(n.nkey,n.id,n.label,n.qualified_name,n.binding_key,n.file,f.path,printf('%s',n.payload),n.search) FROM nodes n LEFT JOIN files f ON f.fkey=n.owner_key ORDER BY n.id",
+            "SELECT json_array(r.rkey,r.id,n.id,f.path,r.relation,printf('%s',r.payload),t.id,r.resolution_reason) FROM refs r JOIN nodes n ON n.nkey=r.source_key JOIN files f ON f.fkey=r.owner_key LEFT JOIN nodes t ON t.nkey=r.resolved_target_key ORDER BY r.id",
             "SELECT json_array(r.id,k.priority,k.binding_key) FROM ref_keys k JOIN refs r ON r.rkey=k.ref_key ORDER BY r.id,k.priority",
             "SELECT json_array(n.id,a.binding_key) FROM node_aliases a JOIN nodes n ON n.nkey=a.node_key ORDER BY n.id,a.binding_key",
-            "SELECT json_array(e.id,s.id,t.id,e.relation,e.directed,f.path,r.id,e.payload) FROM edges e JOIN nodes s ON s.nkey=e.source_key JOIN nodes t ON t.nkey=e.target_key LEFT JOIN files f ON f.fkey=e.owner_key LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
+            "SELECT json_array(e.id,s.id,t.id,e.relation,e.directed,f.path,r.id,printf('%s',e.payload)) FROM edges e JOIN nodes s ON s.nkey=e.source_key JOIN nodes t ON t.nkey=e.target_key LEFT JOIN files f ON f.fkey=e.owner_key LEFT JOIN refs r ON r.rkey=e.ref_key ORDER BY e.id",
         ]
     } else {
         [
@@ -154,6 +154,160 @@ fn assert_integrity(conn: &Connection) -> anyhow::Result<()> {
     assert_eq!(violations, 0);
     let dangling: i64 = conn.query_row("SELECT count(*) FROM refs r WHERE resolved_target_key IS NOT NULL AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.nkey=r.resolved_target_key)", [], |row| row.get(0))?;
     assert_eq!(dangling, 0);
+    Ok(())
+}
+
+#[test]
+fn initial_bulk_publish_matches_incremental_publication_and_rolls_back_late_failure()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bulk = directory.path().join("bulk.db");
+    let incremental = directory.path().join("incremental.db");
+    let failed = directory.path().join("failed.db");
+
+    let mut caller = facts(
+        "caller.py",
+        vec![
+            node("z-caller", "caller.py", &[]),
+            node("a-helper", "caller.py", &["shared:alias"]),
+        ],
+        vec![
+            reference("z-ref", &["z:priority", "a:fallback"]),
+            reference("a-ref", &["shared:alias"]),
+            reference("missing", &["absent"]),
+        ],
+    );
+    caller.nodes[0].metadata["python_references"] = json!([{
+        "reference_id": "z-ref",
+        "context": "return_type"
+    }]);
+    caller.edges = vec![
+        edge("z-direct", "z-caller", "a-target"),
+        edge("a-direct", "a-helper", "z-target"),
+    ];
+    let input = vec![caller, provider()];
+
+    Store::create(&bulk)?.apply_native("root", input.clone(), vec![], Coverage::default())?;
+    let mut ordinary = Store::create(&incremental)?;
+    ordinary.apply_native("root", vec![], vec![], Coverage::default())?;
+    ordinary.apply_native("root", input.clone(), vec![], Coverage::default())?;
+
+    let bulk_sql = Connection::open(&bulk)?;
+    let ordinary_sql = Connection::open(&incremental)?;
+    assert_eq!(persisted(&bulk_sql)?, persisted(&ordinary_sql)?);
+    assert_eq!(postings(&bulk_sql)?, postings(&ordinary_sql)?);
+    let mut bulk_snapshot = snapshot(&bulk)?;
+    let mut ordinary_snapshot = snapshot(&incremental)?;
+    bulk_snapshot.as_object_mut().unwrap().remove("generation");
+    ordinary_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("generation");
+    assert_eq!(bulk_snapshot, ordinary_snapshot);
+    assert_integrity(&bulk_sql)?;
+    assert_integrity(&ordinary_sql)?;
+    assert_reference_indices(&bulk_sql)?;
+
+    let mut failed_store = Store::create(&failed)?;
+    let failed_sql = Connection::open(&failed)?;
+    let before_schema = schema(&failed_sql)?;
+    failed_sql.execute_batch(
+        "CREATE TRIGGER reject_initial_publish BEFORE UPDATE OF generation ON metadata BEGIN
+             SELECT RAISE(ABORT,'late initial publish failure');
+         END;",
+    )?;
+    let error = failed_store
+        .apply_native("root", input, vec![], Coverage::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("late initial publish failure"));
+    drop(failed_store);
+    drop(failed_sql);
+    let failed_sql = Connection::open(&failed)?;
+    assert_eq!(
+        failed_sql.query_row("SELECT generation FROM metadata", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        failed_sql.query_row("SELECT kind FROM metadata", [], |r| r.get::<_, String>(0))?,
+        "empty"
+    );
+    assert_eq!(
+        failed_sql.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
+    let mut expected_schema = before_schema;
+    expected_schema.push(
+        strings(
+            &failed_sql,
+            "SELECT json_array(type,name,tbl_name,sql) FROM sqlite_master WHERE name='reject_initial_publish'",
+        )?
+        .into_iter()
+        .next()
+        .unwrap(),
+    );
+    expected_schema.sort();
+    assert_eq!(schema(&failed_sql)?, expected_schema);
+    assert_integrity(&failed_sql)?;
+    Ok(())
+}
+
+#[test]
+fn equal_extracted_facts_update_source_proof_without_rewriting_graph_rows() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("facts.db");
+    let mut original = facts(
+        "caller.py",
+        vec![node("z-caller", "caller.py", &["caller:alias"])],
+        vec![reference("z-ref", &["missing:key"])],
+    );
+    original.hash = "source:first".into();
+    let mut store = Store::create(&db)?;
+    let initial =
+        store.apply_native("root", vec![original.clone()], vec![], Coverage::default())?;
+    let sql = Connection::open(&db)?;
+    let before = persisted(&sql)?;
+    sql.execute_batch(
+        "CREATE TRIGGER reject_facts_replacement BEFORE DELETE ON files BEGIN
+             SELECT RAISE(ABORT,'graph rows were replaced');
+         END;",
+    )?;
+
+    let mut comment_only = original.clone();
+    comment_only.hash = "source:second".into();
+    let report = store.apply_native(
+        "root",
+        vec![comment_only.clone()],
+        vec![],
+        Coverage::default(),
+    )?;
+    assert_eq!(report.generation, initial.generation + 1);
+    assert_eq!(report.parsed_files, 1);
+    assert_eq!(
+        sql.query_row("SELECT hash FROM files WHERE path='caller.py'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "source:second"
+    );
+    let after = persisted(&sql)?;
+    assert_eq!(before[1..], after[1..]);
+    assert_eq!(
+        store
+            .apply_native("root", vec![comment_only], vec![], Coverage::default())?
+            .generation,
+        report.generation
+    );
+
+    let mut changed = original;
+    changed.hash = "source:third".into();
+    changed.nodes[0].label = "changed graph fact".into();
+    let generation = store.stats()?.generation;
+    let error = store
+        .apply_native("root", vec![changed], vec![], Coverage::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("graph rows were replaced"));
+    assert_eq!(store.stats()?.generation, generation);
+    assert_eq!(persisted(&sql)?, after);
     Ok(())
 }
 
@@ -254,8 +408,10 @@ fn reference_source_index_changes_only_in_a_successful_explicit_write() -> anyho
     )?;
     let rollback_schema = schema(&sql)?;
     let mut writer = Store::open(&db)?;
+    let mut changed_provider = provider();
+    changed_provider.nodes[0].label = "changed provider".into();
     let error = writer
-        .apply_native("root", vec![provider()], vec![], Coverage::default())
+        .apply_native("root", vec![changed_provider], vec![], Coverage::default())
         .unwrap_err();
     assert!(
         format!("{error:#}").contains("after reference index replacement"),
@@ -268,7 +424,7 @@ fn reference_source_index_changes_only_in_a_successful_explicit_write() -> anyho
 
     let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
     assert_eq!(report.generation, before["generation"].as_u64().unwrap());
-    assert_eq!(version(&sql)?, 3);
+    assert_eq!(version(&sql)?, 4);
     assert_reference_indices(&sql)?;
     assert_eq!(persisted(&sql)?, rows);
     assert_eq!(snapshot(&db)?, before);
@@ -311,7 +467,7 @@ fn new_compact_stores_keep_public_payloads_and_lexical_order() -> anyhow::Result
     let db = temp.path().join("compact.db");
     seed(&db)?;
     let sql = Connection::open(&db)?;
-    assert_eq!(version(&sql)?, 3);
+    assert_eq!(version(&sql)?, 4);
     assert_reference_indices(&sql)?;
     for (table, key) in [("files", "fkey"), ("nodes", "nkey"), ("refs", "rkey")] {
         let is_integer_pk: bool = sql.query_row(
@@ -330,7 +486,7 @@ fn new_compact_stores_keep_public_payloads_and_lexical_order() -> anyhow::Result
     assert_eq!(
         strings(
             &sql,
-            "SELECT name FROM pragma_table_info('edges') WHERE name IN ('source','target','owner_file','ref_id')"
+            "SELECT name FROM pragma_table_info('edges') WHERE name IN ('owner_file','ref_id')"
         )?,
         Vec::<String>::new()
     );
@@ -424,7 +580,7 @@ fn real_legacy_layouts_read_without_mutation_then_upgrade_without_graph_change()
         let generation = writer.stats()?.generation;
         let report = writer.apply_native("root", vec![], vec![], Coverage::default())?;
         assert_eq!(report.generation, generation);
-        assert_eq!(version(&sql)?, 3);
+        assert_eq!(version(&sql)?, 4);
         assert_reference_indices(&sql)?;
         assert_eq!(persisted(&sql)?, old_rows);
         assert_eq!(snapshot(&db)?, before);
@@ -474,7 +630,7 @@ fn old_wal_snapshot_and_preopened_handles_survive_a_format_only_commit() -> anyh
     assert_eq!(persisted(&old_sql)?, old_rows);
     assert_eq!(serde_json::to_value(reader.snapshot()?)?, before);
     old_sql.execute_batch("COMMIT")?;
-    assert_eq!(version(&old_sql)?, 3);
+    assert_eq!(version(&old_sql)?, 4);
     assert_eq!(persisted(&old_sql)?, old_rows);
     // Generation did not change, so this old handle remains a legitimate writer.
     preopened_writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
@@ -622,7 +778,7 @@ fn failed_copy_and_late_write_restore_schema_graph_postings_and_version() -> any
             // Metadata survives table replacement; a trigger on old nodes would not.
             sql.execute_batch(
                 "CREATE TRIGGER reject_commit BEFORE UPDATE OF generation ON metadata BEGIN
-                SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=3
+                SELECT CASE WHEN (SELECT user_version FROM pragma_user_version)=4
                   AND EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='nkey')
                   AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='node_search_content')
                   AND EXISTS(SELECT 1 FROM sqlite_master WHERE name='node_search')
@@ -669,7 +825,7 @@ fn failed_copy_and_late_write_restore_schema_graph_postings_and_version() -> any
             sql.execute_batch("DROP TRIGGER reject_commit")?;
         }
         writer.apply_native("root", vec![provider()], vec![], Coverage::default())?;
-        assert_eq!(version(&sql)?, 3);
+        assert_eq!(version(&sql)?, 4);
         assert_integrity(&sql)?;
     }
     Ok(())
@@ -773,7 +929,7 @@ fn imported_null_ownership_and_metadata_references_are_not_fabricated_links() ->
     );
     assert_eq!(version(&sql)?, 1);
     writer.refresh_import(imported())?;
-    assert_eq!(version(&sql)?, 3);
+    assert_eq!(version(&sql)?, 4);
     assert_eq!(
         strings(&sql, "SELECT CAST(count(*) AS TEXT) FROM files")?,
         ["0"]
@@ -882,7 +1038,7 @@ fn independent_previous_writer_fixture_upgrades_with_exact_records_and_no_genera
     assert_eq!(version(&sql)?, 1);
     let report = Store::open(&db)?.apply_native("fixture", vec![], vec![], coverage)?;
     assert_eq!(report.generation, stats.generation);
-    assert_eq!(version(&sql)?, 3);
+    assert_eq!(version(&sql)?, 4);
     assert_reference_indices(&sql)?;
     assert_eq!(persisted(&sql)?, old_rows);
     assert_eq!(serde_json::to_value(old_reader.snapshot()?)?, before);
@@ -995,7 +1151,7 @@ fn unsupported_physical_version_and_mismatched_layout_fail_without_repair() -> a
     let db = temp.path().join("unsupported.db");
     seed(&db)?;
     let sql = Connection::open(&db)?;
-    for bad in [4, 1] {
+    for bad in [5, 1] {
         sql.pragma_update(None, "user_version", bad)?;
         let before = schema(&sql)?;
         assert!(Store::open(&db).is_err());
@@ -1004,7 +1160,7 @@ fn unsupported_physical_version_and_mismatched_layout_fail_without_repair() -> a
         assert_eq!(version(&sql)?, bad);
         assert_eq!(schema(&sql)?, before);
     }
-    sql.pragma_update(None, "user_version", 3)?;
+    sql.pragma_update(None, "user_version", 4)?;
     assert_eq!(Store::open_read_only(&db)?.snapshot()?.schema_version, 1);
     Ok(())
 }
@@ -1068,7 +1224,7 @@ fn vacuum_refuses_legacy_then_preserves_signed_keys_payloads_and_postings() -> a
         report.pages_after * report.page_size
     );
     assert_eq!(schema(&sql)?, compact_schema);
-    assert_eq!(version(&sql)?, 3);
+    assert_eq!(version(&sql)?, 4);
     assert_eq!(snapshot(&db)?, before);
     assert_eq!(persisted(&sql)?, rows);
     assert_eq!(postings(&sql)?, fts);

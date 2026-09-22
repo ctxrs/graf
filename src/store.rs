@@ -1,7 +1,12 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, Transaction, params};
-use std::{collections::BTreeSet, fs, path::Path, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    path::Path,
+    time::Duration,
+};
 use unicode_normalization::UnicodeNormalization;
 
 const APPLICATION_ID: i64 = 0x47524146;
@@ -19,10 +24,16 @@ pub(crate) fn storage_layout(conn: &Connection) -> Result<StorageLayout> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         1 => Ok(StorageLayout::Legacy),
-        // Format 3 projects refs.id from payload; its read columns are identical.
-        2 | 3 => Ok(StorageLayout::Compact),
-        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1, 2 or 3"),
+        // Formats 3 and 4 expose the same public payload columns. Format 4
+        // reconstructs them from normalized fields instead of storing each
+        // graph record twice.
+        2..=4 => Ok(StorageLayout::Compact),
+        _ => anyhow::bail!("unsupported Graf storage version {version}; expected 1, 2, 3 or 4"),
     }
+}
+
+pub(crate) fn normalized_storage(conn: &Connection) -> Result<bool> {
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 4)
 }
 
 pub struct Store {
@@ -128,6 +139,105 @@ CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
 CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
 "#;
 
+// Format 4 keeps the query-facing payload contract but makes it virtual. This
+// removes the duplicate full-record JSON while preserving schema-1 snapshots,
+// existing SQL read paths, integer foreign keys, and FTS row identities.
+const NORMALIZED_TABLES: &str = r#"
+CREATE TABLE normalized_files (
+    fkey INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+    hash TEXT NOT NULL, module TEXT NOT NULL, diagnostics TEXT NOT NULL,
+    facts_hash TEXT
+);
+CREATE TABLE normalized_nodes (
+    nkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL, kind TEXT NOT NULL, file TEXT NOT NULL,
+    line INTEGER, end_line INTEGER, qualified_name TEXT, binding_key TEXT,
+    metadata TEXT NOT NULL CHECK(json_valid(metadata)),
+    owner_key INTEGER REFERENCES normalized_files(fkey) ON DELETE CASCADE,
+    search TEXT NOT NULL,
+    payload TEXT GENERATED ALWAYS AS (
+        json_object('id',id,'label',label,'kind',kind,'file',file,
+                    'line',line,'end_line',end_line,
+                    'qualified_name',qualified_name,'binding_key',binding_key,
+                    'metadata',json(metadata))
+    ) VIRTUAL
+);
+CREATE TABLE normalized_node_aliases (
+    node_key INTEGER NOT NULL REFERENCES normalized_nodes(nkey) ON DELETE CASCADE,
+    binding_key TEXT NOT NULL, PRIMARY KEY(node_key, binding_key)
+) WITHOUT ROWID;
+"#;
+
+const NORMALIZED_REFERENCE_TABLES: &str = r#"
+CREATE TABLE normalized_refs (
+    rkey INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    source_key INTEGER NOT NULL REFERENCES normalized_nodes(nkey) ON DELETE CASCADE,
+    owner_key INTEGER NOT NULL REFERENCES normalized_files(fkey) ON DELETE CASCADE,
+    label TEXT NOT NULL, relation TEXT NOT NULL, file TEXT NOT NULL,
+    line INTEGER NOT NULL, candidate_keys TEXT NOT NULL CHECK(json_valid(candidate_keys)),
+    reason TEXT NOT NULL,
+    resolved_target_key INTEGER, resolution_reason TEXT NOT NULL,
+    payload TEXT GENERATED ALWAYS AS (
+        json_object('id',id,'source',source,'label',label,'relation',relation,
+                    'file',file,'line',line,'candidate_keys',json(candidate_keys),
+                    'reason',reason)
+    ) VIRTUAL
+);
+CREATE TABLE normalized_ref_keys (
+    ref_key INTEGER NOT NULL REFERENCES normalized_refs(rkey) ON DELETE CASCADE,
+    priority INTEGER NOT NULL, binding_key TEXT NOT NULL,
+    PRIMARY KEY(ref_key, priority)
+) WITHOUT ROWID;
+CREATE TABLE normalized_edges (
+    id TEXT PRIMARY KEY, source TEXT NOT NULL, target TEXT NOT NULL,
+    source_key INTEGER NOT NULL REFERENCES normalized_nodes(nkey) ON DELETE CASCADE,
+    target_key INTEGER NOT NULL REFERENCES normalized_nodes(nkey) ON DELETE CASCADE,
+    relation TEXT NOT NULL, directed INTEGER NOT NULL CHECK(directed IN (0, 1)),
+    file TEXT, line INTEGER, confidence TEXT NOT NULL,
+    metadata TEXT NOT NULL CHECK(json_valid(metadata)),
+    owner_key INTEGER REFERENCES normalized_files(fkey) ON DELETE CASCADE,
+    ref_key INTEGER UNIQUE REFERENCES normalized_refs(rkey) ON DELETE CASCADE,
+    payload TEXT GENERATED ALWAYS AS (
+        json_object('id',id,'source',source,'target',target,'relation',relation,
+                    'directed',json(CASE directed WHEN 1 THEN 'true' ELSE 'false' END),
+                    'file',file,'line',line,'confidence',confidence,
+                    'metadata',json(metadata))
+    ) VIRTUAL
+);
+"#;
+
+const NORMALIZED_PUBLISH: &str = r#"
+ALTER TABLE normalized_files RENAME TO files;
+ALTER TABLE normalized_nodes RENAME TO nodes;
+ALTER TABLE normalized_node_aliases RENAME TO node_aliases;
+CREATE INDEX nodes_label ON nodes(label, id);
+CREATE INDEX nodes_file ON nodes(file, id);
+CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
+CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
+INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
+CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
+    INSERT INTO node_search(rowid,text) VALUES(new.nkey,new.search);
+END;
+CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
+    DELETE FROM node_search WHERE rowid=old.nkey;
+END;
+"#;
+
+const NORMALIZED_REFERENCE_PUBLISH: &str = r#"
+ALTER TABLE normalized_refs RENAME TO refs;
+ALTER TABLE normalized_ref_keys RENAME TO ref_keys;
+ALTER TABLE normalized_edges RENAME TO edges;
+CREATE INDEX refs_owner ON refs(owner_key);
+CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
+CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
+CREATE INDEX edges_source ON edges(source_key, id);
+CREATE INDEX edges_target ON edges(target_key, id);
+CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
+CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
+"#;
+
 // Shared by fresh databases and explicit-write migration; these indexes do
 // not change graph identity, payloads, or schema-1 snapshot compatibility.
 const STORAGE_INDICES: &[(&str, &str)] = &[
@@ -205,16 +315,17 @@ impl Store {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
-            tx.execute_batch(COMPACT_TABLES)?;
-            tx.execute_batch(COMPACT_REFERENCE_TABLES)?;
-            tx.execute_batch(COMPACT_PUBLISH)?;
-            tx.execute_batch(COMPACT_REFERENCE_PUBLISH)?;
+            tx.execute_batch(NORMALIZED_TABLES)?;
+            tx.execute_batch(NORMALIZED_REFERENCE_TABLES)?;
+            tx.execute_batch(NORMALIZED_PUBLISH)?;
+            tx.execute_batch(NORMALIZED_REFERENCE_PUBLISH)?;
             ensure_storage_indices(&tx)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-            tx.pragma_update(None, "user_version", 3)?;
+            tx.pragma_update(None, "user_version", 4)?;
             tx.commit()?;
         }
         validate(&conn)?;
+        ensure_wal(&conn)?;
         let baseline_generation = generation(&conn)?;
         Ok(Self {
             conn,
@@ -251,6 +362,27 @@ impl Store {
             "cannot prepare native index write while the database is busy (journal mode remained {mode})"
         );
         Ok(())
+    }
+
+    pub(crate) fn restore_native_index_write(&self) -> Result<()> {
+        ensure!(
+            self.conn.is_autocommit(),
+            "cannot restore native index journal mode inside a transaction"
+        );
+        ensure_wal(&self.conn)
+    }
+
+    pub(crate) fn finish_native_index_write<T>(&self, result: Result<T>) -> Result<T> {
+        match (result, self.restore_native_index_write()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(restore)) => {
+                Err(restore).context("graph committed but restoring WAL mode failed")
+            }
+            (Err(error), Err(restore)) => Err(error.context(format!(
+                "native graph publish failed and restoring WAL mode also failed: {restore:#}"
+            ))),
+        }
     }
 
     /// Open without write permission or migrations. Normal SQLite WAL locking
@@ -375,12 +507,19 @@ impl Store {
     /// Short saved-graph topic labels for an explicitly configured transcription adapter.
     pub fn transcription_topics(&self) -> Result<Vec<String>> {
         let tx = self.conn.unchecked_transaction()?;
+        let normalized = normalized_storage(&tx)?;
         let sql = match storage_layout(&tx)? {
             StorageLayout::Legacy =>
                 "WITH incidents AS (SELECT source AS id FROM edges UNION ALL SELECT target FROM edges),
                  degrees AS (SELECT id,count(*) AS degree FROM incidents GROUP BY id)
                  SELECT n.label FROM degrees d JOIN nodes n ON n.id=d.id
                  WHERE json_extract(n.payload,'$.kind') NOT IN ('file','module','document','group','rationale')
+                 ORDER BY d.degree DESC,n.id LIMIT 64",
+            StorageLayout::Compact if normalized =>
+                "WITH incidents AS (SELECT source_key AS nkey FROM edges UNION ALL SELECT target_key FROM edges),
+                 degrees AS (SELECT nkey,count(*) AS degree FROM incidents GROUP BY nkey)
+                 SELECT n.label FROM degrees d JOIN nodes n ON n.nkey=d.nkey
+                 WHERE n.kind NOT IN ('file','module','document','group','rationale')
                  ORDER BY d.degree DESC,n.id LIMIT 64",
             StorageLayout::Compact =>
                 "WITH incidents AS (SELECT source_key AS nkey FROM edges UNION ALL SELECT target_key FROM edges),
@@ -640,6 +779,7 @@ impl Store {
     ) -> Result<IndexReport> {
         ensure!(!root.is_empty(), "native root cannot be empty");
         validate_facts(&changed, &deleted)?;
+        let parsed_files = changed.len();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -677,6 +817,71 @@ impl Store {
             options_changed = attrs.get("graf_index_options") != Some(&options);
             attrs.insert("graf_index_options".to_owned(), options);
         }
+        if kind == "empty"
+            && deleted.is_empty()
+            && tx.query_row("SELECT count(*)=0 FROM files", [], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            publish_initial_native(&tx, &changed)?;
+            tx.execute(
+                "UPDATE metadata SET kind='native', root=?1, coverage=?2, generation=generation+1, graph_metadata=?3 WHERE singleton=1",
+                params![
+                    root,
+                    serde_json::to_string(&coverage)?,
+                    serde_json::to_string(&metadata)?
+                ],
+            )?;
+            let stats = read_stats(&tx)?;
+            let report = IndexReport {
+                schema_version: SCHEMA_VERSION,
+                generation: stats.generation,
+                parsed_files,
+                unchanged_files: coverage.unchanged_files,
+                deleted_files: 0,
+                nodes: stats.nodes,
+                edges: stats.edges,
+                diagnostics: stats.diagnostics,
+                semantic_usage: None,
+                provider_usage: None,
+                timings: None,
+            };
+            tx.commit()?;
+            self.baseline_generation = report.generation;
+            return Ok(report);
+        }
+        let mut changed_facts = Vec::with_capacity(changed.len());
+        let mut changed_digests = HashMap::with_capacity(changed.len());
+        let mut stamps_changed = false;
+        for facts in changed {
+            let digest = facts_hash(&facts)?;
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT facts_hash FROM files WHERE path=?1",
+                    [&facts.path],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if previous.as_deref() == Some(&digest) {
+                let updated = tx.execute(
+                    "UPDATE files SET hash=?1,module=?2,diagnostics=?3,facts_hash=?4
+                     WHERE path=?5 AND hash IS NOT ?1",
+                    params![
+                        facts.hash,
+                        facts.module,
+                        serde_json::to_string(&facts.diagnostics)?,
+                        digest,
+                        facts.path
+                    ],
+                )?;
+                stamps_changed |= updated != 0;
+            } else {
+                changed_digests.insert(facts.path.clone(), digest);
+                changed_facts.push(facts);
+            }
+        }
+        let changed = changed_facts;
         // Replacing a target cascades away incoming edges even when their
         // unchanged owner still asserts them. References are rebound below;
         // direct edges have no reference record from which to rebuild them.
@@ -694,7 +899,7 @@ impl Store {
         if !ruby_changed {
             for path in &replaced {
                 ruby_changed = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) AND json_extract(payload,'$.metadata.language')='ruby')",
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_key=(SELECT fkey FROM files WHERE path=?1) AND json_extract(metadata,'$.language')='ruby')",
                     [path], |row| row.get(0),
                 )?;
                 if ruby_changed {
@@ -736,12 +941,15 @@ impl Store {
         }
         for facts in &changed {
             tx.execute(
-                "INSERT INTO files(path,hash,module,diagnostics) VALUES(?1,?2,?3,?4)",
+                "INSERT INTO files(path,hash,module,diagnostics,facts_hash) VALUES(?1,?2,?3,?4,?5)",
                 params![
                     facts.path,
                     facts.hash,
                     facts.module,
-                    serde_json::to_string(&facts.diagnostics)?
+                    serde_json::to_string(&facts.diagnostics)?,
+                    changed_digests
+                        .get(&facts.path)
+                        .context("missing extracted-facts digest")?
                 ],
             )?;
             for node in &facts.nodes {
@@ -774,8 +982,8 @@ impl Store {
                 insert_edge(&tx, edge, Some(&facts.path), None)?;
             }
             for reference in &facts.references {
-                tx.execute("INSERT INTO refs(source_key,owner_key,relation,payload,resolved_target_key,resolution_reason) VALUES((SELECT nkey FROM nodes WHERE id=?1),(SELECT fkey FROM files WHERE path=?2),?3,?4,NULL,?5)",
-                    params![reference.source, facts.path, reference.relation, serde_json::to_string(reference)?, reference.reason])?;
+                tx.execute("INSERT INTO refs(id,source,source_key,owner_key,label,relation,file,line,candidate_keys,reason,resolved_target_key,resolution_reason) VALUES(?1,?2,(SELECT nkey FROM nodes WHERE id=?2),(SELECT fkey FROM files WHERE path=?3),?4,?5,?6,?7,?8,?9,NULL,?9)",
+                    params![reference.id, reference.source, facts.path, reference.label, reference.relation, reference.file, reference.line, serde_json::to_string(&reference.candidate_keys)?, reference.reason])?;
                 for (priority, key) in reference.candidate_keys.iter().enumerate() {
                     tx.execute(
                         "INSERT INTO ref_keys(ref_key,priority,binding_key) VALUES((SELECT rkey FROM refs WHERE id=?1),?2,?3)",
@@ -794,12 +1002,12 @@ impl Store {
         if ruby_changed {
             let nodes: Vec<Node> = read_payloads(
                 &tx,
-                "SELECT payload FROM nodes WHERE json_extract(payload,'$.metadata.language')='ruby' ORDER BY id",
+                "SELECT payload FROM nodes WHERE json_extract(metadata,'$.language')='ruby' ORDER BY id",
             )?;
             let context = crate::languages::scripted::RubyContext::from_nodes(&nodes);
             let references: Vec<Reference> = read_payloads(
                 &tx,
-                "SELECT r.payload FROM refs r JOIN nodes n ON n.nkey=r.source_key WHERE json_extract(n.payload,'$.metadata.language')='ruby' ORDER BY r.id",
+                "SELECT r.payload FROM refs r JOIN nodes n ON n.nkey=r.source_key WHERE json_extract(n.metadata,'$.language')='ruby' ORDER BY r.id",
             )?;
             for reference in references {
                 let keys = context
@@ -847,6 +1055,7 @@ impl Store {
             || previous_coverage.unsupported_files != coverage.unsupported_files;
         let changed_generation = kind == "empty"
             || !changed.is_empty()
+            || stamps_changed
             || removed > 0
             || options_changed
             || aliases_migrated
@@ -860,7 +1069,7 @@ impl Store {
         let report = IndexReport {
             schema_version: SCHEMA_VERSION,
             generation: stats.generation,
-            parsed_files: changed.len(),
+            parsed_files,
             unchanged_files: coverage.unchanged_files,
             deleted_files: removed,
             nodes: stats.nodes,
@@ -975,6 +1184,15 @@ fn connect(path: &Path) -> Result<Connection> {
     connect_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
 }
 
+fn ensure_wal(conn: &Connection) -> Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    ensure!(
+        mode.eq_ignore_ascii_case("wal"),
+        "Graf write connection requires WAL mode (journal mode remained {mode})"
+    );
+    Ok(())
+}
+
 fn connect_with_flags(path: &Path, flags: OpenFlags) -> Result<Connection> {
     connect_with_setup(path, flags, |_| Ok(()))
 }
@@ -1027,6 +1245,7 @@ fn validate_facts(changed: &[FileFacts], deleted: &[String]) -> Result<()> {
         );
         let ids: BTreeSet<_> = facts.nodes.iter().map(|n| n.id.as_str()).collect();
         for node in &facts.nodes {
+            ensure!(!node.id.is_empty(), "node ID cannot be empty");
             binding_aliases(node)?;
             ensure!(
                 node.file == facts.path,
@@ -1034,6 +1253,7 @@ fn validate_facts(changed: &[FileFacts], deleted: &[String]) -> Result<()> {
             );
         }
         for edge in &facts.edges {
+            ensure!(!edge.id.is_empty(), "edge ID cannot be empty");
             ensure!(
                 ids.contains(edge.source.as_str()),
                 "native edge source must belong to its file"
@@ -1230,9 +1450,141 @@ fn ensure_compact_storage(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> 
         ensure!(violations == 0, "storage upgrade foreign key check failed");
         tx.pragma_update(None, "user_version", 3)?;
     }
+    if version < 4 {
+        normalize_storage_v4(tx)?;
+    }
     ensure_aliases(tx, keys)?;
     ensure_storage_indices(tx)?;
     Ok(search_changed)
+}
+
+fn normalize_storage_v4(tx: &Transaction<'_>) -> Result<()> {
+    let invalid: bool = tx.query_row(
+        "SELECT
+          EXISTS(SELECT 1 FROM nodes n WHERE
+            n.id IS NOT json_extract(n.payload,'$.id') OR
+            n.label IS NOT json_extract(n.payload,'$.label') OR
+            n.file IS NOT json_extract(n.payload,'$.file') OR
+            n.qualified_name IS NOT json_extract(n.payload,'$.qualified_name') OR
+            n.binding_key IS NOT json_extract(n.payload,'$.binding_key')) OR
+          EXISTS(SELECT 1 FROM refs r JOIN nodes s ON s.nkey=r.source_key WHERE
+            r.id IS NOT json_extract(r.payload,'$.id') OR
+            s.id IS NOT json_extract(r.payload,'$.source') OR
+            r.relation IS NOT json_extract(r.payload,'$.relation')) OR
+          EXISTS(SELECT 1 FROM edges e JOIN nodes s ON s.nkey=e.source_key JOIN nodes t ON t.nkey=e.target_key WHERE
+            e.id IS NOT json_extract(e.payload,'$.id') OR
+            s.id IS NOT json_extract(e.payload,'$.source') OR
+            t.id IS NOT json_extract(e.payload,'$.target') OR
+            e.relation IS NOT json_extract(e.payload,'$.relation') OR
+            e.directed IS NOT json_extract(e.payload,'$.directed'))",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !invalid,
+        "storage normalization payload projection mismatch"
+    );
+
+    tx.execute_batch(NORMALIZED_TABLES)?;
+    tx.execute_batch(NORMALIZED_REFERENCE_TABLES)?;
+    tx.execute_batch(
+        "INSERT INTO normalized_files(fkey,path,hash,module,diagnostics)
+             SELECT fkey,path,hash,module,diagnostics FROM files;
+         INSERT INTO normalized_nodes(
+             nkey,id,label,kind,file,line,end_line,qualified_name,binding_key,
+             metadata,owner_key,search)
+             SELECT nkey,id,label,json_extract(payload,'$.kind'),file,
+                    json_extract(payload,'$.line'),json_extract(payload,'$.end_line'),
+                    qualified_name,binding_key,payload -> '$.metadata',owner_key,search
+             FROM nodes;
+         INSERT INTO normalized_node_aliases(node_key,binding_key)
+             SELECT node_key,binding_key FROM node_aliases;
+         INSERT INTO normalized_refs(
+             rkey,id,source,source_key,owner_key,label,relation,file,line,
+             candidate_keys,reason,resolved_target_key,resolution_reason)
+             SELECT rkey,id,json_extract(payload,'$.source'),source_key,owner_key,
+                    json_extract(payload,'$.label'),relation,
+                    json_extract(payload,'$.file'),json_extract(payload,'$.line'),
+                    payload -> '$.candidate_keys',json_extract(payload,'$.reason'),
+                    resolved_target_key,resolution_reason
+             FROM refs;
+         INSERT INTO normalized_ref_keys(ref_key,priority,binding_key)
+             SELECT ref_key,priority,binding_key FROM ref_keys;
+         INSERT INTO normalized_edges(
+             id,source,target,source_key,target_key,relation,directed,file,line,
+             confidence,metadata,owner_key,ref_key)
+             SELECT e.id,s.id,t.id,e.source_key,e.target_key,e.relation,e.directed,
+                    json_extract(e.payload,'$.file'),json_extract(e.payload,'$.line'),
+                    json_extract(e.payload,'$.confidence'),e.payload -> '$.metadata',
+                    e.owner_key,e.ref_key
+             FROM edges e JOIN nodes s ON s.nkey=e.source_key
+                          JOIN nodes t ON t.nkey=e.target_key;",
+    )?;
+    for table in [
+        "files",
+        "nodes",
+        "node_aliases",
+        "refs",
+        "ref_keys",
+        "edges",
+    ] {
+        let equal: bool = tx.query_row(
+            &format!(
+                "SELECT (SELECT count(*) FROM {table})=(SELECT count(*) FROM normalized_{table})"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            equal,
+            "storage normalization row count mismatch for {table}"
+        );
+    }
+    tx.execute_batch(
+        "DROP TRIGGER nodes_insert;
+         DROP TRIGGER nodes_delete;
+         DROP TABLE edges;
+         DROP TABLE ref_keys;
+         DROP TABLE refs;
+         DROP TABLE node_aliases;
+         DROP TABLE nodes;
+         DROP TABLE files;
+         ALTER TABLE normalized_files RENAME TO files;
+         ALTER TABLE normalized_nodes RENAME TO nodes;
+         ALTER TABLE normalized_node_aliases RENAME TO node_aliases;
+         ALTER TABLE normalized_refs RENAME TO refs;
+         ALTER TABLE normalized_ref_keys RENAME TO ref_keys;
+         ALTER TABLE normalized_edges RENAME TO edges;",
+    )?;
+    tx.execute_batch(
+        "CREATE INDEX nodes_label ON nodes(label, id);
+         CREATE INDEX nodes_file ON nodes(file, id);
+         CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
+         CREATE INDEX refs_owner ON refs(owner_key);
+         CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
+         CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
+         CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
+         CREATE INDEX edges_source ON edges(source_key, id);
+         CREATE INDEX edges_target ON edges(target_key, id);
+         CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
+         CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
+         CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
+             INSERT INTO node_search(rowid,text) VALUES(new.nkey,new.search);
+         END;
+         CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
+             DELETE FROM node_search WHERE rowid=old.nkey;
+         END;",
+    )?;
+    let violations: i64 =
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    ensure!(
+        violations == 0,
+        "storage normalization foreign key check failed"
+    );
+    tx.pragma_update(None, "user_version", 4)?;
+    Ok(())
 }
 
 fn ensure_aliases(tx: &Transaction<'_>, keys: &mut BTreeSet<String>) -> Result<()> {
@@ -1458,6 +1810,309 @@ fn search_text(node: &Node) -> String {
     }
 }
 
+fn facts_hash(facts: &FileFacts) -> Result<String> {
+    let bytes = serde_json::to_vec(&(
+        &facts.path,
+        &facts.module,
+        &facts.nodes,
+        &facts.edges,
+        &facts.references,
+        &facts.diagnostics,
+    ))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+#[derive(Clone, Copy)]
+enum InitialBinding {
+    Unique(i64),
+    Ambiguous,
+}
+
+fn record_initial_binding<'a>(
+    bindings: &mut HashMap<&'a str, InitialBinding>,
+    key: &'a str,
+    node_key: i64,
+) {
+    match bindings.get(key).copied() {
+        None => {
+            bindings.insert(key, InitialBinding::Unique(node_key));
+        }
+        Some(InitialBinding::Unique(existing)) if existing == node_key => {}
+        Some(_) => {
+            bindings.insert(key, InitialBinding::Ambiguous);
+        }
+    }
+}
+
+fn initial_resolution(
+    reference: &Reference,
+    candidate_keys: &[String],
+    bindings: &HashMap<&str, InitialBinding>,
+) -> (Option<i64>, String) {
+    let mut reason = if reference.reason.is_empty() {
+        "no matching binding".to_owned()
+    } else {
+        reference.reason.clone()
+    };
+    for key in candidate_keys {
+        match bindings.get(key.as_str()) {
+            None => continue,
+            Some(InitialBinding::Unique(target)) => return (Some(*target), String::new()),
+            Some(InitialBinding::Ambiguous) => {
+                reason = format!("ambiguous binding: {key}");
+                break;
+            }
+        }
+    }
+    (None, reason)
+}
+
+fn reference_context<'a>(source: &'a Node, reference_id: &str) -> Option<&'a str> {
+    source.metadata["python_references"]
+        .as_array()?
+        .iter()
+        .find(|item| item["reference_id"] == reference_id)?["context"]
+        .as_str()
+}
+
+fn resolved_reference_edge(reference: &Reference, source: &Node, target: &str) -> Edge {
+    let mut metadata = serde_json::json!({"reference_id": reference.id});
+    if let Some(context) = reference_context(source, &reference.id) {
+        metadata["context"] = serde_json::Value::String(context.to_owned());
+    }
+    Edge {
+        id: format!("reference:{}", reference.id),
+        source: reference.source.clone(),
+        target: target.to_owned(),
+        relation: reference.relation.clone(),
+        directed: true,
+        file: Some(reference.file.clone()),
+        line: Some(reference.line),
+        confidence: "statically_resolved".to_owned(),
+        metadata,
+    }
+}
+
+// A fresh native graph has no readers or old facts to preserve. Load its rows
+// without maintaining derived B-trees and FTS postings for every insert, then
+// publish those structures once. Integer identities are carried in memory so
+// the initial graph also avoids millions of repeated text-key subqueries.
+fn publish_initial_native(tx: &Transaction<'_>, facts: &[FileFacts]) -> Result<()> {
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS nodes_insert;
+         DROP TRIGGER IF EXISTS nodes_delete;
+         DROP TABLE IF EXISTS node_search;
+         DROP INDEX IF EXISTS nodes_label;
+         DROP INDEX IF EXISTS nodes_file;
+         DROP INDEX IF EXISTS node_aliases_binding;
+         DROP INDEX IF EXISTS refs_owner;
+         DROP INDEX IF EXISTS refs_unresolved_source;
+         DROP INDEX IF EXISTS refs_unresolved_relation;
+         DROP INDEX IF EXISTS ref_keys_binding;
+         DROP INDEX IF EXISTS edges_source;
+         DROP INDEX IF EXISTS edges_target;
+         DROP INDEX IF EXISTS edges_source_relation;
+         DROP INDEX IF EXISTS edges_target_relation;
+         DROP INDEX IF EXISTS refs_source;
+         DROP INDEX IF EXISTS nodes_qualified;
+         DROP INDEX IF EXISTS nodes_binding;
+         DROP INDEX IF EXISTS nodes_owner;
+         DROP INDEX IF EXISTS edges_source_direction;
+         DROP INDEX IF EXISTS edges_target_direction;
+         DROP INDEX IF EXISTS edges_source_direction_relation;
+         DROP INDEX IF EXISTS edges_target_direction_relation;
+         DROP INDEX IF EXISTS edges_owner;",
+    )?;
+
+    let total_nodes = facts.iter().map(|file| file.nodes.len()).sum();
+    let mut file_keys = HashMap::with_capacity(facts.len());
+    let mut node_keys = HashMap::with_capacity(total_nodes);
+    let mut node_ids = HashMap::with_capacity(total_nodes);
+    let mut source_nodes = HashMap::with_capacity(total_nodes);
+    let mut bindings = HashMap::new();
+    let ruby_nodes: Vec<_> = facts
+        .iter()
+        .flat_map(|file| &file.nodes)
+        .filter(|node| node.metadata["language"] == "ruby")
+        .cloned()
+        .collect();
+    let ruby_context = crate::languages::scripted::RubyContext::from_nodes(&ruby_nodes);
+
+    {
+        let mut insert_file = tx.prepare(
+            "INSERT INTO files(path,hash,module,diagnostics,facts_hash) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for file in facts {
+            insert_file.execute(params![
+                file.path,
+                file.hash,
+                file.module,
+                serde_json::to_string(&file.diagnostics)?,
+                facts_hash(file)?
+            ])?;
+            file_keys.insert(file.path.as_str(), tx.last_insert_rowid());
+        }
+    }
+    {
+        let mut insert_node = tx.prepare(
+            "INSERT INTO nodes(id,label,kind,file,line,end_line,qualified_name,binding_key,metadata,owner_key,search) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        )?;
+        let mut insert_alias = tx.prepare(
+            "INSERT INTO node_aliases(node_key,binding_key) VALUES(?1,?2) ON CONFLICT(node_key,binding_key) DO NOTHING",
+        )?;
+        for file in facts {
+            let owner = *file_keys
+                .get(file.path.as_str())
+                .context("missing initial file owner")?;
+            for node in &file.nodes {
+                insert_node.execute(params![
+                    node.id,
+                    node.label,
+                    node.kind,
+                    node.file,
+                    node.line,
+                    node.end_line,
+                    node.qualified_name,
+                    node.binding_key,
+                    serde_json::to_string(&node.metadata)?,
+                    owner,
+                    search_text(node)
+                ])?;
+                let node_key = tx.last_insert_rowid();
+                node_keys.insert(node.id.as_str(), node_key);
+                node_ids.insert(node_key, node.id.as_str());
+                source_nodes.insert(node.id.as_str(), node);
+                if let Some(binding) = node.binding_key.as_deref() {
+                    record_initial_binding(&mut bindings, binding, node_key);
+                }
+                for alias in binding_aliases(node)? {
+                    insert_alias.execute(params![node_key, alias])?;
+                    record_initial_binding(&mut bindings, alias, node_key);
+                }
+            }
+        }
+    }
+    {
+        let mut insert_ref = tx.prepare(
+            "INSERT INTO refs(id,source,source_key,owner_key,label,relation,file,line,candidate_keys,reason,resolved_target_key,resolution_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        )?;
+        let mut insert_key =
+            tx.prepare("INSERT INTO ref_keys(ref_key,priority,binding_key) VALUES(?1,?2,?3)")?;
+        let mut insert_edge = tx.prepare(
+            "INSERT INTO edges(id,source,target,source_key,target_key,relation,directed,file,line,confidence,metadata,owner_key,ref_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        )?;
+        for file in facts {
+            let owner = *file_keys
+                .get(file.path.as_str())
+                .context("missing initial reference owner")?;
+            for reference in &file.references {
+                let source_key = *node_keys
+                    .get(reference.source.as_str())
+                    .context("missing initial reference source")?;
+                let source = source_nodes
+                    .get(reference.source.as_str())
+                    .context("missing initial reference source payload")?;
+                let ruby_keys = (source.metadata["language"] == "ruby")
+                    .then(|| ruby_context.inherited_keys(reference))
+                    .flatten();
+                let candidate_keys = ruby_keys.as_deref().unwrap_or(&reference.candidate_keys);
+                let (target_key, reason) = initial_resolution(reference, candidate_keys, &bindings);
+                insert_ref.execute(params![
+                    reference.id,
+                    reference.source,
+                    source_key,
+                    owner,
+                    reference.label,
+                    reference.relation,
+                    reference.file,
+                    reference.line,
+                    serde_json::to_string(&reference.candidate_keys)?,
+                    reference.reason,
+                    target_key,
+                    reason
+                ])?;
+                let ref_key = tx.last_insert_rowid();
+                for (priority, binding) in candidate_keys.iter().enumerate() {
+                    insert_key.execute(params![ref_key, priority as i64, binding])?;
+                }
+                if let Some(target_key) = target_key {
+                    let target = node_ids
+                        .get(&target_key)
+                        .context("missing initial resolved target")?;
+                    let edge = resolved_reference_edge(reference, source, target);
+                    insert_edge.execute(params![
+                        edge.id,
+                        edge.source,
+                        edge.target,
+                        source_key,
+                        target_key,
+                        edge.relation,
+                        edge.directed,
+                        edge.file,
+                        edge.line,
+                        edge.confidence,
+                        serde_json::to_string(&edge.metadata)?,
+                        owner,
+                        ref_key
+                    ])?;
+                }
+            }
+        }
+        for file in facts {
+            let owner = *file_keys
+                .get(file.path.as_str())
+                .context("missing initial edge owner")?;
+            for edge in &file.edges {
+                let source_key = *node_keys
+                    .get(edge.source.as_str())
+                    .context("missing initial edge source")?;
+                let target_key = *node_keys
+                    .get(edge.target.as_str())
+                    .context("missing initial edge target")?;
+                insert_edge.execute(params![
+                    edge.id,
+                    edge.source,
+                    edge.target,
+                    source_key,
+                    target_key,
+                    edge.relation,
+                    edge.directed,
+                    edge.file,
+                    edge.line,
+                    edge.confidence,
+                    serde_json::to_string(&edge.metadata)?,
+                    owner,
+                    Option::<i64>::None
+                ])?;
+            }
+        }
+    }
+
+    tx.execute_batch(
+        "CREATE INDEX nodes_label ON nodes(label, id);
+         CREATE INDEX nodes_file ON nodes(file, id);
+         CREATE INDEX node_aliases_binding ON node_aliases(binding_key, node_key);
+         CREATE INDEX refs_owner ON refs(owner_key);
+         CREATE INDEX refs_unresolved_source ON refs(source_key, id) WHERE resolved_target_key IS NULL;
+         CREATE INDEX refs_unresolved_relation ON refs(source_key, relation, id) WHERE resolved_target_key IS NULL;
+         CREATE INDEX ref_keys_binding ON ref_keys(binding_key, ref_key);
+         CREATE INDEX edges_source ON edges(source_key, id);
+         CREATE INDEX edges_target ON edges(target_key, id);
+         CREATE INDEX edges_source_relation ON edges(source_key, relation, id);
+         CREATE INDEX edges_target_relation ON edges(target_key, relation, id);
+         CREATE VIRTUAL TABLE node_search USING fts5(text, content='', contentless_delete=1);
+         INSERT INTO node_search(rowid,text) SELECT nkey,search FROM nodes;
+         CREATE TRIGGER nodes_insert AFTER INSERT ON nodes BEGIN
+             INSERT INTO node_search(rowid,text) VALUES(new.nkey,new.search);
+         END;
+         CREATE TRIGGER nodes_delete AFTER DELETE ON nodes BEGIN
+             DELETE FROM node_search WHERE rowid=old.nkey;
+         END;",
+    )?;
+    ensure_storage_indices(tx)?;
+    Ok(())
+}
+
 fn insert_node(conn: &Connection, node: &Node, owner: Option<&str>) -> Result<()> {
     ensure!(!node.id.is_empty(), "node ID cannot be empty");
     let owner = owner
@@ -1468,8 +2123,8 @@ fn insert_node(conn: &Connection, node: &Node, owner: Option<&str>) -> Result<()
         })
         .transpose()
         .context("missing node owner")?;
-    conn.execute("INSERT INTO nodes(id,label,qualified_name,binding_key,file,owner_key,payload,search) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![node.id,node.label,node.qualified_name,node.binding_key,node.file,owner,serde_json::to_string(node)?,search_text(node)])?;
+    conn.execute("INSERT INTO nodes(id,label,kind,file,line,end_line,qualified_name,binding_key,metadata,owner_key,search) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![node.id,node.label,node.kind,node.file,node.line,node.end_line,node.qualified_name,node.binding_key,serde_json::to_string(&node.metadata)?,owner,search_text(node)])?;
     Ok(())
 }
 
@@ -1496,8 +2151,8 @@ fn insert_edge(
         })
         .transpose()
         .context("missing edge reference")?;
-    conn.execute("INSERT INTO edges(id,source_key,target_key,relation,directed,owner_key,ref_key,payload) VALUES(?1,(SELECT nkey FROM nodes WHERE id=?2),(SELECT nkey FROM nodes WHERE id=?3),?4,?5,?6,?7,?8)",
-        params![edge.id,edge.source,edge.target,edge.relation,edge.directed,owner,reference,serde_json::to_string(edge)?])?;
+    conn.execute("INSERT INTO edges(id,source,target,source_key,target_key,relation,directed,file,line,confidence,metadata,owner_key,ref_key) VALUES(?1,?2,?3,(SELECT nkey FROM nodes WHERE id=?2),(SELECT nkey FROM nodes WHERE id=?3),?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![edge.id,edge.source,edge.target,edge.relation,edge.directed,edge.file,edge.line,edge.confidence,serde_json::to_string(&edge.metadata)?,owner,reference])?;
     Ok(())
 }
 
@@ -1545,35 +2200,13 @@ fn resolve_reference(
     }
     update_resolution.execute(params![target, reason, id])?;
     if let Some(target) = target {
-        let mut metadata = serde_json::json!({"reference_id": reference.id});
         let source_payload: String = tx.query_row(
             "SELECT payload FROM nodes WHERE id=?1",
             [&reference.source],
             |row| row.get(0),
         )?;
-        let source: serde_json::Value = serde_json::from_str(&source_payload)?;
-        if let Some(context) = source["metadata"]["python_references"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item["reference_id"] == reference.id)
-            })
-            .and_then(|item| item["context"].as_str())
-        {
-            metadata["context"] = serde_json::Value::String(context.to_owned());
-        }
-        let edge = Edge {
-            id: format!("reference:{}", reference.id),
-            source: reference.source,
-            target,
-            relation: reference.relation,
-            directed: true,
-            file: Some(reference.file.clone()),
-            line: Some(reference.line),
-            confidence: "statically_resolved".to_owned(),
-            metadata,
-        };
+        let source: Node = serde_json::from_str(&source_payload)?;
+        let edge = resolved_reference_edge(&reference, &source, &target);
         insert_edge(tx, &edge, Some(&reference.file), Some(id))?;
     }
     Ok(())
@@ -1637,6 +2270,75 @@ mod compaction_tests {
              INSERT INTO discarded VALUES(zeroblob(262144));
              DROP TABLE discarded;",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_native_publish_reports_restore_failure_and_next_writer_repairs_wal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("repair-wal.db");
+        let mut store = Store::create(&path)?;
+        store.prepare_native_index_write()?;
+        store.conn.execute_batch(
+            "CREATE TEMP TRIGGER abort_native_metadata
+             BEFORE UPDATE ON metadata
+             BEGIN SELECT RAISE(ABORT, 'late native failure'); END;",
+        )?;
+        let failure = store
+            .apply_native(
+                "repo",
+                vec![FileFacts {
+                    path: "app.py".into(),
+                    hash: "hash".into(),
+                    module: "app".into(),
+                    nodes: vec![Node {
+                        id: "entry".into(),
+                        label: "entry".into(),
+                        kind: "function".into(),
+                        file: "app.py".into(),
+                        line: Some(1),
+                        end_line: Some(1),
+                        qualified_name: Some("entry".into()),
+                        binding_key: Some("python:app:entry".into()),
+                        metadata: serde_json::json!({}),
+                    }],
+                    edges: vec![],
+                    references: vec![],
+                    diagnostics: vec![],
+                }],
+                vec![],
+                Coverage::default(),
+            )
+            .unwrap_err();
+        store
+            .conn
+            .execute_batch("DROP TRIGGER abort_native_metadata")?;
+
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN")?;
+        reader.query_row("SELECT generation FROM metadata", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        store.conn.busy_timeout(Duration::from_millis(20))?;
+        let error = store
+            .finish_native_index_write::<()>(Err(failure))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("late native failure"), "{message}");
+        assert!(
+            message.contains("restoring WAL mode also failed"),
+            "{message}"
+        );
+        reader.execute_batch("ROLLBACK")?;
+        drop(reader);
+        drop(store);
+
+        let repaired = Store::create(&path)?;
+        assert_eq!(repaired.stats()?.generation, 0);
+        let mode: String = repaired
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        assert_eq!(mode, "wal");
         Ok(())
     }
 

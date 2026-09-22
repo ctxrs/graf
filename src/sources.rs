@@ -75,6 +75,7 @@ fn add_and_index_prepared(
         }
     }
     let record = save(root, source, record.facts)?;
+    drop(store);
     let capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
     let mut report = index::run_with_reserved_semantic_files(root, db, options, reserved)?;
     if let Some(timings) = &mut report.timings {
