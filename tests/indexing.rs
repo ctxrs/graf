@@ -617,6 +617,23 @@ fn python_terminal_target_deletion_and_restore_keep_consumer_facts() {
 }
 
 #[test]
+fn native_index_uses_rollback_journal_for_nonempty_publish() {
+    let root = tempdir().unwrap();
+    let db = root.path().join("graph.db");
+    fs::write(root.path().join("app.py"), "def entry():\n    return 1\n").unwrap();
+
+    index::run(root.path(), &db).unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    assert!(!db.with_file_name("graph.db-wal").exists());
+    assert!(Store::open_read_only(&db).unwrap().stats().unwrap().files > 0);
+}
+
+#[test]
 fn python_star_import_keeps_context_invalidation_on_add() {
     let root = tempdir().unwrap();
     let db = root.path().join(".graf/index.db");
