@@ -540,7 +540,10 @@ fn run_prepared(
             Some(&freshly_read),
         )?;
         ensure!(
-            current.proof.as_ref() == Some(initial_proof),
+            current
+                .proof
+                .as_ref()
+                .is_some_and(|proof| scan_content_matches(initial_proof, proof)),
             "source tree changed during indexing; previous graph retained"
         );
     }
@@ -1903,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_content_match_ignores_only_promoted_source_identities() {
+    fn publish_scan_content_match_ignores_only_promoted_source_identities() {
         let source = |digest: &str, identity| SourceProof {
             path: "app.py".into(),
             digest: digest.into(),
@@ -1928,6 +1931,31 @@ mod tests {
         let changed = proof(source("changed", None));
         assert!(scan_content_matches(&initial, &promoted));
         assert!(!scan_content_matches(&initial, &changed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_allows_fresh_source_identity_to_settle_after_bytes_are_read() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join(".graf/index.db");
+        let source = root.path().join("app.py");
+        fs::write(&source, "def first():\n    pass\n").unwrap();
+        let initial = run(root.path(), &db).unwrap();
+
+        fs::write(&source, "def second():\n    pass\n").unwrap();
+        assert!(manifest_source_identity(&fs::metadata(&source).unwrap()).is_none());
+        BEFORE_PUBLISH_VALIDATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(2_100));
+            }));
+        });
+
+        let updated = run(root.path(), &db).unwrap();
+        assert_eq!(updated.parsed_files, 1);
+        assert_eq!(updated.generation, initial.generation + 1);
+        let snapshot = Store::open_read_only(&db).unwrap().snapshot().unwrap();
+        assert!(snapshot.nodes.iter().any(|node| node.label == "second"));
+        assert!(snapshot.nodes.iter().all(|node| node.label != "first"));
     }
 
     #[test]
