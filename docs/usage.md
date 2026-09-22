@@ -1,6 +1,6 @@
 # Graf usage
 
-This guide describes Graf 0.5.0. Check `graf --version` before using its additions.
+This guide describes Graf 0.6.0. Check `graf --version` before using its additions.
 Installers fetch the latest published release by default, which may precede this
 checkout; build from source if the features you need are not yet released.
 See the [README](../README.md#install) for release installation and
@@ -27,8 +27,8 @@ a model. Explicit learning annotations also check cited local files.
 Use `--db PATH` to select a database; otherwise reads discover the nearest
 ancestor `.graf/index.db`.
 
-Graf 0.5 can read older indexes without upgrading them. Refreshing an existing
-index, such as with `graf update`, upgrades its storage format in the same
+Graf 0.5 and later can read older indexes without upgrading them. Refreshing an
+existing index, such as with `graf update`, upgrades its storage format in the same
 transaction; a failed write preserves the previous format and graph. After
 upgrading, open that database with Graf 0.5 or later. The portable JSON snapshot
 format is unchanged.
@@ -487,7 +487,7 @@ soft targets: inspect `community_split_attempts` and
 
 ### Community algorithms
 
-Source builds targeting 0.5 use native Leiden by default; released 0.4 uses
+Graf 0.5 and later use native Leiden by default; Graf 0.4 uses
 Louvain. Select either algorithm explicitly for stable behavior across that
 upgrade. For example:
 
