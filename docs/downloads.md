@@ -111,7 +111,7 @@ To choose a version or directory:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ctxrs/graf/main/install.sh \
-  | sh -s -- --version 0.5.0 --install-dir "$HOME/bin"
+  | sh -s -- --version 0.6.0 --install-dir "$HOME/bin"
 ```
 
 On Windows:
@@ -122,7 +122,7 @@ irm https://raw.githubusercontent.com/ctxrs/graf/main/install.ps1 | iex
 
 The default directory is `%LOCALAPPDATA%\Graf\bin`. Add it to your `PATH` in
 Windows environment settings if needed. To select a version or another directory,
-set `$env:GRAF_VERSION = '0.5.0'` or `$env:GRAF_INSTALL_DIR = 'C:\Tools\Graf'`
+set `$env:GRAF_VERSION = '0.6.0'` or `$env:GRAF_INSTALL_DIR = 'C:\Tools\Graf'`
 before running the command. Those same environment variables work with the
 Unix installer. Neither script requires administrator access for its default
 directory or modifies your shell profiles.
