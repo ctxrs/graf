@@ -78,7 +78,7 @@ pub fn restore_legacy(conn: &Connection, packed: bool) -> anyhow::Result<()> {
     let tx = conn.unchecked_transaction()?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     anyhow::ensure!(
-        matches!(version, 2..=4),
+        matches!(version, 2..=5),
         "legacy fixture expects a compact input"
     );
     let definitions = [

@@ -311,7 +311,7 @@ fn compact_and_legacy_queries_preserve_full_results_order_errors_and_read_bytes(
     legacy::restore_legacy(&Connection::open(&old)?, false)?;
     legacy::restore_legacy(&Connection::open(&packed)?, true)?;
     let expected = reads(&Store::open_read_only(&old)?)?;
-    for (path, version) in [(&old, 1), (&packed, 1), (&compact, 4)] {
+    for (path, version) in [(&old, 1), (&packed, 1), (&compact, 5)] {
         let conn = Connection::open(path)?;
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
@@ -365,7 +365,7 @@ fn existing_read_handle_switches_layout_after_physical_upgrade_without_generatio
     tx.commit()?;
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        4
+        5
     );
     let keys = conn
         .prepare("SELECT nkey,id FROM nodes ORDER BY nkey")?
@@ -503,7 +503,7 @@ fn an_existing_reader_rejects_an_unsupported_new_physical_version() -> anyhow::R
     let reader = Store::open_read_only(&path)?;
     reader.resolve_endpoint("n-consumer", &SearchOptions::default())?;
     let sql = Connection::open(&path)?;
-    sql.pragma_update(None, "user_version", 5)?;
+    sql.pragma_update(None, "user_version", 6)?;
     for error in [
         reader
             .query("n-consumer", &QueryOptions::default())
@@ -522,7 +522,7 @@ fn an_existing_reader_rejects_an_unsupported_new_physical_version() -> anyhow::R
             "{error:#}"
         );
     }
-    sql.pragma_update(None, "user_version", 4)?;
+    sql.pragma_update(None, "user_version", 5)?;
     assert_order_and_evidence(&reader)?;
     Ok(())
 }
@@ -599,7 +599,7 @@ fn previous_writer_fixture_reads_unchanged_then_upgrades_on_the_same_handle() ->
     assert_eq!(
         Connection::open(&path)?
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        4
+        5
     );
     Ok(())
 }
