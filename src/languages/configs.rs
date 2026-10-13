@@ -214,8 +214,16 @@ impl Facts {
         {
             return;
         }
+        let prefix = format!("config-edge:{}:", self.0.path);
+        let next = self
+            .0
+            .edges
+            .iter()
+            .rev()
+            .find_map(|e| e.id.strip_prefix(&prefix)?.parse::<usize>().ok())
+            .map_or(0, |n| n + 1);
         self.0.edges.push(Edge {
-            id: format!("config-edge:{}:{}", self.0.path, self.0.edges.len()),
+            id: format!("{prefix}{next}"),
             source: from.into(),
             target: to.into(),
             relation: relation.into(),

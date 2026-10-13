@@ -2151,3 +2151,19 @@ prose = "password notes = public"
         );
     }
 }
+
+#[test]
+fn sln_nested_projects_keep_unique_edge_ids() {
+    let source = "Project(\"{2150E333-8FDC-42A3-9474-1A3956D46DE8}\") = \"Libs\", \"Libs\", \"{00000000-0000-0000-0000-000000000001}\"\nEndProject\nProject(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"A\", \"A\\A.csproj\", \"{00000000-0000-0000-0000-000000000002}\"\nEndProject\nProject(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"B\", \"B\\B.csproj\", \"{00000000-0000-0000-0000-000000000003}\"\nEndProject\nGlobal\n\tGlobalSection(NestedProjects) = preSolution\n\t\t{00000000-0000-0000-0000-000000000002} = {00000000-0000-0000-0000-000000000001}\n\tEndGlobalSection\nEndGlobal\n";
+    let f = facts("App.sln", source);
+    let ids: std::collections::HashSet<_> = f.edges.iter().map(|e| &e.id).collect();
+    assert_eq!(ids.len(), f.edges.len(), "{:?}", f.edges);
+    let contains = |from: &str, to: &str| {
+        f.edges.iter().any(|e| {
+            e.relation == "contains" && e.source == node(&f, from).id && e.target == node(&f, to).id
+        })
+    };
+    assert!(contains("Libs", "A"));
+    assert!(contains("App.sln", "B"));
+    assert!(!contains("App.sln", "A"));
+}
