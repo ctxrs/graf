@@ -1038,13 +1038,18 @@ struct Xml {
     line: u32,
 }
 fn xml(source: &str) -> Result<Vec<Xml>> {
+    let bom = if source.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
     let mut reader = Reader::from_str(source);
     let mut nodes: Vec<Xml> = vec![];
     let mut stack = vec![];
     let mut offset = 0;
     let mut current_line = 1;
     loop {
-        let start = reader.buffer_position() as usize;
+        let start = reader.buffer_position() as usize + bom;
         current_line += source[offset..start]
             .bytes()
             .filter(|b| *b == b'\n')
@@ -1078,7 +1083,7 @@ fn xml(source: &str) -> Result<Vec<Xml>> {
                     line: current_line,
                 });
                 // Empty events consume their closing delimiter in this same event.
-                if !source[start..reader.buffer_position() as usize]
+                if !source[start..reader.buffer_position() as usize + bom]
                     .trim_end()
                     .ends_with("/>")
                 {

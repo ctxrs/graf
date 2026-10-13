@@ -1066,6 +1066,11 @@ impl<'a> Template<'a> {
         Ok(())
     }
     fn xaml(&mut self) {
+        let bom = if self.source.starts_with('\u{feff}') {
+            '\u{feff}'.len_utf8()
+        } else {
+            0
+        };
         let mut reader = Reader::from_str(self.source);
         let mut stack: Vec<String> = vec![];
         let mut namespaces = HashMap::new();
@@ -1079,9 +1084,9 @@ impl<'a> Template<'a> {
         let mut roots = 0;
         let mut failure = None;
         loop {
-            let start = reader.buffer_position() as usize;
+            let start = reader.buffer_position() as usize + bom;
             let event = reader.read_event();
-            let end = reader.buffer_position() as usize;
+            let end = reader.buffer_position() as usize + bom;
             match event {
                 Ok(Event::Start(tag) | Event::Empty(tag)) => {
                     let empty = self.source[start..end].trim_end().ends_with("/>");

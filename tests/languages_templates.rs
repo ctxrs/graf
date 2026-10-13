@@ -150,6 +150,26 @@ fn xaml_controls_bindings_resources_events_and_invalid_input() {
 }
 
 #[test]
+fn xaml_utf8_bom_does_not_shift_offsets() {
+    let source = "<Window xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" x:Class=\"Shop.Main\">\n<Button x:Name=\"Submit\" Click=\"OnSave\" Command=\"{Binding SaveCommand}\" />\n</Window>";
+    let summary = |f: &FileFacts| {
+        let nodes: Vec<_> = f.nodes.iter().map(|n| (n.label.clone(), n.line)).collect();
+        let refs: Vec<_> = f
+            .references
+            .iter()
+            .map(|r| (r.relation.clone(), r.label.clone(), r.line))
+            .collect();
+        (nodes, refs, f.diagnostics.len())
+    };
+    let expected = summary(&facts("Views/Main.xaml", source));
+    assert!(expected.0.iter().any(|(label, _)| label == "Submit"));
+    for prefix in ["\u{feff}", "\u{feff}\t", "\u{feff}  "] {
+        let f = facts("Views/Main.xaml", &format!("{prefix}{source}"));
+        assert_eq!(summary(&f), expected, "prefix {prefix:?}");
+    }
+}
+
+#[test]
 fn robot_scoped_calls_imports_bdd_and_templates() {
     let source = "*** Settings ***\nResource    ${Cur_Dir}/steps.resource\nSuite Setup    Prepare\nTest Template    Check Item\n*** Test Cases ***\nTable\n    data is not a keyword\nPlain\n    [Template]    NONE\n    Given Open Session\n    ${value}=    Prepare\n*** Keywords ***\nPrepare\n    Log    ready\n";
     let f = facts("tests/suite.robot", source);
