@@ -3155,10 +3155,21 @@ struct CompiledInventory {
     nodes: BTreeMap<String, crate::model::Node>,
     units: BTreeMap<String, String>,
     parents: BTreeMap<String, String>,
+    children: BTreeMap<String, Vec<String>>,
     types: BTreeMap<(String, String), Vec<String>>,
     bases: BTreeMap<String, Option<Vec<String>>>,
 }
 impl CompiledInventory {
+    fn children(&self, group: &[String]) -> Vec<&crate::model::Node> {
+        let mut ids: Vec<_> = group
+            .iter()
+            .filter_map(|p| self.children.get(p))
+            .flatten()
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.into_iter().map(|id| &self.nodes[id]).collect()
+    }
     fn unit(&self, node: &crate::model::Node) -> String {
         if let Some(module) = node.metadata["swift_module"].as_str() {
             return format!("swift:{module}");
@@ -3213,11 +3224,9 @@ impl CompiledInventory {
         }
         let group = self.group(id);
         let own: Vec<_> = self
-            .nodes
-            .values()
-            .filter(|n| {
-                n.label == name && self.parents.get(&n.id).is_some_and(|p| group.contains(p))
-            })
+            .children(&group)
+            .into_iter()
+            .filter(|n| n.label == name)
             .collect();
         if !own.is_empty() {
             return (own.len() == 1
@@ -3230,12 +3239,9 @@ impl CompiledInventory {
         }
         if static_call {
             let companions: Vec<_> = self
-                .nodes
-                .values()
-                .filter(|n| {
-                    n.metadata["companion"] == true
-                        && self.parents.get(&n.id).is_some_and(|p| group.contains(p))
-                })
+                .children(&group)
+                .into_iter()
+                .filter(|n| n.metadata["companion"] == true)
                 .collect();
             if companions.len() == 1 {
                 return self.member(&companions[0].id, name, true, seen);
@@ -3278,11 +3284,11 @@ impl CompiledInventory {
                         {
                             return true;
                         }
-                        let group = self.group(base);
-                        !self.nodes.values().any(|n| {
-                            n.label == name
-                                && self.parents.get(&n.id).is_some_and(|p| group.contains(p))
-                        }) && self.inherited_name_absent(base, name, &mut seen.clone())
+                        !self
+                            .children(&self.group(base))
+                            .iter()
+                            .any(|n| n.label == name)
+                            && self.inherited_name_absent(base, name, &mut seen.clone())
                     })
                 })
         })
@@ -3315,11 +3321,9 @@ impl CompiledInventory {
         inherited.sort();
         inherited.dedup();
         let own: Vec<_> = self
-            .nodes
-            .values()
-            .filter(|n| {
-                n.label == name && self.parents.get(&n.id).is_some_and(|p| group.contains(p))
-            })
+            .children(&group)
+            .into_iter()
+            .filter(|n| n.label == name)
             .collect();
         if own.is_empty() {
             return Some(inherited);
@@ -3415,6 +3419,7 @@ impl CompiledContext {
             nodes: BTreeMap::new(),
             units: units.clone(),
             parents: BTreeMap::new(),
+            children: BTreeMap::new(),
             types: BTreeMap::new(),
             bases: BTreeMap::new(),
         };
@@ -3439,6 +3444,15 @@ impl CompiledContext {
                         .parents
                         .insert(edge.target.clone(), edge.source.clone());
                 }
+            }
+        }
+        for n in inventory.nodes.values() {
+            if let Some(parent) = inventory.parents.get(&n.id) {
+                inventory
+                    .children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(n.id.clone());
             }
         }
         for n in inventory.nodes.values().filter(|n| type_node(n)) {
@@ -3654,13 +3668,10 @@ impl CompiledContext {
                         // must enforce its access and dispatch evidence before fallback.
                         if kotlin_static
                             || (cpp_qualified
-                                && inventory.nodes.values().any(|n| {
-                                    n.label == name
-                                        && inventory
-                                            .parents
-                                            .get(&n.id)
-                                            .is_some_and(|p| inventory.group(&owner).contains(p))
-                                }))
+                                && inventory
+                                    .children(&inventory.group(&owner))
+                                    .iter()
+                                    .any(|n| n.label == name))
                         {
                             result.candidates.insert(r.id.clone(), vec![]);
                         }
